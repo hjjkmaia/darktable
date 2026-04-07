@@ -19,7 +19,9 @@
 #include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
+#include "common/act_on.h"
 #include "common/collection.h"
+#include "common/image.h"
 #include "common/colorspaces.h"
 #include "common/darktable.h"
 #include "common/debug.h"
@@ -70,6 +72,9 @@ typedef struct dt_lib_export_t
   GtkWidget *storage_extra_container, *format_extra_container;
   GtkWidget *high_quality;
   GtkWidget *export_masks;
+  GtkWidget *limit_by;          // Phase 1: dimension lock mode
+  GtkWidget *quick_presets_box; // Phase 1: quick preset bar container
+  dt_gui_collapsible_section_t quick_cs; // Phase 1: collapsible wrapper for presets
   char *metadata_export;
   char *style_name;
   dt_imageio_module_storage_t *storage_module;
@@ -83,6 +88,35 @@ typedef enum dt_dimensions_type_t
   DT_DIMENSIONS_INCH   = 2,  // set dimensions from physical size in inch
   DT_DIMENSIONS_SCALE  = 3  // set dimensions by scale
 } dt_dimensions_type_t;
+
+// Phase 1: how the user wants to constrain output dimensions
+typedef enum dt_export_limit_by_t
+{
+  DT_EXPORT_LIMIT_BOX        = 0, // bounding box (both W and H limit)
+  DT_EXPORT_LIMIT_WIDTH      = 1, // user sets width, height auto-derived from image ratio
+  DT_EXPORT_LIMIT_HEIGHT     = 2, // user sets height, width auto-derived from image ratio
+  DT_EXPORT_LIMIT_LONG_EDGE  = 3, // user sets one number, applied as long-edge cap
+} dt_export_limit_by_t;
+
+// Phase 1: hard-coded quick presets. Edit this array to customize.
+typedef struct dt_export_quick_preset_t
+{
+  const char *label;       // button text
+  uint32_t    width;       // pixels
+  uint32_t    height;      // pixels (0 = auto from ratio)
+  const char *format_name; // plugin_name of the imageio format module (e.g. "jpeg")
+  const char *tooltip;
+} dt_export_quick_preset_t;
+
+static const dt_export_quick_preset_t _quick_presets[] = {
+  { N_("Web 1080"),    1920, 1080, "jpeg", N_("1920 \303\227 1080 JPEG (Full HD web)") },
+  { N_("Web 4K"),      3840, 2160, "jpeg", N_("3840 \303\227 2160 JPEG (4K web)") },
+  { N_("IG square"),   1080, 1080, "jpeg", N_("1080 \303\227 1080 JPEG (Instagram square)") },
+  { N_("IG portrait"), 1080, 1350, "jpeg", N_("1080 \303\227 1350 JPEG (Instagram portrait 4:5)") },
+  { N_("Print A4"),    2480, 3508, "jpeg", N_("2480 \303\227 3508 JPEG (A4 at 300 dpi)") },
+  { N_("Email"),       1024, 1024, "jpeg", N_("1024 \303\227 1024 JPEG (small email-friendly)") },
+};
+#define DT_EXPORT_QUICK_PRESET_COUNT (sizeof(_quick_presets) / sizeof(_quick_presets[0]))
 
 char *dt_lib_export_metadata_configuration_dialog(char *list,
                                                   const gboolean ondisk);
@@ -228,9 +262,15 @@ void gui_update(dt_lib_module_t *self)
                            && export_enabled);
 }
 
+static void _apply_limit_by_mode(dt_lib_export_t *d); // fwd
+
 static void _image_selection_changed_callback(gpointer instance,
                                               dt_lib_module_t *self)
 {
+  dt_lib_export_t *d = self->data;
+  // Phase 1: refresh limit_by calculated previews when the active image changes
+  if(d && d->limit_by)
+    _apply_limit_by_mode(d);
   dt_lib_gui_queue_update(self);
 }
 
@@ -1083,9 +1123,19 @@ static void _width_changed(GtkEditable *entry, gpointer user_data)
 {
   DT_GUARD_GUI_UPDATE();
 
-  const dt_lib_export_t *d = (dt_lib_export_t *)user_data;
+  dt_lib_export_t *d = (dt_lib_export_t *)user_data;
   const uint32_t width = atoi(gtk_entry_get_text(GTK_ENTRY(d->width)));
   dt_conf_set_int(CONFIG_PREFIX "width", width);
+
+  // Phase 1: when limit_by mode is width or long-edge, refresh the calculated
+  // height preview so the user immediately sees what dimension they'll get.
+  if(d->limit_by)
+  {
+    const dt_export_limit_by_t mode =
+      (dt_export_limit_by_t)dt_bauhaus_combobox_get(d->limit_by);
+    if(mode == DT_EXPORT_LIMIT_WIDTH || mode == DT_EXPORT_LIMIT_LONG_EDGE)
+      _apply_limit_by_mode(d);
+  }
 }
 
 static void _print_width_changed(GtkEditable *entry, gpointer user_data)
@@ -1109,9 +1159,14 @@ static void _height_changed(GtkEditable *entry, gpointer user_data)
 {
   DT_GUARD_GUI_UPDATE();
 
-  const dt_lib_export_t *d = (dt_lib_export_t *)user_data;
+  dt_lib_export_t *d = (dt_lib_export_t *)user_data;
   const uint32_t height = atoi(gtk_entry_get_text(GTK_ENTRY(d->height)));
   dt_conf_set_int(CONFIG_PREFIX "height", height);
+
+  // Phase 1: when limit_by mode is height, refresh the calculated width preview.
+  if(d->limit_by &&
+     dt_bauhaus_combobox_get(d->limit_by) == DT_EXPORT_LIMIT_HEIGHT)
+    _apply_limit_by_mode(d);
 }
 
 static void _print_height_changed(GtkEditable *entry, gpointer user_data)
@@ -1430,6 +1485,156 @@ void set_preferences(GMenu *menu, GActionGroup *action_group, dt_lib_module_t *s
   g_menu_append(menu, _("preferences..."), "presets.preferences");
 }
 
+// Phase 1: get the active image's final aspect ratio (width / height).
+// Returns 1.5 (a sensible 3:2 default) if no image is selected or sizes
+// can't be determined yet.
+static float _get_active_image_aspect(void)
+{
+  const dt_imgid_t imgid = dt_act_on_get_main_image();
+  if(!dt_is_valid_imgid(imgid)) return 1.5f;
+  int iw = 0, ih = 0;
+  if(!dt_image_get_final_size(imgid, &iw, &ih) || iw <= 0 || ih <= 0)
+    return 1.5f;
+  return (float)iw / (float)ih;
+}
+
+// Phase 1: apply the current limit_by mode. For width/height/long-edge modes,
+// the unconstrained dimension is shown as a CALCULATED PREVIEW based on the
+// active image's aspect ratio (Lightroom-style). The conf value for the
+// derived side stays at 0 so the export pipeline computes it per-image.
+static void _apply_limit_by_mode(dt_lib_export_t *d)
+{
+  const dt_export_limit_by_t mode =
+    (dt_export_limit_by_t)dt_bauhaus_combobox_get(d->limit_by);
+
+  const uint32_t w = dt_conf_get_int(CONFIG_PREFIX "width");
+  const uint32_t h = dt_conf_get_int(CONFIG_PREFIX "height");
+  const float aspect = _get_active_image_aspect();
+
+  switch(mode)
+  {
+    case DT_EXPORT_LIMIT_BOX:
+      // both dimensions act as a bounding box (default existing behavior)
+      gtk_widget_set_sensitive(d->width, TRUE);
+      gtk_widget_set_sensitive(d->height, TRUE);
+      break;
+
+    case DT_EXPORT_LIMIT_WIDTH:
+    {
+      // user sets width. height conf stays 0 (= auto, per-image).
+      // displayed height value = width / aspect (preview only).
+      gtk_widget_set_sensitive(d->width, TRUE);
+      gtk_widget_set_sensitive(d->height, FALSE);
+      dt_conf_set_int(CONFIG_PREFIX "height", 0);
+      const uint32_t preview_h = (w > 0 && aspect > 0.0f)
+                                 ? (uint32_t)((float)w / aspect + 0.5f)
+                                 : 0;
+      DT_ENTER_GUI_UPDATE();
+      gchar *txt = g_strdup_printf("%u", preview_h);
+      gtk_entry_set_text(GTK_ENTRY(d->height), txt);
+      g_free(txt);
+      DT_LEAVE_GUI_UPDATE();
+      break;
+    }
+
+    case DT_EXPORT_LIMIT_HEIGHT:
+    {
+      gtk_widget_set_sensitive(d->width, FALSE);
+      gtk_widget_set_sensitive(d->height, TRUE);
+      dt_conf_set_int(CONFIG_PREFIX "width", 0);
+      const uint32_t preview_w = (h > 0 && aspect > 0.0f)
+                                 ? (uint32_t)((float)h * aspect + 0.5f)
+                                 : 0;
+      DT_ENTER_GUI_UPDATE();
+      gchar *txt = g_strdup_printf("%u", preview_w);
+      gtk_entry_set_text(GTK_ENTRY(d->width), txt);
+      g_free(txt);
+      DT_LEAVE_GUI_UPDATE();
+      break;
+    }
+
+    case DT_EXPORT_LIMIT_LONG_EDGE:
+    {
+      // long-edge: width entry holds the long-edge target N.
+      // internally we set both conf width=N and height=N so the existing
+      // bounding-box logic gives long-edge = N for any orientation.
+      // displayed height = the actual short-edge for the active image.
+      gtk_widget_set_sensitive(d->width, TRUE);
+      gtk_widget_set_sensitive(d->height, FALSE);
+      if(w > 0)
+      {
+        dt_conf_set_int(CONFIG_PREFIX "height", w);
+        // preview the short edge for the active image
+        uint32_t preview_short;
+        if(aspect >= 1.0f) // landscape: short = w / aspect
+          preview_short = (uint32_t)((float)w / aspect + 0.5f);
+        else               // portrait: short = w * aspect
+          preview_short = (uint32_t)((float)w * aspect + 0.5f);
+        DT_ENTER_GUI_UPDATE();
+        gchar *txt = g_strdup_printf("%u", preview_short);
+        gtk_entry_set_text(GTK_ENTRY(d->height), txt);
+        g_free(txt);
+        DT_LEAVE_GUI_UPDATE();
+      }
+      break;
+    }
+  }
+}
+
+static void _limit_by_changed(GtkWidget *widget, dt_lib_export_t *d)
+{
+  DT_GUARD_GUI_UPDATE();
+  const int mode = dt_bauhaus_combobox_get(widget);
+  dt_conf_set_int(CONFIG_PREFIX "limit_by", mode);
+  _apply_limit_by_mode(d);
+}
+
+// Phase 1: apply a quick preset (sets dimensions, format and resets limit_by to "box")
+static void _quick_preset_clicked(GtkButton *button, dt_lib_export_t *d)
+{
+  const int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "preset_index"));
+  if(idx < 0 || idx >= (int)DT_EXPORT_QUICK_PRESET_COUNT) return;
+
+  const dt_export_quick_preset_t *p = &_quick_presets[idx];
+
+  // 1. switch to pixel mode (presets are pixel-based)
+  dt_bauhaus_combobox_set(d->dimensions_type, DT_DIMENSIONS_PIXELS);
+
+  // 2. set dimensions
+  dt_conf_set_int(CONFIG_PREFIX "width",  p->width);
+  dt_conf_set_int(CONFIG_PREFIX "height", p->height);
+  DT_ENTER_GUI_UPDATE();
+  {
+    gchar *wtxt = g_strdup_printf("%u", p->width);
+    gchar *htxt = g_strdup_printf("%u", p->height);
+    gtk_entry_set_text(GTK_ENTRY(d->width),  wtxt);
+    gtk_entry_set_text(GTK_ENTRY(d->height), htxt);
+    g_free(wtxt);
+    g_free(htxt);
+  }
+  DT_LEAVE_GUI_UPDATE();
+
+  // 3. switch format module
+  dt_imageio_module_format_t *fmod = dt_imageio_get_format_by_name(p->format_name);
+  if(fmod)
+  {
+    set_format_by_name(d, fmod->name());
+    dt_bauhaus_combobox_set_from_text(d->format, fmod->name());
+  }
+
+  // 4. reset limit_by to bounding-box so the user sees a normal state
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_combobox_set(d->limit_by, DT_EXPORT_LIMIT_BOX);
+  DT_LEAVE_GUI_UPDATE();
+  dt_conf_set_int(CONFIG_PREFIX "limit_by", DT_EXPORT_LIMIT_BOX);
+  _apply_limit_by_mode(d);
+
+  _resync_print_dimensions(d);
+  _size_in_px_update(d);
+
+  dt_control_log(_("applied export preset: %s"), _(p->label));
+}
+
 void gui_init(dt_lib_module_t *self)
 {
   dt_lib_export_t *d = malloc(sizeof(dt_lib_export_t));
@@ -1562,6 +1767,37 @@ void gui_init(dt_lib_module_t *self)
      dt_conf_get_string_const(CONFIG_PREFIX "resizing_factor"));
   gtk_widget_set_halign(GTK_WIDGET(d->scale), GTK_ALIGN_END);
 
+  // Phase 1: limit_by combo (sits above width/height)
+  DT_BAUHAUS_COMBOBOX_NEW_FULL
+    (d->limit_by, self, NULL, N_("limit by"),
+     _("how the output dimensions are constrained:\n"
+       "\u2022 bounding box: image fits inside W \303\227 H, ratio preserved\n"
+       "\u2022 width: you set width; height auto-derived from image ratio\n"
+       "\u2022 height: you set height; width auto-derived from image ratio\n"
+       "\u2022 long edge: you set one number; whichever side is longer is capped to it"),
+     dt_conf_get_int(CONFIG_PREFIX "limit_by"),
+     _limit_by_changed, d,
+     N_("bounding box"),
+     N_("width"),
+     N_("height"),
+     N_("long edge"));
+
+  // Phase 1: quick preset bar (sits above the limit_by combo)
+  d->quick_presets_box = gtk_flow_box_new();
+  gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(d->quick_presets_box), 3);
+  gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(d->quick_presets_box), 2);
+  gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(d->quick_presets_box), 2);
+  gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(d->quick_presets_box), GTK_SELECTION_NONE);
+  for(int i = 0; i < (int)DT_EXPORT_QUICK_PRESET_COUNT; i++)
+  {
+    GtkWidget *btn = gtk_button_new_with_label(_(_quick_presets[i].label));
+    gtk_widget_set_tooltip_text(btn, _(_quick_presets[i].tooltip));
+    g_object_set_data(G_OBJECT(btn), "preset_index", GINT_TO_POINTER(i));
+    g_signal_connect(G_OBJECT(btn), "clicked",
+                     G_CALLBACK(_quick_preset_clicked), d);
+    gtk_container_add(GTK_CONTAINER(d->quick_presets_box), btn);
+  }
+
   d->size_in_px = gtk_label_new("");
   gtk_label_set_ellipsize(GTK_LABEL(d->size_in_px), PANGO_ELLIPSIZE_START);
   gtk_widget_set_sensitive(GTK_WIDGET(d->size_in_px), FALSE);
@@ -1691,11 +1927,25 @@ void gui_init(dt_lib_module_t *self)
      dt_ui_section_label_new(C_("section", "format options")),
      d->format, d->format_extra_container,
      dt_ui_section_label_new(C_("section", "global options")),
+     d->limit_by,
      d->dimensions_type, d->px_size, d->print_size, d->scale, d->size_in_px,
      d->upscale, d->high_quality, d->export_masks,
      d->profile, d->intent,
      style_box, d->style_mode,
      d->export_button);
+
+  // Phase 1: wrap quick presets in a collapsible section so it adds zero height
+  // when collapsed (default). Placed after the main vbox so it appears at the
+  // bottom of the export module, like the existing multi-preset export section.
+  dt_gui_new_collapsible_section(&d->quick_cs,
+                                 "plugins/lighttable/export/quick_presets_expanded",
+                                 _("quick presets"),
+                                 GTK_BOX(self->widget),
+                                 DT_ACTION(self));
+  gtk_widget_set_tooltip_text(d->quick_cs.expander,
+                              _("one-click export presets for common output sizes"));
+  gtk_box_pack_start(GTK_BOX(d->quick_cs.container), d->quick_presets_box,
+                     FALSE, FALSE, 0);
 
   // multi-preset export
   dt_gui_new_collapsible_section(&d->cs,
@@ -1754,6 +2004,9 @@ void gui_init(dt_lib_module_t *self)
   gtk_entry_set_text(GTK_ENTRY(d->height), setting);
 
   _size_update_display(d);
+
+  // Phase 1: apply the persisted limit_by mode (greys out the right entry)
+  _apply_limit_by_mode(d);
 
   // Set storage
   setting = dt_conf_get_string_const(CONFIG_PREFIX "storage_name");

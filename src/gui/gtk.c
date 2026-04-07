@@ -2707,7 +2707,11 @@ void dt_ui_restore_panels(const dt_ui_t *ui)
       if(dt_conf_key_exists(key))
         dt_ui_panel_show(ui, k, dt_conf_get_bool(key), FALSE);
       else
-        dt_ui_panel_show(ui, k, TRUE, TRUE);
+        // Phase 1 layout fix: bottom panel (film strip) defaults to HIDDEN.
+        // Users can expand it via the bottom border arrow / Ctrl+F shortcut,
+        // or by toggling via the panel handle. The visibility choice is then
+        // remembered in conf so the default only applies on first launch.
+        dt_ui_panel_show(ui, k, (k != DT_UI_PANEL_BOTTOM), TRUE);
 
       g_free(key);
     }
@@ -3032,10 +3036,21 @@ static GtkWidget *_ui_init_panel_container_top(GtkWidget *container)
 static gboolean _ui_init_panel_container_center_scroll_event(GtkWidget *widget,
                                                              const GdkEventScroll *event)
 {
-  // just make sure nothing happens unless ctrl-alt are pressed:
-  return (((dt_gdk_event_get_state(event) & gtk_accelerator_get_default_mod_mask())
-           != darktable.gui->sidebar_scroll_mask)
-          != dt_conf_get_bool("darkroom/ui/sidebar_scroll_default"));
+  // Phase 1 layout fix: allow plain mouse wheel to scroll the side panel
+  // when the cursor is over the panel's empty/background area or over a
+  // module header (i.e., NOT over a focused control like a slider/combo).
+  // The original code blocked all wheel events to avoid accidentally
+  // changing slider values, but that left long panels unscrollable.
+  //
+  // Strategy: if a modifier key is held, behave as before (consume so
+  // controls react). Otherwise return FALSE so the GtkScrolledWindow
+  // receives the event and scrolls the panel.
+  if((dt_gdk_event_get_state(event) & gtk_accelerator_get_default_mod_mask()) ==
+     darktable.gui->sidebar_scroll_mask)
+    return TRUE; // user is holding modifier -> let controls handle it
+  if(dt_conf_get_bool("darkroom/ui/sidebar_scroll_default"))
+    return TRUE; // legacy preference: never wheel-scroll the panel
+  return FALSE;  // default: allow wheel to scroll the panel
   // GTK4: return GDK_EVENT_PROPAGATE/GDK_EVENT_STOP
 }
 
@@ -3616,6 +3631,9 @@ static void _ui_init_panel_bottom(dt_ui_t *ui,
                         _panel_handle_cursor_enter, _panel_handle_cursor_leave, widget);
   gtk_widget_show(handle);
 
+  // Bottom panel spans the full window width (columns 1-3) when expanded.
+  // It is hidden by default (see dt_ui_restore_panels), so side panels
+  // remain unobstructed; the user expands it on demand via the bottom border.
   gtk_grid_attach(GTK_GRID(container), over, 1, 2, 3, 1);
 
   /* add the container */
