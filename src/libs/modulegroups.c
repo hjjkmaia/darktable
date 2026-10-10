@@ -2148,6 +2148,10 @@ void init_presets(dt_lib_module_t *self)
   AM("colorbalancergb/global vibrance");
   AM("colorbalancergb/global saturation");
   AM("@tone curve");
+  AM("paramcurve/highlights");
+  AM("paramcurve/lights");
+  AM("paramcurve/darks");
+  AM("paramcurve/shadows");
   AM("rgbcurve/channel");
   AM("rgbcurve/curve");
 
@@ -2170,6 +2174,7 @@ void init_presets(dt_lib_module_t *self)
   AM("highlights");
 
   SMG(C_("modulegroup", "tone curve"), "tone");
+  AM("paramcurve");
   AM("rgbcurve");
   AM("tonecurve");
   AM("rgblevels");
