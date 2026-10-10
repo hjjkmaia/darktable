@@ -323,6 +323,7 @@ src/iop/invert.c
 src/iop/lens.cc
 src/iop/levels.c
 src/iop/liquify.c
+src/iop/localmask.c
 src/iop/lowlight.c
 src/iop/lowpass.c
 src/iop/lut3d.c

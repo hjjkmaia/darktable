@@ -111,6 +111,7 @@ const dt_iop_order_entry_t legacy_order[] = {
   { {23.0f }, "basecurve", 0},
   { {24.0f }, "bilateral", 0},
   { {25.0f }, "profile_gamma", 0},
+  { {25.5f }, "localmask", 0},
   { {26.0f }, "hazeremoval", 0},
   { {27.0f }, "colorin", 0},
   { {27.5f }, "channelmixerrgb", 0},
@@ -202,6 +203,7 @@ const dt_iop_order_entry_t v30_order[] = {
                                   // lensfun does not reintroduce
                                   // chromatic aberrations when trying
                                   // to correct them
+  { {13.8f }, "localmask", 0},
   { {14.0f }, "hazeremoval", 0},
   { {15.0f }, "ashift", 0},
   { {16.0f }, "flip", 0},
@@ -326,6 +328,7 @@ const dt_iop_order_entry_t v50_order[] = {
                                   // lensfun does not reintroduce
                                   // chromatic aberrations when trying
                                   // to correct them
+  { {13.8f }, "localmask", 0},
   { {14.0f }, "hazeremoval", 0},
   { {15.0f }, "ashift", 0},
   { {16.0f }, "flip", 0},
@@ -452,6 +455,7 @@ const dt_iop_order_entry_t v30_jpg_order[] = {
   { { 28.0f }, "lens", 0},
   { { 28.0f }, "cacorrectrgb", 0}, // correct chromatic aberrations after lens correction so that lensfun
                                   // does not reintroduce chromatic aberrations when trying to correct them
+  { { 28.0f }, "localmask", 0},
   { { 28.0f }, "hazeremoval", 0},
   { { 28.0f }, "ashift", 0},
   { { 28.0f }, "flip", 0},
@@ -579,6 +583,7 @@ const dt_iop_order_entry_t v50_jpg_order[] = {
   { { 28.0f }, "lens", 0},
   { { 28.0f }, "cacorrectrgb", 0}, // correct chromatic aberrations after lens correction so that lensfun
                                   // does not reintroduce chromatic aberrations when trying to correct them
+  { { 28.0f }, "localmask", 0},
   { { 28.0f }, "hazeremoval", 0},
   { { 28.0f }, "ashift", 0},
   { { 28.0f }, "flip", 0},
@@ -773,6 +778,7 @@ void dt_ioppr_migrate_legacy_iop_order_list(GList *iop_order_list)
   _insert_before_after(iop_order_list, "highlights", "rasterfile", TRUE);
   _insert_before_after(iop_order_list, "demosaic", "demosaicscale", FALSE);
   _insert_before_after(iop_order_list, "colorbalance", "colorharmonizer", TRUE);
+  _insert_before_after(iop_order_list, "hazeremoval", "localmask", TRUE);
 }
 
 static dt_iop_order_t _ioppr_get_default_iop_order_version(const dt_imgid_t imgid)
