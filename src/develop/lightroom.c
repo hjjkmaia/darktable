@@ -26,7 +26,11 @@
 #include "common/ratings.h"
 #include "common/tags.h"
 #include "common/metadata.h"
+#include "control/conf.h"
 #include "control/control.h"
+#include "develop/blend.h"
+#include "develop/iop_params.h"
+#include "develop/lightroom_map.h"
 
 #include <libxml/parser.h>
 #include <libxml/xpath.h>
@@ -274,14 +278,6 @@ static float get_interpolate(lr2dt_t lr2dt_table[], const float value)
            * (lr2dt_table[k + 1].dt - lr2dt_table[k].dt);
 }
 
-static float lr2dt_blacks(const float value)
-{
-  lr2dt_t lr2dt_blacks_table[]
-      = { { -100, 0.020 }, { -50, 0.005 }, { 0, 0 }, { 50, -0.005 }, { 100, -0.010 } };
-
-  return get_interpolate(lr2dt_blacks_table, value);
-}
-
 static float lr2dt_vignette_gain(const float value)
 {
   lr2dt_t lr2dt_vignette_table[] = { { -100, -1 }, { -50, -0.7 }, { 0, 0 }, { 50, 0.5 }, { 100, 1 } };
@@ -315,13 +311,6 @@ static float lr2dt_splittoning_balance(const float value)
   lr2dt_t lr2dt_splittoning_table[] = { { -100, 100 }, { 0, 0 }, { 100, 0 } };
 
   return get_interpolate(lr2dt_splittoning_table, value);
-}
-
-static float lr2dt_clarity(const float value)
-{
-  lr2dt_t lr2dt_clarity_table[] = { { -100, -.650 }, { 0, 0 }, { 100, .650 } };
-
-  return get_interpolate(lr2dt_clarity_table, value);
 }
 
 static void dt_add_hist(const dt_imgid_t imgid, const char *operation, const dt_iop_params_t *params, const int params_size, char *imported,
@@ -425,6 +414,11 @@ typedef struct lr_data_t
   dt_iop_bilat_params_t pbl;
   gboolean has_bilat;
 
+  // crs tags the mapping table owns, name -> gdouble. Darkroom path only.
+  GHashTable *mapped;
+  // any ColorGrade* tag is present, so the legacy splittoning row is suppressed
+  gboolean has_colorgrade;
+
   gboolean has_tags;
 
   int rating;
@@ -489,6 +483,22 @@ static void _lrop(const dt_develop_t *dev, const xmlDocPtr doc, const dt_imgid_t
 
   if(value)
   {
+    // Tags in the mapping table are applied later, one blob per module.
+    // Recording them here is what keeps the legacy exposure / clarity
+    // writers from also firing: those branches are gone.
+    if(dev != NULL && data->mapped)
+    {
+      const dt_lr_mapping_t *probe[1];
+      if(dt_lr_map_lookup((const char *)name, DT_LR_WF_ALL, probe, 1) > 0)
+      {
+        gdouble *stored = g_new(gdouble, 1);
+        *stored = g_ascii_strtod((const char *)value, NULL);
+        g_hash_table_replace(data->mapped, g_strdup((const char *)name), stored);
+      }
+      if(g_str_has_prefix((const char *)name, "ColorGrade"))
+        data->has_colorgrade = TRUE;
+    }
+
     if(!xmlStrcmp(name, (const xmlChar *)"CropTop"))
       data->pc.cy = g_ascii_strtod((char *)value, NULL);
     else if(!xmlStrcmp(name, (const xmlChar *)"CropRight"))
@@ -514,24 +524,6 @@ static void _lrop(const dt_develop_t *dev, const xmlDocPtr doc, const dt_imgid_t
     else if(!xmlStrcmp(name, (const xmlChar *)"HasCrop"))
     {
       if(!xmlStrcmp(value, (const xmlChar *)"True")) data->has_crop = TRUE;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"Blacks2012"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0)
-      {
-        data->has_exposure = TRUE;
-        data->pe.black = lr2dt_blacks((float)v);
-      }
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"Exposure2012"))
-    {
-      const float v = g_ascii_strtod((char *)value, NULL);
-      if(v != 0.0)
-      {
-        data->has_exposure = TRUE;
-        data->pe.exposure = v;
-      }
     }
     else if(!xmlStrcmp(name, (const xmlChar *)"PostCropVignetteAmount"))
     {
@@ -790,15 +782,6 @@ static void _lrop(const dt_develop_t *dev, const xmlDocPtr doc, const dt_imgid_t
     {
       const float v = g_ascii_strtod((char *)value, NULL);
       data->pst.balance = lr2dt_splittoning_balance(v);
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"Clarity2012"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0)
-      {
-        data->has_bilat = TRUE;
-        data->pbl.detail = lr2dt_clarity((float)v);
-      }
     }
     else if(!xmlStrcmp(name, (const xmlChar *)"Rating"))
     {
@@ -1120,6 +1103,222 @@ static inline float round5(const double x)
   return round(x * 100000.f) / 100000.f;
 }
 
+// One history row for a mapped module: current params version, the module's
+// current default blend, multi_priority 0. This is the D14 write. It replaces
+// the hard-coded LRDT_* version and the legacy v4 blend blob for these rows.
+static void _lr_add_hist_current(const dt_imgid_t imgid,
+                                 dt_iop_module_t *module,
+                                 const void *params,
+                                 const size_t params_size,
+                                 const int version,
+                                 char *imported,
+                                 const size_t imported_len,
+                                 int *import_count)
+{
+  int32_t num = 0;
+  sqlite3_stmt *stmt;
+
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT COUNT(*) FROM main.history WHERE imgid = ?1",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  if(sqlite3_step(stmt) == SQLITE_ROW)
+    num = sqlite3_column_int(stmt, 0);
+  sqlite3_finalize(stmt);
+
+  // clang-format off
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "INSERT INTO main.history"
+                              "  (imgid, num, module, operation, op_params, enabled,"
+                              "   blendop_params, blendop_version, multi_priority, multi_name)"
+                              " VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 0, '')",
+                              -1, &stmt, NULL);
+  // clang-format on
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, num);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 3, version);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 4, module->op, -1, SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 5, params, (int)params_size, SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, module->default_blendop_params,
+                             sizeof(dt_develop_blend_params_t), SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 7, dt_develop_blend_version());
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+
+  // clang-format off
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "UPDATE main.images"
+                              " SET history_end = (SELECT IFNULL(MAX(num) + 1, 0)"
+                              "                    FROM main.history"
+                              "                    WHERE imgid = ?1)"
+                              " WHERE id = ?1",
+                              -1, &stmt, NULL);
+  // clang-format on
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+
+  if(imported[0]) g_strlcat(imported, ", ", imported_len);
+  g_strlcat(imported, dt_iop_get_localized_name(module->op), imported_len);
+  (*import_count)++;
+}
+
+typedef struct _lr_write_t
+{
+  const dt_lr_mapping_t *row;
+  float lr;
+} _lr_write_t;
+
+typedef struct _lr_op_acc_t
+{
+  const char *op;
+  GArray *writes;
+} _lr_op_acc_t;
+
+static _lr_op_acc_t *_lr_acc(GPtrArray *ops, const char *op)
+{
+  for(guint i = 0; i < ops->len; i++)
+  {
+    _lr_op_acc_t *acc = g_ptr_array_index(ops, i);
+    if(!g_strcmp0(acc->op, op)) return acc;
+  }
+  _lr_op_acc_t *acc = g_malloc0(sizeof(_lr_op_acc_t));
+  acc->op = op;
+  acc->writes = g_array_new(FALSE, FALSE, sizeof(_lr_write_t));
+  g_ptr_array_add(ops, acc);
+  return acc;
+}
+
+static void _lr_acc_free(void *p)
+{
+  _lr_op_acc_t *acc = p;
+  g_array_free(acc->writes, TRUE);
+  g_free(acc);
+}
+
+static gint _lr_acc_cmp(gconstpointer a, gconstpointer b)
+{
+  const _lr_op_acc_t *aa = *(const _lr_op_acc_t *const *)a;
+  const _lr_op_acc_t *bb = *(const _lr_op_acc_t *const *)b;
+  return g_strcmp0(aa->op, bb->op);
+}
+
+// Seed one blob per target op from module->default_params, apply every
+// non-zero tag that maps onto it, and append one multi_priority 0 row.
+// include_colorequal stays FALSE until the HSL commit: those rows are
+// already in the table, and the legacy colorzones path still owns them.
+static void _lr_import_mapped(dt_develop_t *dev,
+                              const dt_imgid_t imgid,
+                              GHashTable *tags,
+                              const gboolean include_colorequal,
+                              char *imported,
+                              const size_t imported_len,
+                              int *n_import,
+                              gboolean *refresh_needed)
+{
+  if(!dev || !dev->iop || !tags || g_hash_table_size(tags) == 0) return;
+
+  const dt_lr_workflow_t wf =
+    dt_lr_workflow_from_conf(dt_conf_get_string_const("plugins/darkroom/workflow"));
+
+  GPtrArray *ops = g_ptr_array_new_with_free_func(_lr_acc_free);
+  GHashTableIter it;
+  gpointer key = NULL;
+  gpointer value = NULL;
+  g_hash_table_iter_init(&it, tags);
+  while(g_hash_table_iter_next(&it, &key, &value))
+  {
+    const char *tag = key;
+    const float lr = (float)(*(const gdouble *)value);
+    const dt_lr_mapping_t *rows[8];
+    const size_t n = dt_lr_map_lookup(tag, wf, rows, G_N_ELEMENTS(rows));
+    if(n > G_N_ELEMENTS(rows))
+      dt_print(DT_DEBUG_ALWAYS,
+               "[lightroom] tag '%s' has %zu mappings; only the first %zu are applied",
+               tag, n, G_N_ELEMENTS(rows));
+
+    for(size_t i = 0; i < MIN(n, G_N_ELEMENTS(rows)); i++)
+    {
+      const dt_lr_mapping_t *row = rows[i];
+      if(!include_colorequal && !g_strcmp0(row->op, "colorequal"))
+        continue;
+      // a zero Lightroom value contributes nothing, so an op whose tags
+      // are all zero never gets a row
+      if((row->flags & DT_LR_SKIP_IF_ZERO) && lr == 0.0f)
+        continue;
+
+      _lr_write_t w = { row, lr };
+      g_array_append_val(_lr_acc(ops, row->op)->writes, w);
+    }
+  }
+
+  g_ptr_array_sort(ops, _lr_acc_cmp);
+
+  for(guint i = 0; i < ops->len; i++)
+  {
+    _lr_op_acc_t *acc = g_ptr_array_index(ops, i);
+    if(acc->writes->len == 0) continue;
+
+    dt_iop_module_t *module = dt_iop_get_module_by_op_priority(dev->iop, acc->op, 0);
+    if(!module || !module->default_params || !module->default_blendop_params)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[lightroom] no priority-0 instance of '%s'; skipped", acc->op);
+      continue;
+    }
+
+    dt_iop_params_err_t err = DT_IOP_PARAMS_OK;
+    dt_iop_params_builder_t *builder = dt_iop_params_builder_new(
+      acc->op, module->default_params, (size_t)module->params_size, &err);
+    if(!builder)
+    {
+      dt_print(DT_DEBUG_ALWAYS, "[lightroom] cannot seed '%s': %s",
+               acc->op, dt_iop_params_err_str(err));
+      continue;
+    }
+
+    int applied = 0;
+    for(guint w = 0; w < acc->writes->len; w++)
+    {
+      const _lr_write_t *wr = &g_array_index(acc->writes, _lr_write_t, w);
+      float v = wr->row->convert ? wr->row->convert(wr->lr) : wr->lr;
+      if(wr->row->flags & DT_LR_ADD_TO_DEFAULT)
+      {
+        float base = 0.0f;
+        err = dt_iop_params_builder_get_float(builder, wr->row->field, &base);
+        if(err != DT_IOP_PARAMS_OK)
+        {
+          dt_print(DT_DEBUG_ALWAYS, "[lightroom] %s.%s: %s",
+                   acc->op, wr->row->field, dt_iop_params_err_str(err));
+          continue;
+        }
+        v += base;
+      }
+      err = dt_iop_params_builder_set_float(builder, wr->row->field, v);
+      if(err != DT_IOP_PARAMS_OK)
+      {
+        dt_print(DT_DEBUG_ALWAYS, "[lightroom] %s.%s = %.6g: %s",
+                 acc->op, wr->row->field, v, dt_iop_params_err_str(err));
+        continue;
+      }
+      applied++;
+    }
+
+    if(applied > 0)
+    {
+      size_t size = 0;
+      int version = 0;
+      const void *blob = dt_iop_params_builder_blob(builder, &size, &version);
+      _lr_add_hist_current(imgid, module, blob, size, version,
+                           imported, imported_len, n_import);
+      *refresh_needed = TRUE;
+    }
+    dt_iop_params_builder_free(builder);
+  }
+
+  g_ptr_array_free(ops, TRUE);
+}
+
 gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto)
 {
   gboolean refresh_needed = FALSE;
@@ -1241,6 +1440,10 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
   data.has_colorzones = FALSE;
   data.has_splittoning = FALSE;
   data.has_bilat = FALSE;
+  data.has_colorgrade = FALSE;
+  data.mapped = NULL;
+  if(dev != NULL)
+    data.mapped = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
   data.has_tags = FALSE;
   data.rating = 0;
   data.has_rating = FALSE;
@@ -1308,6 +1511,12 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
   xmlFreeDoc(doc);
 
   //  Integrates into the history all the imported iop
+
+  // HSL stays on colorzones in this commit. The colorequal rows are already
+  // in the mapping table; the next commit turns this on and drops colorzones.
+  if(dev != NULL && data.mapped)
+    _lr_import_mapped(dev, imgid, data.mapped, FALSE, imported, sizeof(imported),
+                      &n_import, &refresh_needed);
 
   if(dev != NULL && is_lr && dt_image_is_raw(&dev->image_storage))
   {
@@ -1394,12 +1603,9 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     refresh_needed = TRUE;
   }
 
-  if(dev != NULL && data.has_exposure)
-  {
-    dt_add_hist(imgid, "exposure", (dt_iop_params_t *)&data.pe, sizeof(dt_iop_exposure_params_t), imported,
-                sizeof(imported), LRDT_EXPOSURE_VERSION, &n_import);
-    refresh_needed = TRUE;
-  }
+  // Exposure2012 and Blacks2012 are mapped (exposure slider, tone-mapper
+  // targets). The legacy v2 exposure blob, which also wrote exposure.black,
+  // is not emitted.
 
   if(dev != NULL && data.has_grain)
   {
@@ -1465,9 +1671,11 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     refresh_needed = TRUE;
   }
 
-  if(dev != NULL &&
-     (data.curve_kind != linear
-      || data.ptc_value[0] != 0 || data.ptc_value[1] != 0 || data.ptc_value[2] != 0 || data.ptc_value[3] != 0))
+  // Parametric* sliders stay unwired until paramcurve exists (stage 3).
+  // A point curve (ToneCurvePV2012, anything but Linear) still imports.
+  // All-zero parametric sliders already emitted nothing; non-zero ones
+  // must not grow a tonecurve node either.
+  if(dev != NULL && data.curve_kind != linear)
   {
     const int total_pts = (data.curve_kind == custom) ? data.n_pts : 6;
     data.ptc.tonecurve_nodes[ch_L] = total_pts;
@@ -1487,45 +1695,10 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     for(int k = 0; k < 7; k++) data.ptc.tonecurve[ch_b][k].x = linear_ab[k];
     for(int k = 0; k < 7; k++) data.ptc.tonecurve[ch_b][k].y = linear_ab[k];
 
-    // Set the base tonecurve
-
-    if(data.curve_kind == linear)
+    for(int k = 0; k < total_pts; k++)
     {
-      data.ptc.tonecurve[ch_L][0].x = 0.0;
-      data.ptc.tonecurve[ch_L][0].y = 0.0;
-      data.ptc.tonecurve[ch_L][1].x = data.ptc_split[0] / 2.0;
-      data.ptc.tonecurve[ch_L][1].y = data.ptc_split[0] / 2.0;
-      data.ptc.tonecurve[ch_L][2].x = data.ptc_split[1] - (data.ptc_split[1] - data.ptc_split[0]) / 2.0;
-      data.ptc.tonecurve[ch_L][2].y = data.ptc_split[1] - (data.ptc_split[1] - data.ptc_split[0]) / 2.0;
-      data.ptc.tonecurve[ch_L][3].x = data.ptc_split[1] + (data.ptc_split[2] - data.ptc_split[1]) / 2.0;
-      data.ptc.tonecurve[ch_L][3].y = data.ptc_split[1] + (data.ptc_split[2] - data.ptc_split[1]) / 2.0;
-      data.ptc.tonecurve[ch_L][4].x = data.ptc_split[2] + (1.0 - data.ptc_split[2]) / 2.0;
-      data.ptc.tonecurve[ch_L][4].y = data.ptc_split[2] + (1.0 - data.ptc_split[2]) / 2.0;
-      data.ptc.tonecurve[ch_L][5].x = 1.0;
-      data.ptc.tonecurve[ch_L][5].y = 1.0;
-    }
-    else
-    {
-      for(int k = 0; k < total_pts; k++)
-      {
-        data.ptc.tonecurve[ch_L][k].x = data.curve_pts[k][0] / 255.0;
-        data.ptc.tonecurve[ch_L][k].y = data.curve_pts[k][1] / 255.0;
-      }
-    }
-
-    if(data.curve_kind != custom)
-    {
-      // set shadows/darks/lights/highlight adjustments
-
-      data.ptc.tonecurve[ch_L][1].y += data.ptc.tonecurve[ch_L][1].y * ((float)data.ptc_value[0] / 100.0);
-      data.ptc.tonecurve[ch_L][2].y += data.ptc.tonecurve[ch_L][2].y * ((float)data.ptc_value[1] / 100.0);
-      data.ptc.tonecurve[ch_L][3].y += data.ptc.tonecurve[ch_L][3].y * ((float)data.ptc_value[2] / 100.0);
-      data.ptc.tonecurve[ch_L][4].y += data.ptc.tonecurve[ch_L][4].y * ((float)data.ptc_value[3] / 100.0);
-
-      if(data.ptc.tonecurve[ch_L][1].y > data.ptc.tonecurve[ch_L][2].y)
-        data.ptc.tonecurve[ch_L][1].y = data.ptc.tonecurve[ch_L][2].y;
-      if(data.ptc.tonecurve[ch_L][3].y > data.ptc.tonecurve[ch_L][4].y)
-        data.ptc.tonecurve[ch_L][4].y = data.ptc.tonecurve[ch_L][3].y;
+      data.ptc.tonecurve[ch_L][k].x = data.curve_pts[k][0] / 255.0;
+      data.ptc.tonecurve[ch_L][k].y = data.curve_pts[k][1] / 255.0;
     }
 
     dt_add_hist(imgid, "tonecurve", (dt_iop_params_t *)&data.ptc, sizeof(dt_iop_tonecurve_params_t), imported,
@@ -1546,7 +1719,10 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     refresh_needed = TRUE;
   }
 
-  if(dev != NULL && data.has_splittoning)
+  // Color grade owns these files. The legacy splittoning row divides hue
+  // by 255, so hue 210 would land near 297 degrees. Keep splittoning only
+  // for an old sidecar that has SplitToning* and no ColorGrade*.
+  if(dev != NULL && data.has_splittoning && !data.has_colorgrade)
   {
     data.pst.compress = 50.0;
 
@@ -1555,15 +1731,7 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     refresh_needed = TRUE;
   }
 
-  if(dev != NULL && data.has_bilat)
-  {
-    data.pbl.sigma_r = 100.0;
-    data.pbl.sigma_s = 100.0;
-
-    dt_add_hist(imgid, "bilat", (dt_iop_params_t *)&data.pbl, sizeof(dt_iop_bilat_params_t), imported,
-                sizeof(imported), LRDT_BILAT_VERSION, &n_import);
-    refresh_needed = TRUE;
-  }
+  // Clarity2012 is contrastntexture.gain_coarse. No bilat row.
 
   if(data.has_tags)
   {
@@ -1605,6 +1773,8 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     g_strlcat(imported, _("color label"), sizeof(imported));
     n_import++;
   }
+
+  if(data.mapped) g_hash_table_destroy(data.mapped);
 
   if(dev != NULL && refresh_needed && dev->gui_attached)
   {
