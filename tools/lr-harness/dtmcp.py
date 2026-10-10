@@ -171,6 +171,9 @@ def server_env() -> dict[str, str]:
     # reads. Without this, export's dt_dev_init(FALSE) consumes first_run
     # and the Lightroom module rows are never written. See README.md.
     env["DT_LR_HISTORY_OPEN"] = "1"
+    # A leftover DT_LR_MAP_VALIDATE makes darktable-mcp print the mapping
+    # check and exit. The harness needs a server that stays up.
+    env.pop("DT_LR_MAP_VALIDATE", None)
     env.pop("DTMCP_SERVE", None)
     return env
 

@@ -168,7 +168,10 @@ dt_dev_cleanup(&dev);
 `dt_bridge_get_history_json` calls it when `DT_LR_HISTORY_OPEN` is set and
 the server is not `--read-only`, then queries `main.history`. The harness
 sets the variable in the server environment. Other MCP clients that do not
-set it still get a plain history read. This harness does not launch the GUI.
+set it still get a plain history read. The harness also drops
+`DT_LR_MAP_VALIDATE` from that environment: when it is set, `darktable-mcp`
+prints the mapping self-check and exits instead of serving. This harness
+does not launch the GUI.
 
 `darktable-cli` was the other candidate. It uses the same headless
 `dt_dev_init(FALSE)` as MCP's export, and its `--verbose` history print
