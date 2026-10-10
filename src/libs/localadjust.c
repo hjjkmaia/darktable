@@ -331,6 +331,8 @@ static void _refresh_sliders(dt_lib_module_t *self)
   d->updating = FALSE;
 }
 
+static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self);
+
 static gboolean _has_group(const GArray *groups, const int priority)
 {
   for(guint i = 0; i < groups->len; i++)
@@ -373,29 +375,29 @@ static void _update(dt_lib_module_t *self)
     else if(!_has_group(groups, d->selected))
       d->selected = g_array_index(groups, int, 0);
 
-    GtkListBoxRow *select_row = NULL;
     for(guint i = 0; i < groups->len; i++)
     {
       const int priority = g_array_index(groups, int, i);
       dt_iop_module_t *mask = _find_mask_instance(dev, priority);
       gchar *item_name = dt_history_item_get_name(mask);
-      GtkWidget *row = gtk_list_box_row_new();
-      GtkWidget *label = dt_ui_label_new(item_name);
+      // a plain list row has no visible selected state in this theme.
+      // a checked button uses the same highlight as the history list.
+      GtkWidget *row = gtk_toggle_button_new_with_label(item_name);
+      gtk_widget_set_hexpand(row, TRUE);
+      GtkWidget *lab = gtk_bin_get_child(GTK_BIN(row));
+      gtk_widget_set_halign(lab, GTK_ALIGN_START);
+      gtk_label_set_xalign(GTK_LABEL(lab), 0.0f);
       gtk_widget_set_tooltip_text
-        (label, _("one local adjustment: draw on this mask with the "
-                  "mask manager, adjust it with the sliders below"));
+        (row, _("one local adjustment: draw on this mask with the "
+                "mask manager, adjust it with the sliders below"));
       g_free(item_name);
-      gtk_container_add(GTK_CONTAINER(row), label);
       g_object_set_data(G_OBJECT(row), "mask-priority", GINT_TO_POINTER(priority));
-      gtk_container_add(GTK_CONTAINER(d->list), row);
-      if(priority == d->selected) select_row = GTK_LIST_BOX_ROW(row);
+      g_signal_connect(G_OBJECT(row), "toggled", G_CALLBACK(_row_toggled), self);
+      gtk_box_pack_start(GTK_BOX(d->list), row, FALSE, FALSE, 0);
+      if(priority == d->selected)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(row), TRUE);
     }
     gtk_widget_show_all(d->list);
-
-    if(select_row)
-      gtk_list_box_select_row(GTK_LIST_BOX(d->list), select_row);
-    else
-      gtk_list_box_unselect_all(GTK_LIST_BOX(d->list));
 
     g_array_free(d->groups, TRUE);
     d->groups = groups;
@@ -407,14 +409,35 @@ static void _update(dt_lib_module_t *self)
   gtk_widget_set_sensitive(d->delete_button, d->selected >= 0);
 }
 
-static void _row_selected(GtkListBox *box, GtkListBoxRow *row, dt_lib_module_t *self)
+static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self)
 {
   dt_lib_localadjust_t *d = self->data;
   if(d->updating) return;
 
-  d->selected = row
-    ? GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-priority"))
-    : -1;
+  const int priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "mask-priority"));
+
+  // one adjustment stays chosen: clicking the highlighted row again
+  // must not turn the highlight off
+  if(!gtk_toggle_button_get_active(button))
+  {
+    if(priority == d->selected)
+    {
+      d->updating = TRUE;
+      gtk_toggle_button_set_active(button, TRUE);
+      d->updating = FALSE;
+    }
+    return;
+  }
+
+  d->updating = TRUE;
+  GList *rows = gtk_container_get_children(GTK_CONTAINER(d->list));
+  for(GList *it = rows; it; it = g_list_next(it))
+    if(it->data != button && gtk_toggle_button_get_active(it->data))
+      gtk_toggle_button_set_active(it->data, FALSE);
+  g_list_free(rows);
+  d->updating = FALSE;
+
+  d->selected = priority;
   _refresh_sliders(self);
   gtk_widget_set_sensitive(d->sliders_box, d->selected >= 0);
   gtk_widget_set_sensitive(d->delete_button, d->selected >= 0);
@@ -452,10 +475,7 @@ void gui_init(dt_lib_module_t *self)
   g_signal_connect(G_OBJECT(d->delete_button), "clicked",
                    G_CALLBACK(_delete_clicked), self);
 
-  d->list = gtk_list_box_new();
-  gtk_list_box_set_selection_mode(GTK_LIST_BOX(d->list), GTK_SELECTION_SINGLE);
-  g_signal_connect(G_OBJECT(d->list), "row-selected",
-                   G_CALLBACK(_row_selected), self);
+  d->list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
   d->sliders_box = dt_gui_vbox();
   for(int k = 0; k < SLIDER_COUNT; k++)
