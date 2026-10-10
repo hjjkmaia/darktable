@@ -35,10 +35,6 @@ STARTUP_S = 90
 RPC_S = 180
 MAX_LINE = 64 * 1024 * 1024
 
-# History renders only to force dt_dev_load_image -> dt_dev_read_history_ext.
-# The pixels are discarded. 128px is enough for that load to finish.
-HISTORY_WIDTH = 128
-
 CHANNELS = ("r", "g", "b")
 METRICS = ("min", "max", "mean", "p1", "p50", "p99", "clip_lo", "clip_hi")
 
@@ -171,6 +167,10 @@ def server_env() -> dict[str, str]:
     env["XDG_DATA_DIRS"] = "/opt/homebrew/share"
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
+    # get_history runs a darkroom-path open (full.pipe loading) before it
+    # reads. Without this, export's dt_dev_init(FALSE) consumes first_run
+    # and the Lightroom module rows are never written. See README.md.
+    env["DT_LR_HISTORY_OPEN"] = "1"
     env.pop("DTMCP_SERVE", None)
     return env
 
@@ -674,12 +674,17 @@ def photo_sidecar(raw: Path) -> Path:
 
 
 def cmd_history(session: Session, raw: Path) -> None:
-    """First-open import of a scratch copy, then the decoded history.
+    """First darkroom open of a scratch copy, then the decoded history.
 
-    import_images alone is the library path (dev == NULL): metadata only.
-    image_stats on that imgid is what runs dt_dev_load_image and therefore
-    dt_dev_read_history_ext. The copy is unique so auto-presets have not
-    been applied yet, and the caller's file is never the path darktable opens.
+    import_images is the library path (dev == NULL): metadata only.
+    get_history, with DT_LR_HISTORY_OPEN set on the server, is the darkroom
+    path: it creates full.pipe the way dt_dev_image() does, then loads the
+    image, so dt_lightroom_import runs while the pipe is loading. image_stats
+    must not run first. That call exports with dt_dev_init(FALSE), the pipe
+    stays NULL, and first_run is consumed before any module row is written.
+
+    A second get_history on the same imgid is a second open. The import is
+    one-shot, so it must not add rows.
     """
     sidecar = photo_sidecar(raw)
     hist_root = ROOT / "history"
@@ -698,15 +703,17 @@ def cmd_history(session: Session, raw: Path) -> None:
         die(f"import failed: {err}")
     imgid = images[0]["imgid"]
 
-    # This render is the headless stand-in for the first darkroom open.
-    session.tool("image_stats", {"input": {"imgid": imgid}, "width": HISTORY_WIDTH})
     history = content_json(session.tool("get_history", {"imgid": imgid}))
     if not isinstance(history, list):
         die(f"get_history returned unexpected JSON: {history!r}"[:500])
+    again = content_json(session.tool("get_history", {"imgid": imgid}))
+    if not isinstance(again, list):
+        die(f"get_history returned unexpected JSON: {again!r}"[:500])
     doc = {
         "file": raw.name,
         "sidecar": sidecar.name,
         "history": history,
+        "second_open_added": len(again) - len(history),
     }
     print(dump(doc), end="")
 

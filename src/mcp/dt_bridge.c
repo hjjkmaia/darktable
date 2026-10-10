@@ -1730,10 +1730,32 @@ char *dt_bridge_list_images_json(int limit, const char *folder, int rating,
   return out;
 }
 
+// Headless stand-in for a darkroom open. dt_dev_image() does the same two
+// steps: dt_dev_init(TRUE) creates full.pipe (dt_dev_init(FALSE), which export
+// and image_stats use, leaves it NULL), then gui_attached is cleared so the
+// load does not touch widgets. dt_dev_load_image() sets full.pipe->loading,
+// and that is the gate in dt_dev_read_history_ext() that runs
+// dt_lightroom_import() on first_run.
+static void _darkroom_open(const dt_imgid_t imgid)
+{
+  if(!dt_is_valid_imgid(imgid)) return;
+  dt_develop_t dev;
+  dt_dev_init(&dev, TRUE);
+  dev.gui_attached = FALSE;
+  dt_dev_load_image(&dev, imgid);
+  dt_dev_cleanup(&dev);
+}
+
 char *dt_bridge_get_history_json(int imgid, char **err)
 {
   // an empty array would otherwise read as "this image has no edits"
   if(!_require_image(imgid, "get_history", err)) return NULL;
+
+  // The lr-harness sets this so `history` takes the darkroom path. A second
+  // call on the same imgid is a second open: first_run is already consumed,
+  // so the import does not append again. Other callers keep a plain read.
+  if(!_read_only && g_getenv("DT_LR_HISTORY_OPEN"))
+    _darkroom_open((dt_imgid_t)imgid);
 
   sqlite3 *db = dt_database_get(darktable.db);
   sqlite3_stmt *st = NULL;

@@ -7,8 +7,7 @@ checked against the owner's photo-flavor sidecars (`IMG.xmp` beside `IMG.ARW`,
 is not the goal. Scales Lightroom does not publish are calibrated here.
 
 The client is Python 3, standard library only. It speaks JSON-RPC to this
-worktree's `darktable-mcp`. It does not modify C, and it does not open
-`~/.config/darktable`.
+worktree's `darktable-mcp`. It does not open `~/.config/darktable`.
 
 ## Baseline
 
@@ -117,7 +116,7 @@ min/max is rejected by the server.
 `history` needs the photo-flavor sidecar `basename.xmp` beside the raw
 (`DSC04302.ARW` needs `DSC04302.xmp`). It does not read `DSC04302.ARW.xmp`.
 
-Each invocation does four things:
+Each invocation does this:
 
 1. Copy the raw and the photo-flavor sidecar to a new directory under
    `/tmp/lr-harness/history/`. The caller's file is only read. A new copy
@@ -125,47 +124,67 @@ Each invocation does four things:
 2. `import_images` on that copy. This is the library path (`dev == NULL`).
    It records rating, labels, tags, GPS, and metadata. It does not write
    module rows.
-3. `image_stats` on the new `imgid` at 128 pixels wide. The pixels are
-   thrown away. The call exists because export loads the image with
-   `dt_dev_load_image`, which calls `dt_dev_read_history_ext`. That is the
-   first-open path: workflow defaults and auto-presets are written into
-   history.
-4. `get_history` on that `imgid`. Stdout is JSON: file name, sidecar name,
-   and the history entries (operation, version, enabled, iop order, and
-   decoded fields when the blob matches the module's current layout).
+3. `get_history` on that `imgid`. The server is started with
+   `DT_LR_HISTORY_OPEN=1`. Under that variable, and only then,
+   `dt_bridge_get_history_json` runs a darkroom open before it reads the
+   database (see below). Stdout is JSON: file name, sidecar name, the
+   history entries (operation, version, enabled, iop order, and decoded
+   fields when the blob matches the module's current layout), and
+   `second_open_added`.
+4. `get_history` again on the same `imgid`. That is a second open.
+   `second_open_added` is how many rows it appended. The import is
+   one-shot, so the number is 0.
+
+`image_stats` is not part of this sequence. Export loads the image with
+`dt_dev_init(FALSE)`, so `full.pipe` stays NULL, `dt_lightroom_import` does
+not write module rows, and `first_run` is still consumed. Calling it before
+`get_history` would burn the only import.
+
+#### How the darkroom open runs headless
+
+Module rows are written only on the darkroom path, and only when
+`dev->full.pipe` is loading (`dt_dev_read_history_ext` in
+`src/develop/develop.c`). `dt_dev_init` creates that pipe only when its
+`gui_attached` argument is true. MCP export and `darktable-cli` call
+`dt_dev_init(FALSE)`, so the pipe stays NULL and a first open through them
+records the workflow defaults only.
+
+`dt_dev_image()` already has the headless shape of a darkroom open: it
+calls `dt_dev_init(TRUE)` (the pipe exists) and then sets `gui_attached` to
+false so nothing talks to widgets. `dt_dev_load_image()` then sets
+`full.pipe->loading` and calls `dt_dev_read_history_ext`. On `first_run`
+that calls `dt_lightroom_import`.
+
+`history` uses that sequence and does not render. In
+`src/mcp/dt_bridge.c`, `_darkroom_open()` is:
+
+```c
+dt_dev_init(&dev, TRUE);
+dev.gui_attached = FALSE;
+dt_dev_load_image(&dev, imgid);
+dt_dev_cleanup(&dev);
+```
+
+`dt_bridge_get_history_json` calls it when `DT_LR_HISTORY_OPEN` is set and
+the server is not `--read-only`, then queries `main.history`. The harness
+sets the variable in the server environment. Other MCP clients that do not
+set it still get a plain history read. This harness does not launch the GUI.
 
 `darktable-cli` was the other candidate. It uses the same headless
 `dt_dev_init(FALSE)` as MCP's export, and its `--verbose` history print
-runs *before* that load, while the default library is `:memory:` and
-disappears when the process exits. MCP is the path that both runs
-`dt_dev_read_history_ext` and can return decoded fields.
+runs before that load, while the default library is `:memory:` and
+disappears when the process exits.
 
-Headless limit, checked in this tree: `dt_lightroom_import` writes module
-rows only when `dev->full.pipe` is loading (`src/develop/develop.c`, the
-`first_run` branch). `dt_dev_init` creates that pipe only for a GUI-attached
-develop, and MCP's export (like `darktable-cli`) passes `gui_attached =
-FALSE`, so the pipe stays NULL and the module import is skipped. Metadata
-from step 2 is still imported. The history JSON from step 4 is the
-workflow-default stack (exposure +0.7 EV and the sigmoid workflow), which
-is the baseline the other commands measure. Module rows from the Lightroom
-sidecar appear in this dump only once a headless open actually takes the
-`full.pipe` branch. This harness does not launch the GUI and does not
-change C.
+The workflow-default rows are still there (exposure +0.7 EV, sigmoid, and
+the rest of the auto-applied stack). Mapped Lightroom tags append one later
+row per module at `multi_priority` 0. For an equal priority the later row
+is the one the pipe uses. `iop_order` in the JSON is the integer
+`get_history` returns (a pipeline slot, with gaps of 100), not the legacy
+float in `src/common/iop_order.c` (sigmoid is 45.3 there and 6200 here).
+The scratch copy grows no `DSC04302.ARW.xmp`.
 
-Checked on a scratch copy of `DSC04302`: two first opens print the same
-history, and it is only the workflow default. In history order the ten rows
-are `rawprepare`, `colorin`, `colorout`, `gamma`, `temperature`,
-`highlights`, `channelmixerrgb`, `exposure` (version 7, the float32 value of
-+0.7 EV, black `-0.000244140625`), `flip`, and `sigmoid` (version 3). There
-is no `colorzones`, `bilat`, `splittoning`, or `tonecurve` row, and the
-scratch copy grows no `DSC04302.ARW.xmp`. `iop_order` in the JSON is the
-integer `get_history` returns (a pipeline slot, with gaps of 100), not the
-legacy float in `src/common/iop_order.c` (sigmoid is 45.3 there and 6200
-here).
-
-Running `history` twice compares two first opens. It does not reopen one
-image. A second develop of the same `imgid` is what would show whether a
-second open adds rows.
+Running `history` twice compares two first opens of two scratch copies. The
+`second_open_added` field is the second develop of one image.
 
 ## Fixtures
 
