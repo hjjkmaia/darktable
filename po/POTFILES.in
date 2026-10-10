@@ -398,6 +398,7 @@ src/libs/import.c
 src/libs/ioporder.c
 src/libs/lib.c
 src/libs/live_view.c
+src/libs/localadjust.c
 src/libs/location.c
 src/libs/map_locations.c
 src/libs/map_settings.c
