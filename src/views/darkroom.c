@@ -31,7 +31,9 @@
 #include "common/history.h"
 #include "common/image.h"
 #include "common/image_cache.h"
+#include "common/iop_order.h"
 #include "common/metadata.h"
+#include "common/mipmap_cache.h"
 #include "common/overlay.h"
 #include "common/selection.h"
 #include "common/styles.h"
@@ -107,6 +109,22 @@ static void _dev_change_image(dt_develop_t *dev, const dt_imgid_t imgid);
 static void _darkroom_display_second_window(dt_develop_t *dev);
 static void _darkroom_ui_second_window_write_config(GtkWidget *widget);
 static void _darkroom_ui_second_window_cleanup(dt_develop_t *dev);
+
+typedef struct dt_darkroom_before_after_t
+{
+  gboolean active;
+  dt_imgid_t imgid;
+  int history_end;
+  uint8_t *buf;
+  float scale;
+  size_t width, height;
+  dt_dev_zoom_pos_t zoom_pos;
+  dt_view_context_t ctx;
+} dt_darkroom_before_after_t;
+
+static dt_darkroom_before_after_t _darkroom_before_after = { 0 };
+
+static void _darkroom_before_after_stop(void);
 
 static gboolean _darkroom_iop_expanded(const char *op)
 {
@@ -280,6 +298,7 @@ uint32_t view(const dt_view_t *self)
 void cleanup(dt_view_t *self)
 {
   dt_develop_t *dev = self->data;
+  _darkroom_before_after_stop();
 
   // unref the grid lines popover if needed
   if(darktable.view_manager->guides_popover) g_object_unref(darktable.view_manager->guides_popover);
@@ -597,6 +616,350 @@ static void _view_paint_surface(cairo_t *cr,
   dt_pthread_mutex_unlock(&p->backbuf_mutex);
 }
 
+static void _darkroom_before_after_clear_render(void)
+{
+  dt_free_align(_darkroom_before_after.buf);
+  _darkroom_before_after.buf = NULL;
+  _darkroom_before_after.scale = 0.0f;
+  _darkroom_before_after.width = 0;
+  _darkroom_before_after.height = 0;
+  memset(_darkroom_before_after.zoom_pos, 0,
+         sizeof(_darkroom_before_after.zoom_pos));
+  _darkroom_before_after.ctx = DT_INVALID_HASH;
+}
+
+static void _darkroom_before_after_stop(void)
+{
+  _darkroom_before_after.active = FALSE;
+  _darkroom_before_after.imgid = NO_IMGID;
+  _darkroom_before_after.history_end = -1;
+  _darkroom_before_after_clear_render();
+}
+
+static gboolean _history_item_params_match(const void *params,
+                                           const int params_size,
+                                           const void *expected,
+                                           const int expected_size)
+{
+  return params_size == expected_size
+      && (params_size == 0
+          || (params && expected && !memcmp(params, expected, params_size)));
+}
+
+static gboolean _history_item_blend_match(const dt_dev_history_item_t *hist,
+                                          const void *blend_params,
+                                          const int blend_size)
+{
+  return blend_size == sizeof(dt_develop_blend_params_t)
+      && hist->blend_params
+      && blend_params
+      && !memcmp(hist->blend_params, blend_params, sizeof(dt_develop_blend_params_t));
+}
+
+static gboolean _history_item_matches_default_module(const dt_dev_history_item_t *hist)
+{
+  const dt_iop_module_t *module = hist ? hist->module : NULL;
+  return module
+      && module->default_enabled
+      && hist->enabled
+      && _history_item_params_match(hist->params,
+                                    module->params_size,
+                                    module->default_params,
+                                    module->params_size)
+      && _history_item_blend_match(hist,
+                                   module->default_blendop_params,
+                                   sizeof(dt_develop_blend_params_t));
+}
+
+static gboolean _history_item_matches_auto_preset(const dt_dev_history_item_t *hist)
+{
+  const dt_iop_module_t *module = hist ? hist->module : NULL;
+  if(!module) return FALSE;
+
+  sqlite3_stmt *stmt;
+  // clang-format off
+  DT_DEBUG_SQLITE3_PREPARE_V2(
+    dt_database_get(darktable.db),
+    "SELECT op_params, enabled, blendop_params"
+    " FROM data.presets"
+    " WHERE autoapply = 1"
+    "   AND operation = ?1"
+    "   AND op_version = ?2",
+    -1, &stmt, NULL);
+  // clang-format on
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, module->op, -1, SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, module->version());
+
+  gboolean match = FALSE;
+  while(sqlite3_step(stmt) == SQLITE_ROW)
+  {
+    if(sqlite3_column_int(stmt, 1) != hist->enabled) continue;
+
+    const void *op_params = sqlite3_column_blob(stmt, 0);
+    const int op_params_size = sqlite3_column_bytes(stmt, 0);
+    const gboolean params_match =
+      op_params_size == 0
+      ? _history_item_params_match(hist->params,
+                                   module->params_size,
+                                   module->default_params,
+                                   module->params_size)
+      : _history_item_params_match(hist->params,
+                                   module->params_size,
+                                   op_params,
+                                   op_params_size);
+
+    if(!params_match) continue;
+
+    const void *blend_params = sqlite3_column_blob(stmt, 2);
+    const int blend_size = sqlite3_column_bytes(stmt, 2);
+    const gboolean blend_match =
+      blend_size == 0
+      ? _history_item_blend_match(hist,
+                                  module->default_blendop_params,
+                                  sizeof(dt_develop_blend_params_t))
+      : _history_item_blend_match(hist, blend_params, blend_size);
+    if(blend_match)
+    {
+      match = TRUE;
+      break;
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  return match;
+}
+
+static gboolean _history_item_matches_starting_picture(const dt_dev_history_item_t *hist)
+{
+  return _history_item_matches_default_module(hist)
+      || _history_item_matches_auto_preset(hist);
+}
+
+static int _darkroom_before_after_history_end(dt_develop_t *dev)
+{
+  int history_end = 0;
+
+  dt_pthread_mutex_lock(&dev->history_mutex);
+  for(const GList *history = dev->history;
+      history;
+      history = g_list_next(history))
+  {
+    const dt_dev_history_item_t *hist = history->data;
+    if(!_history_item_matches_starting_picture(hist))
+      break;
+    history_end++;
+  }
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+
+  return history_end;
+}
+
+static dt_iop_module_t *_darkroom_find_cloned_module(dt_develop_t *dev,
+                                                     const dt_iop_module_t *src_mod)
+{
+  if(!src_mod) return NULL;
+
+  for(GList *modules = dev->iop; modules; modules = g_list_next(modules))
+  {
+    dt_iop_module_t *module = modules->data;
+    if(module->instance == src_mod->instance
+       && module->multi_priority == src_mod->multi_priority
+       && dt_iop_module_is(module, src_mod->op))
+      return module;
+  }
+
+  return NULL;
+}
+
+static dt_iop_module_t *_darkroom_clone_module(dt_develop_t *dev,
+                                               const dt_iop_module_t *src_mod)
+{
+  dt_iop_module_t *module = calloc(1, sizeof(dt_iop_module_t));
+  if(!module) return NULL;
+
+  if(dt_iop_load_module_by_so(module, src_mod->so, dev))
+  {
+    free(module);
+    return NULL;
+  }
+
+  module->instance = src_mod->instance;
+  module->enabled = src_mod->enabled;
+  module->iop_order = src_mod->iop_order;
+  module->multi_priority = src_mod->multi_priority;
+  module->multi_name_hand_edited = src_mod->multi_name_hand_edited;
+  module->hide_enable_button = src_mod->hide_enable_button;
+  g_strlcpy(module->multi_name, src_mod->multi_name, sizeof(module->multi_name));
+
+  if(src_mod->params)
+    memcpy(module->params, src_mod->params, src_mod->params_size);
+  if(module->blend_params && src_mod->blend_params)
+    memcpy(module->blend_params, src_mod->blend_params,
+           sizeof(dt_develop_blend_params_t));
+
+  return module;
+}
+
+static GList *_darkroom_duplicate_iop_list(dt_develop_t *dst,
+                                           dt_develop_t *src)
+{
+  GList *list = NULL;
+  for(GList *modules = src->iop; modules; modules = g_list_next(modules))
+  {
+    dt_iop_module_t *module = _darkroom_clone_module(dst, modules->data);
+    if(module)
+      list = g_list_append(list, module);
+  }
+
+  return list;
+}
+
+static GList *_darkroom_duplicate_history_list(dt_develop_t *dst,
+                                               GList *src_history,
+                                               gboolean *ok)
+{
+  GList *history = dt_history_duplicate(src_history);
+  for(GList *items = history; items; items = g_list_next(items))
+  {
+    dt_dev_history_item_t *item = items->data;
+    item->module = _darkroom_find_cloned_module(dst, item->module);
+    if(!item->module) *ok = FALSE;
+  }
+
+  return history;
+}
+
+static void _darkroom_load_raw_for_transient_dev(dt_develop_t *dev,
+                                                 const dt_imgid_t imgid)
+{
+  dt_mipmap_buffer_t buf;
+  dt_mipmap_cache_get(&buf, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  dt_mipmap_cache_release(&buf);
+
+  const dt_image_t *image = dt_image_cache_get(imgid, 'r');
+  dev->image_storage = *image;
+  dt_image_cache_read_release(image);
+  dev->requested_id = dev->image_storage.id;
+}
+
+static gboolean _darkroom_render_history_from_dev(dt_develop_t *src_dev,
+                                                  const int history_end,
+                                                  const size_t width,
+                                                  const size_t height,
+                                                  uint8_t **buf,
+                                                  float *scale,
+                                                  size_t *buf_width,
+                                                  size_t *buf_height,
+                                                  dt_dev_zoom_pos_t zoom_pos)
+{
+  *buf = NULL;
+  if(buf_width) *buf_width = 0;
+  if(buf_height) *buf_height = 0;
+  if(scale) *scale = 0.0f;
+
+  dt_develop_t dev;
+  dt_dev_init(&dev, TRUE);
+  dev.gui_attached = FALSE;
+  dt_dev_pixelpipe_t *pipe = dev.full.pipe;
+  pipe->type |= DT_DEV_PIXELPIPE_IMAGE;
+  pipe->loading = TRUE;
+  pipe->status = DT_DEV_PIXELPIPE_DIRTY;
+  pipe->changed |= DT_DEV_PIPE_SYNCH;
+
+  const dt_imgid_t imgid = src_dev->image_storage.id;
+  dt_lock_image(imgid);
+  _darkroom_load_raw_for_transient_dev(&dev, imgid);
+
+  gboolean clone_ok = TRUE;
+
+  dt_pthread_mutex_lock(&darktable.dev_threadsafe);
+  dev.iop = _darkroom_duplicate_iop_list(&dev, src_dev);
+  dev.forms = dt_masks_dup_forms_deep(src_dev->forms, NULL);
+  dev.iop_instance = src_dev->iop_instance;
+  dev.history = _darkroom_duplicate_history_list(&dev, src_dev->history,
+                                                 &clone_ok);
+  dev.history_end = src_dev->history_end;
+  dev.history_last_module =
+    _darkroom_find_cloned_module(&dev, src_dev->history_last_module);
+  dev.iop_order_version = src_dev->iop_order_version;
+  dev.iop_order_list = dt_ioppr_iop_order_copy_deep(src_dev->iop_order_list);
+  dt_dev_reset_chroma(&dev);
+  for(GList *modules = dev.iop; modules; modules = g_list_next(modules))
+    dt_iop_reload_defaults((dt_iop_module_t *)modules->data);
+  dt_pthread_mutex_unlock(&darktable.dev_threadsafe);
+  dt_unlock_image(imgid);
+
+  if(!clone_ok)
+  {
+    dt_dev_cleanup(&dev);
+    return FALSE;
+  }
+
+  dt_dev_pop_history_items_ext(&dev, history_end);
+
+  dev.full = src_dev->full;
+  dev.full.dev = &dev;
+  dev.full.pipe = pipe;
+
+  if(!zoom_pos)
+  {
+    dev.full.zoom = DT_ZOOM_FIT;
+    dev.full.width = width;
+    dev.full.height = height;
+    dev.full.ppd = 1.0;
+    dev.full.color_assessment = FALSE;
+  }
+
+  dt_dev_process_image_job(&dev, &dev.full, pipe, -1, DT_DEVICE_NONE);
+
+  const size_t bufsize =
+    sizeof(uint32_t) * pipe->backbuf_width * pipe->backbuf_height;
+  if(pipe->backbuf && bufsize > 0)
+  {
+    *buf = dt_alloc_aligned(bufsize);
+    memset(*buf, 0, bufsize);
+    memcpy(*buf, pipe->backbuf, MIN(bufsize, pipe->backbuf_size));
+    if(buf_width) *buf_width = pipe->backbuf_width;
+    if(buf_height) *buf_height = pipe->backbuf_height;
+    if(scale) *scale = pipe->backbuf_scale;
+    if(zoom_pos) memcpy(zoom_pos, pipe->backbuf_zoom_pos,
+                        sizeof(dt_dev_zoom_pos_t));
+  }
+
+  dt_dev_cleanup(&dev);
+
+  return *buf != NULL;
+}
+
+static gboolean _darkroom_before_after_ensure_render(dt_develop_t *dev,
+                                                     const int32_t width,
+                                                     const int32_t height)
+{
+  if(!_darkroom_before_after.active) return FALSE;
+
+  if(_darkroom_before_after.imgid != dev->image_storage.id)
+  {
+    _darkroom_before_after_stop();
+    return FALSE;
+  }
+
+  const dt_view_context_t ctx = dt_view_get_context_hash();
+  if(ctx == _darkroom_before_after.ctx && _darkroom_before_after.buf)
+    return TRUE;
+
+  _darkroom_before_after_clear_render();
+  _darkroom_before_after.ctx = ctx;
+  return _darkroom_render_history_from_dev(dev,
+                                           _darkroom_before_after.history_end,
+                                           width,
+                                           height,
+                                           &_darkroom_before_after.buf,
+                                           &_darkroom_before_after.scale,
+                                           &_darkroom_before_after.width,
+                                           &_darkroom_before_after.height,
+                                           _darkroom_before_after.zoom_pos);
+}
+
 /* drag&drop hint overlays
    When an external file drag enters the darkroom, we paint a hint on the
    center view ("drop XMP sidecars here") and on the filmstrip ("drop images
@@ -816,11 +1179,23 @@ void expose(dt_view_t *self,
   const gboolean expose_full =
         port->pipe->backbuf                                // do we have an image?
      && port->pipe->output_imgid == dev->image_storage.id;  // same image?
+  gboolean showing_original = FALSE;
 
   if(expose_full)
   {
+    showing_original = _darkroom_before_after_ensure_render(dev, width, height);
+
     // draw image
-    _view_paint_surface(cri, width, height, port, DT_WINDOW_MAIN);
+    if(showing_original)
+      dt_view_paint_surface(cri, width, height, port, DT_WINDOW_MAIN,
+                            _darkroom_before_after.buf,
+                            _darkroom_before_after.scale,
+                            _darkroom_before_after.width,
+                            _darkroom_before_after.height,
+                            _darkroom_before_after.zoom_pos);
+    else
+      _view_paint_surface(cri, width, height, port, DT_WINDOW_MAIN);
+
     // clean up cached rendering; do this unconditionally in case user toggles the preference
     if(darktable.gui->surface)
     {
@@ -992,6 +1367,9 @@ void expose(dt_view_t *self,
   if(_full_request(dev)) dt_dev_process_image(dev);
   if(_preview_request(dev)) dt_dev_process_preview(dev);
   if(_preview2_request(dev)) dt_dev_process_preview2(dev);
+
+  if(showing_original)
+    return;
 
   /* if we are in full preview mode, we don"t want anything else than the image */
   if(dev->full_preview || !darktable.develop->preview_pipe->processed_width)
@@ -1330,6 +1708,8 @@ static gboolean _dev_load_requested_image(gpointer user_data);
 static void _dev_change_image(dt_develop_t *dev,
                               const dt_imgid_t imgid)
 {
+  _darkroom_before_after_stop();
+
   if(dt_check_gimpmode("file"))
   {
     dt_control_log(_("can't change image in GIMP plugin mode"));
@@ -1854,6 +2234,31 @@ static void _toggle_pin_second_window_action(dt_action_t *action)
   if(!dev->second_wnd) return;
 
   dt_dev_toggle_preview2_pinned(dev);
+}
+
+static void _show_original_callback(dt_action_t *action)
+{
+  dt_view_t *self = dt_action_view(action);
+  dt_develop_t *dev = self->data;
+
+  if(_darkroom_before_after.active)
+  {
+    _darkroom_before_after_stop();
+    dt_control_queue_redraw_center();
+    return;
+  }
+
+  const int history_end = _darkroom_before_after_history_end(dev);
+  if(history_end <= 0)
+    return;
+
+  _darkroom_before_after_stop();
+  _darkroom_before_after.active = TRUE;
+  _darkroom_before_after.imgid = dev->image_storage.id;
+  _darkroom_before_after.history_end = history_end;
+
+  dt_toast_log(_("showing original"));
+  dt_control_queue_redraw_center();
 }
 
 static void skip_b_key_accel_callback(dt_action_t *action)
@@ -3792,6 +4197,8 @@ void gui_init(dt_view_t *self)
                      GDK_KEY_space, 0);
   dt_action_register(DT_ACTION(self), N_("image back"), skip_b_key_accel_callback,
                      GDK_KEY_BackSpace, 0);
+  dt_action_register(DT_ACTION(self), N_("show original"), _show_original_callback,
+                     GDK_KEY_backslash, 0);
 
   // cycle overlay colors
   dt_action_register(DT_ACTION(self), N_("cycle overlay colors"),
@@ -4029,6 +4436,8 @@ static void _darkroom_dnd_xmp_received(GtkWidget *widget,
 
 void enter(dt_view_t *self)
 {
+  _darkroom_before_after_stop();
+
   // prevent accels_window to refresh
   darktable.view_manager->accels_window.prevent_refresh = TRUE;
 
@@ -4217,6 +4626,8 @@ static inline void _clear_pipecache(dt_dev_pixelpipe_t *pipe)
 
 void leave(dt_view_t *self)
 {
+  _darkroom_before_after_stop();
+
   dt_iop_color_picker_cleanup();
   if(darktable.lib->proxy.colorpicker.picker_proxy)
     dt_iop_color_picker_reset(darktable.lib->proxy.colorpicker.picker_proxy->module, FALSE);
