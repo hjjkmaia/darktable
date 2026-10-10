@@ -398,6 +398,16 @@ typedef struct lr_data_t
   int curve_pts[MAX_PTS][2];
   int n_pts;
 
+  // Sharpness and noise reduction. Code in the importer, not mapping
+  // rows: a zero on one noise channel still has to be stored.
+  int sharpness;
+  float sharpen_radius;
+  gboolean has_sharpen_radius;
+  float sharpen_masking;
+  gboolean has_sharpen_masking;
+  int luminance_smoothing;
+  int color_noise_reduction;
+
   dt_iop_splittoning_params_t pst;
   gboolean has_splittoning;
 
@@ -585,6 +595,30 @@ static void _lrop(const dt_develop_t *dev, const xmlDocPtr doc, const dt_imgid_t
     else if(!xmlStrcmp(name, (const xmlChar *)"ParametricHighlightSplit"))
     {
       data->ptc_split[2] = g_ascii_strtod((char *)value, NULL) / 100.0;
+    }
+    // SharpenDetail, ColorNoiseReductionDetail, and
+    // ColorNoiseReductionSmoothness have no scalar field. Left unread.
+    else if(!xmlStrcmp(name, (const xmlChar *)"Sharpness"))
+    {
+      data->sharpness = atoi((char *)value);
+    }
+    else if(!xmlStrcmp(name, (const xmlChar *)"SharpenRadius"))
+    {
+      data->has_sharpen_radius = TRUE;
+      data->sharpen_radius = (float)g_ascii_strtod((char *)value, NULL);
+    }
+    else if(!xmlStrcmp(name, (const xmlChar *)"SharpenEdgeMasking"))
+    {
+      data->has_sharpen_masking = TRUE;
+      data->sharpen_masking = (float)g_ascii_strtod((char *)value, NULL);
+    }
+    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceSmoothing"))
+    {
+      data->luminance_smoothing = atoi((char *)value);
+    }
+    else if(!xmlStrcmp(name, (const xmlChar *)"ColorNoiseReduction"))
+    {
+      data->color_noise_reduction = atoi((char *)value);
     }
     else if(!xmlStrcmp(name, (const xmlChar *)"ToneCurveName2012"))
     {
@@ -1267,6 +1301,143 @@ static void _lr_import_paramcurve(dt_develop_t *dev,
   dt_iop_params_builder_free(builder);
 }
 
+static gboolean _lr_history_has_op(const dt_imgid_t imgid, const char *op)
+{
+  sqlite3_stmt *stmt;
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT 1 FROM main.history"
+                              " WHERE imgid = ?1 AND operation = ?2 LIMIT 1",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, op, -1, SQLITE_TRANSIENT);
+  const gboolean found = sqlite3_step(stmt) == SQLITE_ROW;
+  sqlite3_finalize(stmt);
+  return found;
+}
+
+// Sharpness -> sharpen.amount / radius / threshold.
+// LuminanceSmoothing and ColorNoiseReduction -> nlmeans.luma / chroma.
+// denoiseprofile is not auto-applied: its only preset is inserted with
+// autoapply 0, and default_enabled stays false. Its scalar fields are one
+// strength plus curve samples, so they cannot carry luminance and color
+// as two amounts. nlmeans.luma and nlmeans.chroma can (module_schema).
+// If a denoiseprofile row is already in this history, skip nlmeans rather
+// than stack a second denoiser. A zero on one channel is still written,
+// so the other does not keep the module default (luma 0.5, chroma 1).
+// Both zero writes no row. SharpenRadius alone writes no row.
+// SharpenDetail, ColorNoiseReductionDetail, and
+// ColorNoiseReductionSmoothness have no schema field.
+// Amount and the two weights are the Lightroom integer divided by 100.
+// F3 calibrates those scales later.
+static void _lr_import_detail(dt_develop_t *dev,
+                              const dt_imgid_t imgid,
+                              const lr_data_t *data,
+                              char *imported,
+                              const size_t imported_len,
+                              int *n_import,
+                              gboolean *refresh_needed)
+{
+  if(!dev || !dev->iop) return;
+
+  if(data->sharpness != 0)
+  {
+    dt_iop_module_t *module = dt_iop_get_module_by_op_priority(dev->iop, "sharpen", 0);
+    if(!module || !module->default_params || !module->default_blendop_params)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[lightroom] no priority-0 instance of 'sharpen'; skipped");
+    }
+    else
+    {
+      dt_iop_params_err_t err = DT_IOP_PARAMS_OK;
+      dt_iop_params_builder_t *builder = dt_iop_params_builder_new(
+        "sharpen", module->default_params, (size_t)module->params_size, &err);
+      if(!builder)
+      {
+        dt_print(DT_DEBUG_ALWAYS, "[lightroom] cannot seed 'sharpen': %s",
+                 dt_iop_params_err_str(err));
+      }
+      else
+      {
+        int applied = 0;
+        // sharpen.amount is 0..2
+        if(_lr_builder_set(builder, "sharpen", "amount",
+                           _lr_clampf(data->sharpness / 100.0f, 0.0f, 2.0f)))
+          applied++;
+        // sharpen.radius is 0..99. A missing tag keeps the seeded default.
+        if(data->has_sharpen_radius
+           && _lr_builder_set(builder, "sharpen", "radius",
+                              _lr_clampf(data->sharpen_radius, 0.0f, 99.0f)))
+          applied++;
+        // sharpen.threshold is 0..100. SharpenEdgeMasking is on that scale.
+        if(data->has_sharpen_masking
+           && _lr_builder_set(builder, "sharpen", "threshold",
+                              _lr_clampf(data->sharpen_masking, 0.0f, 100.0f)))
+          applied++;
+        if(applied > 0)
+        {
+          size_t size = 0;
+          int version = 0;
+          const void *blob = dt_iop_params_builder_blob(builder, &size, &version);
+          _lr_add_hist_current(imgid, module, blob, size, version,
+                               imported, imported_len, n_import, 1);
+          *refresh_needed = TRUE;
+        }
+        dt_iop_params_builder_free(builder);
+      }
+    }
+  }
+
+  if(data->luminance_smoothing == 0 && data->color_noise_reduction == 0)
+    return;
+
+  if(_lr_history_has_op(imgid, "denoiseprofile"))
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[lightroom] image %d already has denoiseprofile;"
+             " not adding nlmeans, the two would stack",
+             imgid);
+    return;
+  }
+
+  dt_iop_module_t *module = dt_iop_get_module_by_op_priority(dev->iop, "nlmeans", 0);
+  if(!module || !module->default_params || !module->default_blendop_params)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[lightroom] no priority-0 instance of 'nlmeans'; skipped");
+    return;
+  }
+
+  dt_iop_params_err_t err = DT_IOP_PARAMS_OK;
+  dt_iop_params_builder_t *builder = dt_iop_params_builder_new(
+    "nlmeans", module->default_params, (size_t)module->params_size, &err);
+  if(!builder)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[lightroom] cannot seed 'nlmeans': %s",
+             dt_iop_params_err_str(err));
+    return;
+  }
+
+  int applied = 0;
+  // nlmeans.luma and nlmeans.chroma are 0..1. Write both, including 0.
+  if(_lr_builder_set(builder, "nlmeans", "luma",
+                     _lr_clampf(data->luminance_smoothing / 100.0f, 0.0f, 1.0f)))
+    applied++;
+  if(_lr_builder_set(builder, "nlmeans", "chroma",
+                     _lr_clampf(data->color_noise_reduction / 100.0f, 0.0f, 1.0f)))
+    applied++;
+  if(applied > 0)
+  {
+    size_t size = 0;
+    int version = 0;
+    const void *blob = dt_iop_params_builder_blob(builder, &size, &version);
+    _lr_add_hist_current(imgid, module, blob, size, version,
+                         imported, imported_len, n_import, 1);
+    *refresh_needed = TRUE;
+  }
+  dt_iop_params_builder_free(builder);
+}
+
 gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto)
 {
   gboolean refresh_needed = FALSE;
@@ -1624,6 +1795,11 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
   if(dev != NULL)
     _lr_import_paramcurve(dev, imgid, &data, imported, sizeof(imported),
                           &n_import, &refresh_needed);
+
+  // Sharpness and luminance/color noise reduction. Not mapping-table rows.
+  if(dev != NULL)
+    _lr_import_detail(dev, imgid, &data, imported, sizeof(imported),
+                      &n_import, &refresh_needed);
 
   // A point curve (ToneCurveName2012 other than Linear, ToneCurvePV2012)
   // still imports on its own module.

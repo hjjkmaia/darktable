@@ -25,8 +25,9 @@
 // Lightroom (crs:) tag -> darktable module field mapping table, the data side
 // of the Lightroom XMP import. Rows are data: the importer walks them, looks
 // up the workflow mask, and writes the fields through the params builder
-// (develop/iop_params.h). White balance and the parametric curve are code in
-// lightroom.c, not rows here.
+// (develop/iop_params.h). White balance, the parametric curve, and
+// sharpness / noise reduction are code in lightroom.c, not rows here.
+// A zero noise channel still has to be stored, which SKIP_IF_ZERO cannot do.
 
 typedef enum dt_lr_workflow_t
 {
