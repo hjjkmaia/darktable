@@ -2121,8 +2121,10 @@ void init_presets(dt_lib_module_t *self)
     AM("agx/curve/contrast");
   else
     AM("colorbalancergb/contrast");
-  AM("contrastntexture/highlights");
-  AM("contrastntexture/shadows");
+  // highlights and shadows are exposure by region, so they are the tone
+  // equalizer bands with those labels, not contrastntexture's local contrast
+  AM("toneequal/highlights");
+  AM("toneequal/shadows");
   // whites/blacks are display mapping targets, so they follow the tone mapper
   if(wf_sigmoid)
   {

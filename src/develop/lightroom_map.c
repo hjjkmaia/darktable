@@ -73,10 +73,11 @@ static const dt_lr_mapping_t _map[] =
   { "Blacks2012", "agx", "range_black_relative_ev", _lr_percent,
     DT_LR_ADD_TO_DEFAULT | DT_LR_SKIP_IF_ZERO, DT_LR_WF_AGX },
 
-  // D4
-  { "Highlights2012", "contrastntexture", "gain_highlights", _lr_percent,
+  // D4: the bands whose labels are "highlights" and "shadows".
+  // ±100 starts at ±1 EV; the hard range is ±2 EV. F3 calibrates the scale.
+  { "Highlights2012", "toneequal", "highlights", _lr_percent,
     DT_LR_SKIP_IF_ZERO, DT_LR_WF_ALL },
-  { "Shadows2012", "contrastntexture", "gain_shadows", _lr_percent,
+  { "Shadows2012", "toneequal", "deep_blacks", _lr_percent,
     DT_LR_SKIP_IF_ZERO, DT_LR_WF_ALL },
 
   // D5
