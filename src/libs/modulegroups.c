@@ -2150,6 +2150,8 @@ void init_presets(dt_lib_module_t *self)
   AM("rgbcurve/curve");
 
   SMG(C_("modulegroup", "basic"), "basic");
+  AM("temperature");
+  AM("channelmixerrgb");
   AM("exposure");
   if(wf_filmic || wf_none)
     AM("filmicrgb");
@@ -2159,11 +2161,45 @@ void init_presets(dt_lib_module_t *self)
     AM("agx");
   if(wf_spektrafilm || wf_none)
     AM("spektrafilm");
-  AM("temperature");
-  AM("channelmixerrgb");
+  AM("contrastntexture");
+  AM("toneequal");
+  AM("hazeremoval");
   AM("colorbalancergb");
+  AM("highlights");
+
+  SMG(C_("modulegroup", "tone curve"), "tone");
   AM("rgbcurve");
   AM("tonecurve");
+  AM("rgblevels");
+
+  SMG(C_("modulegroup", "color"), "color");
+  AM("colorequal");
+  AM("colorzones");
+  AM("colorbalancergb");
+
+  SMG(C_("modulegroup", "detail"), "correct");
+  AM("sharpen");
+  AM("diffuse");
+  AM("denoiseprofile");
+  AM("nlmeans");
+
+  // Lightroom's lens corrections and transform panels share one tab: there
+  // are only seven distinct group icons
+  SMG(C_("modulegroup", "lens & transform"), "technical");
+  AM("lens");
+  AM("cacorrect");
+  AM("cacorrectrgb");
+  AM("hotpixels");
+  AM("ashift");
+  AM("crop");
+  AM("flip");
+
+  SMG(C_("modulegroup", "effects"), "effect");
+  AM("vignette");
+  AM("grain");
+
+  SMG(C_("modulegroup", "calibration"), "grading");
+  AM("channelmixerrgb");
 
   dt_lib_presets_add(_("workflow: lightroom"),
                      self->plugin_name, self->version(), tx, strlen(tx), TRUE, 0);
