@@ -126,6 +126,7 @@ FILE(GLOB SOURCE_FILES
   "develop/imageop.c"
   "develop/imageop_gui.c"
   "develop/imageop_math.c"
+  "develop/iop_params.c"
   "develop/lightroom.c"
   "develop/masks/brush.c"
   "develop/masks/circle.c"

@@ -37,6 +37,7 @@
 #include "common/usermanual_url.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/iop_params.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 
@@ -214,25 +215,6 @@ static void _add_value(JsonBuilder *b, dt_introspection_field_t *f, const void *
   }
 }
 
-// write default value of a scalar field into blob at p
-static void _write_default(dt_introspection_field_t *f, void *p)
-{
-  switch(f->header.type)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:  *(float *)p = f->Float.Default; break;
-    case DT_INTROSPECTION_TYPE_DOUBLE: *(double *)p = f->Double.Default; break;
-    case DT_INTROSPECTION_TYPE_INT:    *(int *)p = f->Int.Default; break;
-    case DT_INTROSPECTION_TYPE_UINT:   *(unsigned int *)p = f->UInt.Default; break;
-    case DT_INTROSPECTION_TYPE_INT8:   *(int8_t *)p = f->Int8.Default; break;
-    case DT_INTROSPECTION_TYPE_UINT8:  *(uint8_t *)p = f->UInt8.Default; break;
-    case DT_INTROSPECTION_TYPE_SHORT:  *(short *)p = f->Short.Default; break;
-    case DT_INTROSPECTION_TYPE_USHORT: *(unsigned short *)p = f->UShort.Default; break;
-    case DT_INTROSPECTION_TYPE_BOOL:   *(gboolean *)p = f->Bool.Default; break;
-    case DT_INTROSPECTION_TYPE_ENUM:   *(int *)p = f->Enum.Default; break;
-    default: break;
-  }
-}
-
 // the bounds module_schema publishes. a field whose source carries no range
 // comment gets its type's full range (introspection.h:77), so this only ever
 // rejects what a module actually declares out of bounds
@@ -254,24 +236,6 @@ static gboolean _num_in_range(dt_introspection_field_t *f, const double num,
     default: return TRUE;   // bool and enum carry no range
   }
   return num >= *lo && num <= *hi;
-}
-
-static void _write_num(dt_introspection_field_t *f, void *p, double num)
-{
-  switch(f->header.type)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:  *(float *)p = (float)num; break;
-    case DT_INTROSPECTION_TYPE_DOUBLE: *(double *)p = num; break;
-    case DT_INTROSPECTION_TYPE_INT:    *(int *)p = (int)num; break;
-    case DT_INTROSPECTION_TYPE_UINT:   *(unsigned int *)p = (unsigned int)num; break;
-    case DT_INTROSPECTION_TYPE_INT8:   *(int8_t *)p = (int8_t)num; break;
-    case DT_INTROSPECTION_TYPE_UINT8:  *(uint8_t *)p = (uint8_t)num; break;
-    case DT_INTROSPECTION_TYPE_SHORT:  *(short *)p = (short)num; break;
-    case DT_INTROSPECTION_TYPE_USHORT: *(unsigned short *)p = (unsigned short)num; break;
-    case DT_INTROSPECTION_TYPE_BOOL:   *(gboolean *)p = (num != 0.0); break;
-    case DT_INTROSPECTION_TYPE_ENUM:   *(int *)p = (int)num; break;
-    default: break;
-  }
 }
 
 static char *_builder_to_string(JsonBuilder *b)
@@ -472,122 +436,115 @@ char *dt_bridge_decode_params_json(const char *op, const char *blob_hex, char **
   return out;
 }
 
-// build a params blob from `defaults`, then overwrite the named fields.
-// `defaults` is NULL when there is no module instance to take them from
-static uint8_t *_seed_and_apply(dt_iop_module_so_t *so, const void *defaults,
-                                JsonObject *fields, size_t *size, char **err)
+// the messages encode_params and the stack path have always sent, keyed off
+// the params builder's codes
+static void _params_builder_err(const char *op, const dt_iop_params_err_t perr,
+                                char **err)
 {
-  dt_introspection_t *intro = so->get_introspection();
-  dt_introspection_field_t *lin = so->get_introspection_linear();
-
-  uint8_t *blob = g_malloc0(intro->size);
-
-  if(defaults)
+  switch(perr)
   {
-    // arrays and curve nodes come across intact, so having one no longer
-    // rules out setting a module's scalar fields by name
-    memcpy(blob, defaults, intro->size);
+    case DT_IOP_PARAMS_NO_MODULE:
+      _seterr(err, "unknown module operation '%s'", op ? op : "(null)");
+      break;
+    case DT_IOP_PARAMS_NO_INTROSPECTION:
+      _seterr(err, "module '%s' has no introspection", op);
+      break;
+    case DT_IOP_PARAMS_TYPE:
+      // a builder seeded without defaults refuses modules it cannot synthesize
+      _seterr(err, "module '%s' has non-scalar parameters; pass a full blob_hex"
+                   " instead of fields", op);
+      break;
+    default:
+      _seterr(err, "module '%s': %s", op ? op : "(null)",
+              dt_iop_params_err_str(perr));
+      break;
   }
-  else
-  {
-    // only scalar defaults are reachable here, and a non-scalar left at
-    // zero would be worse than refusing
-    for(dt_introspection_field_t *f = lin;
-        f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
-      if(!_is_scalar(f->header.type) && f->header.size != intro->size)
-      {
-        _seterr(err, "module '%s' has non-scalar parameters; pass a full blob_hex"
-                     " instead of fields", so->op);
-        g_free(blob);
-        return NULL;
-      }
+}
 
-    for(dt_introspection_field_t *f = lin;
-        f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+// apply a { field: value, ... } JSON object to the builder. the JSON layer
+// stays here: enum symbols, and the range check on the raw double before any
+// int truncation, so the refusal text and its bounds read as they always have
+static gboolean _apply_fields_json(dt_iop_params_builder_t *b,
+                                   dt_iop_module_so_t *so,
+                                   JsonObject *fields, char **err)
+{
+  if(!fields) return TRUE;
+  gboolean ok = TRUE;
+  GList *members = json_object_get_members(fields);
+  for(GList *it = members; it && ok; it = g_list_next(it))
+  {
+    const char *name = (const char *)it->data;
+    dt_introspection_field_t *f = so->get_f(name);
+    if(!f || !_is_scalar(f->header.type))
     {
-      if(!_is_scalar(f->header.type)) continue;
-      void *p = so->get_p(blob, f->header.name);
-      if(p) _write_default(f, p);
+      _seterr(err, "unknown or non-scalar field '%s' for module '%s'", name, so->op);
+      ok = FALSE;
+      break;
     }
-  }
-
-  if(fields)
-  {
-    GList *members = json_object_get_members(fields);
-    for(GList *it = members; it; it = g_list_next(it))
+    JsonNode *node = json_object_get_member(fields, name);
+    if(f->header.type == DT_INTROSPECTION_TYPE_ENUM
+       && json_node_get_value_type(node) == G_TYPE_STRING)
     {
-      const char *name = (const char *)it->data;
-      dt_introspection_field_t *f = so->get_f(name);
-      if(!f || !_is_scalar(f->header.type))
+      const char *sym = json_node_get_string(node);
+      int val = 0;
+      gboolean found = FALSE;
+      for(dt_introspection_type_enum_tuple_t *e = f->Enum.values; e && e->name; e++)
+        if(!g_strcmp0(e->name, sym)) { val = e->value; found = TRUE; break; }
+      if(!found)
       {
-        _seterr(err, "unknown or non-scalar field '%s' for module '%s'", name, so->op);
-        g_list_free(members);
-        g_free(blob);
-        return NULL;
+        _seterr(err, "unknown enum value '%s' for field '%s'", sym, name);
+        ok = FALSE;
+        break;
       }
-      void *p = so->get_p(blob, f->header.name);
-      if(!p) continue;
-      JsonNode *node = json_object_get_member(fields, name);
-      if(f->header.type == DT_INTROSPECTION_TYPE_ENUM
-         && json_node_get_value_type(node) == G_TYPE_STRING)
+      dt_iop_params_builder_set_int(b, name, val);
+    }
+    else
+    {
+      // refuse rather than clamp: a silently corrected value would render
+      // fine and leave the caller believing the number they sent was used
+      const double num = json_node_get_double(node);
+      double lo = 0.0, hi = 0.0;
+      if(!_num_in_range(f, num, &lo, &hi))
       {
-        const char *sym = json_node_get_string(node);
-        int val = 0;
-        gboolean found = FALSE;
-        for(dt_introspection_type_enum_tuple_t *e = f->Enum.values; e && e->name; e++)
-          if(!g_strcmp0(e->name, sym)) { val = e->value; found = TRUE; break; }
-        if(!found)
-        {
-          _seterr(err, "unknown enum value '%s' for field '%s'", sym, name);
-          g_list_free(members);
-          g_free(blob);
-          return NULL;
-        }
-        *(int *)p = val;
+        _seterr(err, "field '%s' of module '%s' is %g, outside its range"
+                     " [%g, %g] (see module_schema)", name, so->op, num, lo, hi);
+        ok = FALSE;
+        break;
       }
+      if(f->header.type == DT_INTROSPECTION_TYPE_FLOAT
+         || f->header.type == DT_INTROSPECTION_TYPE_DOUBLE)
+        dt_iop_params_builder_set_float(b, name, (float)num);
+      else if(f->header.type == DT_INTROSPECTION_TYPE_BOOL)
+        dt_iop_params_builder_set_int(b, name, num != 0.0);
       else
-      {
-        // refuse rather than clamp: a silently corrected value would render
-        // fine and leave the caller believing the number they sent was used
-        const double num = json_node_get_double(node);
-        double lo = 0.0, hi = 0.0;
-        if(!_num_in_range(f, num, &lo, &hi))
-        {
-          _seterr(err, "field '%s' of module '%s' is %g, outside its range"
-                       " [%g, %g] (see module_schema)", name, so->op, num, lo, hi);
-          g_list_free(members);
-          g_free(blob);
-          return NULL;
-        }
-        _write_num(f, p, num);
-      }
+        dt_iop_params_builder_set_int(b, name, (int)num);
     }
-    g_list_free(members);
   }
-
-  *size = intro->size;
-  return blob;
+  g_list_free(members);
+  return ok;
 }
 
 char *dt_bridge_encode_params_hex(const char *op, void *fields_jsonobject, char **err)
 {
-  dt_iop_module_so_t *so = _find_so(op);
-  if(!so)
+  dt_iop_params_err_t perr = DT_IOP_PARAMS_OK;
+  dt_iop_params_builder_t *b = dt_iop_params_builder_new(op, NULL, 0, &perr);
+  if(!b)
   {
-    _seterr(err, "unknown module operation '%s'", op ? op : "(null)");
+    _params_builder_err(op, perr, err);
     return NULL;
   }
-  if(!so->have_introspection || !so->get_introspection || !so->get_p || !so->get_f)
+
+  dt_iop_module_so_t *so = _find_so(op);
+  if(!_apply_fields_json(b, so, (JsonObject *)fields_jsonobject, err))
   {
-    _seterr(err, "module '%s' has no introspection", op);
+    dt_iop_params_builder_free(b);
     return NULL;
   }
 
   size_t size = 0;
-  uint8_t *blob = _seed_and_apply(so, NULL, (JsonObject *)fields_jsonobject, &size, err);
-  if(!blob) return NULL;
+  const void *blob = dt_iop_params_builder_blob(b, &size, NULL);
   char *hex = _bytes_to_hex(blob, size);
-  g_free(blob);
+  dt_iop_params_builder_free(b);
   return hex;
 }
 
@@ -1100,8 +1057,24 @@ static gboolean _apply_entry(dt_develop_t *dev, JsonObject *entry, char **err)
     // values instead of resetting the rest to defaults
     const void *defaults = (mod->params_size == (int32_t)mod->so->get_introspection()->size)
       ? mod->params : NULL;
-    blob = _seed_and_apply(mod->so, defaults, fields, &size, err);
-    if(!blob) return FALSE;
+    dt_iop_params_err_t perr = DT_IOP_PARAMS_OK;
+    dt_iop_params_builder_t *pb =
+      dt_iop_params_builder_new(op, defaults, defaults ? (size_t)mod->params_size : 0,
+                                &perr);
+    if(!pb)
+    {
+      _params_builder_err(op, perr, err);
+      return FALSE;
+    }
+    if(!_apply_fields_json(pb, mod->so, fields, err))
+    {
+      dt_iop_params_builder_free(pb);
+      return FALSE;
+    }
+    const void *built = dt_iop_params_builder_blob(pb, &size, NULL);
+    blob = g_malloc(size);
+    memcpy(blob, built, size);
+    dt_iop_params_builder_free(pb);
   }
 
   if(size != (size_t)mod->params_size)
