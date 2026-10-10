@@ -947,7 +947,8 @@ static void _lr_add_hist_current(const dt_imgid_t imgid,
                                  const int version,
                                  char *imported,
                                  const size_t imported_len,
-                                 int *import_count)
+                                 int *import_count,
+                                 const int enabled)
 {
   int32_t num = 0;
   sqlite3_stmt *stmt;
@@ -965,7 +966,7 @@ static void _lr_add_hist_current(const dt_imgid_t imgid,
                               "INSERT INTO main.history"
                               "  (imgid, num, module, operation, op_params, enabled,"
                               "   blendop_params, blendop_version, multi_priority, multi_name)"
-                              " VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 0, '')",
+                              " VALUES (?1, ?2, ?3, ?4, ?5, ?8, ?6, ?7, 0, '')",
                               -1, &stmt, NULL);
   // clang-format on
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
@@ -976,6 +977,7 @@ static void _lr_add_hist_current(const dt_imgid_t imgid,
   DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, module->default_blendop_params,
                              sizeof(dt_develop_blend_params_t), SQLITE_TRANSIENT);
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 7, dt_develop_blend_version());
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 8, enabled ? 1 : 0);
   sqlite3_step(stmt);
   sqlite3_finalize(stmt);
 
@@ -1140,13 +1142,119 @@ static void _lr_import_mapped(dt_develop_t *dev,
       int version = 0;
       const void *blob = dt_iop_params_builder_blob(builder, &size, &version);
       _lr_add_hist_current(imgid, module, blob, size, version,
-                           imported, imported_len, n_import);
+                           imported, imported_len, n_import, 1);
       *refresh_needed = TRUE;
     }
     dt_iop_params_builder_free(builder);
   }
 
   g_ptr_array_free(ops, TRUE);
+}
+
+static float _lr_clampf(const float v, const float lo, const float hi)
+{
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static gboolean _lr_near(const float a, const float b)
+{
+  const float d = a - b;
+  return d < 0.0001f && d > -0.0001f;
+}
+
+// same cascade as paramcurve: [0.05, 0.95], strictly ordered, gap >= 0.05
+static void _lr_clamp_param_splits(float s[3])
+{
+  const float gap = 0.05f;
+  const float hi = 0.95f;
+  s[0] = _lr_clampf(s[0], gap, hi - 2.0f * gap);
+  s[1] = _lr_clampf(s[1], s[0] + gap, hi - gap);
+  s[2] = _lr_clampf(s[2], s[1] + gap, hi);
+}
+
+static gboolean _lr_builder_set(dt_iop_params_builder_t *builder,
+                                const char *op,
+                                const char *field,
+                                const float v)
+{
+  const dt_iop_params_err_t err = dt_iop_params_builder_set_float(builder, field, v);
+  if(err != DT_IOP_PARAMS_OK)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[lightroom] %s.%s = %.6g: %s",
+             op, field, v, dt_iop_params_err_str(err));
+    return FALSE;
+  }
+  return TRUE;
+}
+
+// Parametric* is paramcurve, not a tonecurve node. The point curve
+// (ToneCurveName2012 other than Linear) still goes to tonecurve.
+// All-zero region sliders and the default splits (25/50/75) write no row.
+// paramcurve is off unless a history row enables it; a non-zero region does.
+static void _lr_import_paramcurve(dt_develop_t *dev,
+                                  const dt_imgid_t imgid,
+                                  const lr_data_t *data,
+                                  char *imported,
+                                  const size_t imported_len,
+                                  int *n_import,
+                                  gboolean *refresh_needed)
+{
+  if(!dev || !dev->iop) return;
+
+  const gboolean region = data->ptc_value[0] != 0 || data->ptc_value[1] != 0
+                          || data->ptc_value[2] != 0 || data->ptc_value[3] != 0;
+  float splits[3] = { data->ptc_split[0], data->ptc_split[1], data->ptc_split[2] };
+  _lr_clamp_param_splits(splits);
+  if(!region && _lr_near(splits[0], 0.25f) && _lr_near(splits[1], 0.5f)
+     && _lr_near(splits[2], 0.75f))
+    return;
+
+  dt_iop_module_t *module = dt_iop_get_module_by_op_priority(dev->iop, "paramcurve", 0);
+  if(!module || !module->default_params || !module->default_blendop_params)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[lightroom] no priority-0 instance of 'paramcurve'; skipped");
+    return;
+  }
+
+  dt_iop_params_err_t err = DT_IOP_PARAMS_OK;
+  dt_iop_params_builder_t *builder = dt_iop_params_builder_new(
+    "paramcurve", module->default_params, (size_t)module->params_size, &err);
+  if(!builder)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[lightroom] cannot seed 'paramcurve': %s",
+             dt_iop_params_err_str(err));
+    return;
+  }
+
+  // integers are -100..100; the fields are -1..1
+  const float regions[4] = {
+    _lr_clampf(data->ptc_value[0] / 100.0f, -1.0f, 1.0f),
+    _lr_clampf(data->ptc_value[1] / 100.0f, -1.0f, 1.0f),
+    _lr_clampf(data->ptc_value[2] / 100.0f, -1.0f, 1.0f),
+    _lr_clampf(data->ptc_value[3] / 100.0f, -1.0f, 1.0f),
+  };
+  static const char *const region_fields[4] = { "shadows", "darks", "lights", "highlights" };
+  static const char *const split_fields[3] = {
+    "split_shadows", "split_midtones", "split_highlights"
+  };
+
+  int applied = 0;
+  for(int i = 0; i < 4; i++)
+    if(_lr_builder_set(builder, "paramcurve", region_fields[i], regions[i])) applied++;
+  for(int i = 0; i < 3; i++)
+    if(_lr_builder_set(builder, "paramcurve", split_fields[i], splits[i])) applied++;
+
+  if(applied > 0)
+  {
+    size_t size = 0;
+    int version = 0;
+    const void *blob = dt_iop_params_builder_blob(builder, &size, &version);
+    _lr_add_hist_current(imgid, module, blob, size, version,
+                         imported, imported_len, n_import, region ? 1 : 0);
+    *refresh_needed = TRUE;
+  }
+  dt_iop_params_builder_free(builder);
 }
 
 gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto)
@@ -1267,6 +1375,10 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
   data.has_spots = FALSE;
   data.curve_kind = linear;
   data.n_pts = 0;
+  // missing Parametric*Split tags mean Lightroom's 25/50/75, not zero
+  data.ptc_split[0] = 0.25f;
+  data.ptc_split[1] = 0.5f;
+  data.ptc_split[2] = 0.75f;
   data.has_splittoning = FALSE;
   data.has_bilat = FALSE;
   data.has_colorgrade = FALSE;
@@ -1498,10 +1610,13 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     refresh_needed = TRUE;
   }
 
-  // Parametric* sliders stay unwired until paramcurve exists (stage 3).
-  // A point curve (ToneCurvePV2012, anything but Linear) still imports.
-  // All-zero parametric sliders already emitted nothing; non-zero ones
-  // must not grow a tonecurve node either.
+  // Parametric* lands on paramcurve. It must not add tonecurve nodes.
+  if(dev != NULL)
+    _lr_import_paramcurve(dev, imgid, &data, imported, sizeof(imported),
+                          &n_import, &refresh_needed);
+
+  // A point curve (ToneCurveName2012 other than Linear, ToneCurvePV2012)
+  // still imports on its own module.
   if(dev != NULL && data.curve_kind != linear)
   {
     const int total_pts = (data.curve_kind == custom) ? data.n_pts : 6;
