@@ -158,22 +158,6 @@ typedef struct dt_iop_tonecurve_params_t
   int tonecurve_preset;
 } dt_iop_tonecurve_params_t;
 
-#define LRDT_COLORZONES_VERSION 2
-#define DT_IOP_COLORZONES_BANDS 8
-
-typedef enum dt_iop_colorzones_channel_t
-{
-  DT_IOP_COLORZONES_L = 0,
-  DT_IOP_COLORZONES_C = 1,
-  DT_IOP_COLORZONES_h = 2
-} dt_iop_colorzones_channel_t;
-
-typedef struct dt_iop_colorzones_params_t
-{
-  int32_t channel;
-  float equalizer_x[3][DT_IOP_COLORZONES_BANDS], equalizer_y[3][DT_IOP_COLORZONES_BANDS];
-} dt_iop_colorzones_params_t;
-
 #define LRDT_SPLITTONING_VERSION 1
 typedef struct dt_iop_splittoning_params_t
 {
@@ -405,9 +389,6 @@ typedef struct lr_data_t
   int curve_pts[MAX_PTS][2];
   int n_pts;
 
-  dt_iop_colorzones_params_t pcz;
-  gboolean has_colorzones;
-
   dt_iop_splittoning_params_t pst;
   gboolean has_splittoning;
 
@@ -478,9 +459,6 @@ static gboolean _skip_comma(const char **startptr)
 static void _lrop(const dt_develop_t *dev, const xmlDocPtr doc, const dt_imgid_t imgid,
                   const xmlChar *name, const xmlChar *value, const xmlNodePtr node, lr_data_t *data)
 {
-  const float hfactor = 3.0 / 9.0; // hue factor adjustment (use 3 out of 9 boxes in colorzones)
-  const float lfactor = 4.0 / 9.0; // lightness factor adjustment (use 4 out of 9 boxes in colorzones)
-
   if(value)
   {
     // Tags in the mapping table are applied later, one blob per module.
@@ -609,150 +587,6 @@ static void _lrop(const dt_develop_t *dev, const xmlDocPtr doc, const dt_imgid_t
         data->curve_kind = strong_contrast;
       else if(!xmlStrcmp(value, (const xmlChar *)"Custom"))
         data->curve_kind = custom;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentRed"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][0] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentOrange"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][1] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentYellow"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][2] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentGreen"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][3] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentAqua"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][4] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentBlue"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][5] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentPurple"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][6] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"SaturationAdjustmentMagenta"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[1][7] = 0.5 + (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentRed"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][0] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentOrange"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][1] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentYellow"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][2] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentGreen"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][3] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentAqua"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][4] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentBlue"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][5] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentPurple"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][6] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"LuminanceAdjustmentMagenta"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[0][7] = 0.5 + lfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentRed"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][0] = 0.5 + hfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentOrange"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][1] = 0.5 + hfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentYellow"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][2] = 0.5 + hfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentGreen"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][3] = 0.5 + hfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentAqua"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][4] = 0.5 + hfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentBlue"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][5] = 0.5 + hfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentPurple"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][6] = 0.5 + hfactor * (float)v / 200.0;
-    }
-    else if(!xmlStrcmp(name, (const xmlChar *)"HueAdjustmentMagenta"))
-    {
-      const int v = atoi((char *)value);
-      if(v != 0) data->has_colorzones = TRUE;
-      data->pcz.equalizer_y[2][7] = 0.5 + hfactor * (float)v / 200.0;
     }
     else if(!xmlStrcmp(name, (const xmlChar *)"SplitToningShadowHue"))
     {
@@ -1205,12 +1039,10 @@ static gint _lr_acc_cmp(gconstpointer a, gconstpointer b)
 
 // Seed one blob per target op from module->default_params, apply every
 // non-zero tag that maps onto it, and append one multi_priority 0 row.
-// include_colorequal stays FALSE until the HSL commit: those rows are
-// already in the table, and the legacy colorzones path still owns them.
+// HSL tags land on colorequal; the legacy colorzones writer is gone.
 static void _lr_import_mapped(dt_develop_t *dev,
                               const dt_imgid_t imgid,
                               GHashTable *tags,
-                              const gboolean include_colorequal,
                               char *imported,
                               const size_t imported_len,
                               int *n_import,
@@ -1240,8 +1072,6 @@ static void _lr_import_mapped(dt_develop_t *dev,
     for(size_t i = 0; i < MIN(n, G_N_ELEMENTS(rows)); i++)
     {
       const dt_lr_mapping_t *row = rows[i];
-      if(!include_colorequal && !g_strcmp0(row->op, "colorequal"))
-        continue;
       // a zero Lightroom value contributes nothing, so an op whose tags
       // are all zero never gets a row
       if((row->flags & DT_LR_SKIP_IF_ZERO) && lr == 0.0f)
@@ -1437,7 +1267,6 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
   data.has_spots = FALSE;
   data.curve_kind = linear;
   data.n_pts = 0;
-  data.has_colorzones = FALSE;
   data.has_splittoning = FALSE;
   data.has_bilat = FALSE;
   data.has_colorgrade = FALSE;
@@ -1512,10 +1341,8 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
 
   //  Integrates into the history all the imported iop
 
-  // HSL stays on colorzones in this commit. The colorequal rows are already
-  // in the mapping table; the next commit turns this on and drops colorzones.
   if(dev != NULL && data.mapped)
-    _lr_import_mapped(dev, imgid, data.mapped, FALSE, imported, sizeof(imported),
+    _lr_import_mapped(dev, imgid, data.mapped, imported, sizeof(imported),
                       &n_import, &refresh_needed);
 
   if(dev != NULL && is_lr && dt_image_is_raw(&dev->image_storage))
@@ -1703,19 +1530,6 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
 
     dt_add_hist(imgid, "tonecurve", (dt_iop_params_t *)&data.ptc, sizeof(dt_iop_tonecurve_params_t), imported,
                 sizeof(imported), LRDT_TONECURVE_VERSION, &n_import);
-    refresh_needed = TRUE;
-  }
-
-  if(dev != NULL && data.has_colorzones)
-  {
-    data.pcz.channel = DT_IOP_COLORZONES_h;
-
-    for(int i = 0; i < 3; i++)
-      for(int k = 0; k < 8; k++)
-        data.pcz.equalizer_x[i][k] = k / (DT_IOP_COLORZONES_BANDS - 1.0);
-
-    dt_add_hist(imgid, "colorzones", (dt_iop_params_t *)&data.pcz, sizeof(dt_iop_colorzones_params_t), imported,
-                sizeof(imported), LRDT_COLORZONES_VERSION, &n_import);
     refresh_needed = TRUE;
   }
 
