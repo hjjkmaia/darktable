@@ -22,10 +22,11 @@
 #include "common/curve_tools.h"
 #include "common/darktable.h"
 #include "common/debug.h"
+#include "common/history.h"
 #include "common/math.h"
+#include "common/metadata.h"
 #include "common/ratings.h"
 #include "common/tags.h"
-#include "common/metadata.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/blend.h"
@@ -37,6 +38,13 @@
 #include <libxml/xpathInternals.h>
 #include <stdlib.h>
 #include <string.h>
+
+// History rows this importer writes carry this multi_name. Re-import
+// deletes those rows and writes a fresh set. Preset rows and edits to
+// modules this importer did not touch use another name and stay.
+// multi_name_hand_edited stays 0, so the darkroom may relabel the
+// module on a later edit; the stored row keeps this marker until then.
+#define DT_LR_IMPORT_MULTI_NAME "lr-import"
 
 // copy here the iop params struct with the actual version. This is so to
 // be as independent as possible of any iop evolutions. Indeed, we create
@@ -320,7 +328,7 @@ static void dt_add_hist(const dt_imgid_t imgid, const char *operation, const dt_
                               "INSERT INTO main.history"
                               "  (imgid, num, module, operation, op_params, enabled,"
                               "   blendop_params, blendop_version, multi_priority, multi_name)"
-                              " VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 0, ' ')",
+                              " VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 0, ?8)",
                               -1, &stmt, NULL);
   // clang-format on
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
@@ -330,6 +338,7 @@ static void dt_add_hist(const dt_imgid_t imgid, const char *operation, const dt_
   DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 5, params, params_size, SQLITE_TRANSIENT);
   DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, &blend_params, sizeof(dt_lr_develop_blend_params_t), SQLITE_TRANSIENT);
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 7, LRDT_BLEND_VERSION);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 8, DT_LR_IMPORT_MULTI_NAME, -1, SQLITE_TRANSIENT);
 
   sqlite3_step(stmt);
   sqlite3_finalize(stmt);
@@ -966,7 +975,7 @@ static void _lr_add_hist_current(const dt_imgid_t imgid,
                               "INSERT INTO main.history"
                               "  (imgid, num, module, operation, op_params, enabled,"
                               "   blendop_params, blendop_version, multi_priority, multi_name)"
-                              " VALUES (?1, ?2, ?3, ?4, ?5, ?8, ?6, ?7, 0, '')",
+                              " VALUES (?1, ?2, ?3, ?4, ?5, ?8, ?6, ?7, 0, ?9)",
                               -1, &stmt, NULL);
   // clang-format on
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
@@ -978,6 +987,7 @@ static void _lr_add_hist_current(const dt_imgid_t imgid,
                              sizeof(dt_develop_blend_params_t), SQLITE_TRANSIENT);
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 7, dt_develop_blend_version());
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 8, enabled ? 1 : 0);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 9, DT_LR_IMPORT_MULTI_NAME, -1, SQLITE_TRANSIENT);
   sqlite3_step(stmt);
   sqlite3_finalize(stmt);
 
@@ -1720,6 +1730,105 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
     }
   }
   return TRUE;
+}
+
+// Delete importer rows and pack the surviving nums from 0. The append
+// path uses COUNT(*) as the next num, which collides if a gap is left
+// where a row was removed.
+static void _lr_drop_imported_history(const dt_imgid_t imgid)
+{
+  sqlite3_stmt *stmt;
+
+  dt_database_start_transaction(darktable.db);
+
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "DELETE FROM main.history"
+                              " WHERE imgid = ?1 AND multi_name = ?2",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, DT_LR_IMPORT_MULTI_NAME, -1, SQLITE_TRANSIENT);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "UPDATE main.history SET num = num + 1000000 WHERE imgid = ?1",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT rowid FROM main.history WHERE imgid = ?1 ORDER BY num",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  GArray *rowids = g_array_new(FALSE, FALSE, sizeof(int));
+  while(sqlite3_step(stmt) == SQLITE_ROW)
+  {
+    const int rowid = sqlite3_column_int(stmt, 0);
+    g_array_append_val(rowids, rowid);
+  }
+  sqlite3_finalize(stmt);
+
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "UPDATE main.history SET num = ?1 WHERE rowid = ?2",
+                              -1, &stmt, NULL);
+  for(guint i = 0; i < rowids->len; i++)
+  {
+    DT_DEBUG_SQLITE3_CLEAR_BINDINGS(stmt);
+    DT_DEBUG_SQLITE3_RESET(stmt);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, (int)i);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, g_array_index(rowids, int, i));
+    sqlite3_step(stmt);
+  }
+  sqlite3_finalize(stmt);
+  g_array_free(rowids, TRUE);
+
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "UPDATE main.images"
+                              " SET history_end = (SELECT IFNULL(MAX(num) + 1, 0)"
+                              "                    FROM main.history"
+                              "                    WHERE imgid = ?1)"
+                              " WHERE id = ?1",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+
+  dt_database_release_transaction(darktable.db);
+}
+
+gboolean dt_lightroom_reimport(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto)
+{
+  if(!dev)
+  {
+    if(!iauto)
+      dt_control_log(_("re-import needs an open image in the darkroom"));
+    return FALSE;
+  }
+
+  // Confirm the photo-flavor sidecar is there before deleting anything.
+  char *pathname = dt_get_lightroom_xmp(imgid);
+  if(!pathname)
+  {
+    if(!iauto) dt_control_log(_("cannot find Lightroom XMP!"));
+    return FALSE;
+  }
+  g_free(pathname);
+
+  dt_lock_image(imgid);
+  _lr_drop_imported_history(imgid);
+  const gboolean ok = dt_lightroom_import(imgid, dev, iauto);
+  // A GUI reload rewrites the hash. Headless does not reload, so write
+  // the current hash here or the next open treats the stack as stale.
+  if(ok && !dev->gui_attached)
+    dt_history_hash_write_from_history(imgid, DT_HISTORY_HASH_CURRENT);
+  dt_unlock_image(imgid);
+
+  // import reloads only when it appended rows. A sidecar that now
+  // imports nothing still has to drop the old rows from the open stack.
+  if(ok && dev->gui_attached)
+    dt_dev_reload_history_items(dev);
+  return ok;
 }
 
 // clang-format off

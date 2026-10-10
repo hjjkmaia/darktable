@@ -26,6 +26,24 @@
 */
 gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto);
 
+/* Re-read the photo-flavor sidecar (IMG.xmp beside the raw, never
+   IMG.ARW.xmp) and replace the history rows dt_lightroom_import()
+   wrote. Preset rows and edits to modules the importer did not write
+   stay. This does not clear DT_IMAGE_AUTO_PRESETS_APPLIED, so it does
+   not re-apply presets and does not delete the rest of the history.
+
+   A later UI calls this with the develop that already has the image
+   open, the same dev the darkroom path passes to dt_lightroom_import().
+   dev must be non-NULL. Pass iauto FALSE so a missing sidecar is
+   reported. There is no button in this change:
+
+     dt_lightroom_reimport(dev->image_storage.id, dev, FALSE);
+
+   The history harness passes reimport=true to get_history. That opens
+   the image and calls this. It is a test hook, not the UI.
+*/
+gboolean dt_lightroom_reimport(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto);
+
 /* returns NULL if not found, or g_strdup'ed pathname, the caller should g_free it. */
 char *dt_get_lightroom_xmp(dt_imgid_t imgid);
 

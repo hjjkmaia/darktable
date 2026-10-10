@@ -272,7 +272,8 @@ static JsonNode *_tool_get_history(JsonObject *args)
   if(!args || !json_object_has_member(args, "imgid"))
     return _text_result("get_history: requires integer 'imgid'", TRUE);
   char *err = NULL;
-  char *json = dt_bridge_get_history_json(_arg_int(args, "imgid", 0), &err);
+  char *json = dt_bridge_get_history_json(_arg_int(args, "imgid", 0),
+                                          _arg_bool(args, "reimport", FALSE), &err);
   return _json_text_or_err(json, err);
 }
 

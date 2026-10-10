@@ -38,6 +38,7 @@
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/iop_params.h"
+#include "develop/lightroom.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 
@@ -1746,15 +1747,34 @@ static void _darkroom_open(const dt_imgid_t imgid)
   dt_dev_cleanup(&dev);
 }
 
-char *dt_bridge_get_history_json(int imgid, char **err)
+// Same open as _darkroom_open, then dt_lightroom_reimport(). The UI call
+// is dt_lightroom_reimport(dev->image_storage.id, dev, FALSE) from a
+// darkroom that already has the image open. This hook exists so the
+// history harness can run that function without a button.
+static void _darkroom_reimport(const dt_imgid_t imgid)
+{
+  if(!dt_is_valid_imgid(imgid)) return;
+  dt_develop_t dev;
+  dt_dev_init(&dev, TRUE);
+  dev.gui_attached = FALSE;
+  dt_dev_load_image(&dev, imgid);
+  dt_lightroom_reimport(imgid, &dev, TRUE);
+  dt_dev_cleanup(&dev);
+}
+
+char *dt_bridge_get_history_json(int imgid, const gboolean reimport, char **err)
 {
   // an empty array would otherwise read as "this image has no edits"
   if(!_require_image(imgid, "get_history", err)) return NULL;
 
-  // The lr-harness sets this so `history` takes the darkroom path. A second
-  // call on the same imgid is a second open: first_run is already consumed,
-  // so the import does not append again. Other callers keep a plain read.
-  if(!_read_only && g_getenv("DT_LR_HISTORY_OPEN"))
+  // reimport opens, then replaces the importer's rows. Otherwise the
+  // lr-harness sets DT_LR_HISTORY_OPEN so `history` takes the darkroom
+  // path. A second call on the same imgid is a second open: first_run
+  // is already consumed, so the import does not append again. Other
+  // callers keep a plain read.
+  if(!_read_only && reimport)
+    _darkroom_reimport((dt_imgid_t)imgid);
+  else if(!_read_only && g_getenv("DT_LR_HISTORY_OPEN"))
     _darkroom_open((dt_imgid_t)imgid);
 
   sqlite3 *db = dt_database_get(darktable.db);

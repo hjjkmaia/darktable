@@ -12,6 +12,7 @@ import base64
 import fcntl
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -676,7 +677,7 @@ def photo_sidecar(raw: Path) -> Path:
     return sidecar
 
 
-def cmd_history(session: Session, raw: Path) -> None:
+def cmd_history(session: Session, raw: Path, reimport: bool) -> None:
     """First darkroom open of a scratch copy, then the decoded history.
 
     import_images is the library path (dev == NULL): metadata only.
@@ -718,6 +719,29 @@ def cmd_history(session: Session, raw: Path) -> None:
         "history": history,
         "second_open_added": len(again) - len(history),
     }
+    if reimport:
+        # The scratch copy is the only file this writes. Change one
+        # parametric slider so a replacement is visible, then ask the
+        # server to call dt_lightroom_reimport on this same imgid.
+        scratch_xmp = scratch / sidecar.name
+        text = scratch_xmp.read_text()
+        new, n = re.subn(
+            r'(crs:ParametricHighlights=")[^"]*(")',
+            r"\g<1>40\2",
+            text,
+            count=1,
+        )
+        if n != 1:
+            die(f"{scratch_xmp} has no ParametricHighlights to rewrite")
+        scratch_xmp.write_text(new)
+        replaced = content_json(
+            session.tool("get_history", {"imgid": imgid, "reimport": True})
+        )
+        if not isinstance(replaced, list):
+            die(f"get_history reimport returned unexpected JSON: {replaced!r}"[:500])
+        doc["reimport_highlights"] = 40
+        doc["reimport_history"] = replaced
+        doc["reimport_added"] = len(replaced) - len(history)
     print(dump(doc), end="")
 
 
@@ -760,6 +784,14 @@ def build_parser() -> argparse.ArgumentParser:
     history = sub.add_parser("history", help="first-open import on a scratch copy, then history")
     history.add_argument("--raw", required=True,
                          help="a raw whose photo-flavor basename.xmp sits beside it")
+    history.add_argument(
+        "--reimport",
+        action="store_true",
+        help=(
+            "after the second open, set ParametricHighlights to 40 on the "
+            "scratch sidecar and call dt_lightroom_reimport"
+        ),
+    )
     return parser
 
 
@@ -794,7 +826,7 @@ def main() -> None:
         elif args.cmd == "compare":
             cmd_compare(session, raw, args.stacks[0], args.stacks[1], args.json)
         elif args.cmd == "history":
-            cmd_history(session, raw)
+            cmd_history(session, raw, args.reimport)
         else:
             die(f"unknown command {args.cmd}")
     finally:

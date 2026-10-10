@@ -68,8 +68,9 @@ char *dt_bridge_import_images_json(void *paths_jsonarray, const char *folder,
 /** the library's film rolls (folders) with their image counts */
 char *dt_bridge_list_film_rolls_json(void);
 
-/** JSON array of the decoded edit-history stack of `imgid` */
-char *dt_bridge_get_history_json(int imgid, char **err);
+/** JSON array of the decoded edit-history stack of `imgid`.
+    reimport runs dt_lightroom_reimport() after a darkroom open. */
+char *dt_bridge_get_history_json(int imgid, gboolean reimport, char **err);
 
 /** saved styles as { total, styles: [{ name, description }] }, narrowed by a
     `filter` substring and cut off after `limit` entries (0 = no limit) */

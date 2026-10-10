@@ -186,6 +186,15 @@ is the one the pipe uses. `iop_order` in the JSON is the integer
 float in `src/common/iop_order.c` (sigmoid is 45.3 there and 6200 here).
 The scratch copy grows no `DSC04302.ARW.xmp`.
 
+`history --reimport` does that sequence, then rewrites
+`ParametricHighlights` to 40 on the scratch sidecar only and calls
+`get_history` with `reimport: true`. The server opens the image and calls
+`dt_lightroom_reimport()`. The JSON gains `reimport_history`,
+`reimport_highlights`, and `reimport_added` (rows after re-import minus
+rows after the first open). A UI calls the same function with the open
+develop; see `dt_lightroom_reimport()` in `src/develop/lightroom.h`.
+There is no darkroom button.
+
 Running `history` twice compares two first opens of two scratch copies. The
 `second_open_added` field is the second develop of one image.
 
