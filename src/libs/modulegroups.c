@@ -2101,10 +2101,48 @@ void init_presets(dt_lib_module_t *self)
   SLQA();
   // section headings are stored as '@'-prefixed ids and translated at display
   // time from the "modulegroup" context; NC_ marks their names for translation
-  (void)NC_("modulegroup", "basic");
+  (void)NC_("modulegroup", "white balance");
+  (void)NC_("modulegroup", "tone");
+  (void)NC_("modulegroup", "presence");
   (void)NC_("modulegroup", "tone curve");
-  AM("@basic");
+  AM("@white balance");
+  AM("channelmixerrgb/illuminant");
+  AM("channelmixerrgb/temperature");
+  AM("channelmixerrgb/hue");
+  AM("channelmixerrgb/chroma");
+  AM("@tone");
   AM("exposure/exposure");
+  // in scene-referred workflows contrast lives in the tone mapper
+  if(wf_filmic)
+    AM("filmicrgb/contrast");
+  else if(wf_sigmoid)
+    AM("sigmoid/contrast");
+  else if(wf_agx)
+    AM("agx/curve/contrast");
+  else
+    AM("colorbalancergb/contrast");
+  AM("contrastntexture/highlights");
+  AM("contrastntexture/shadows");
+  // whites/blacks are display mapping targets, so they follow the tone mapper
+  if(wf_sigmoid)
+  {
+    AM("sigmoid/target white");
+    AM("sigmoid/target black");
+  }
+  else if(wf_filmic)
+  {
+    AM("filmicrgb/white relative exposure");
+    AM("filmicrgb/black relative exposure");
+  }
+  else if(wf_agx)
+  {
+    AM("agx/white relative exposure");
+    AM("agx/black relative exposure");
+  }
+  AM("@presence");
+  AM("contrastntexture/medium details");
+  AM("contrastntexture/coarse details");
+  AM("hazeremoval/strength");
   AM("colorbalancergb/global vibrance");
   AM("colorbalancergb/global saturation");
   AM("@tone curve");
