@@ -330,6 +330,78 @@ static gboolean _supported_image(const gchar *filename)
   return FALSE;
 }
 
+static gboolean _is_arw(const gchar *filename)
+{
+  const gchar *ext = g_strrstr(filename, ".");
+  return ext && !g_ascii_strcasecmp(ext + 1, "arw");
+}
+
+// RawSpeed cannot decode the YCbCr ARWs written by Sony's lossless compressed
+// M/S raw sizes, so LibRaw takes over exactly those and no other ARW. The
+// name is the one LibRaw's decoder_info.cpp reports for that decoder.
+static gboolean _is_sony_ycbcr(libraw_data_t *raw)
+{
+  libraw_decoder_info_t info = { 0 };
+  return libraw_get_decoder_info(raw, &info) == LIBRAW_SUCCESS
+         && !g_strcmp0(info.decoder_name, "sony_ycbcr_load_raw()");
+}
+
+// Sony YCbCr ARWs hold demosaiced camera RGB with the as-shot white balance
+// already applied; it is divided out because darktable applies white balance
+// itself. The buffer is normalized here, so rawprepare must leave it unscaled.
+static dt_imageio_retval_t _open_sony_ycbcr(dt_image_t *img,
+                                            const libraw_data_t *raw,
+                                            dt_mipmap_buffer_t *mbuf)
+{
+  img->flags &= ~(DT_IMAGE_LDR | DT_IMAGE_HDR | DT_IMAGE_RAW | DT_IMAGE_4BAYER);
+  img->flags |= DT_IMAGE_S_RAW;
+  img->buf_dsc.filters = 0u;
+  img->buf_dsc.channels = 4;
+  img->buf_dsc.datatype = TYPE_FLOAT;
+  img->buf_dsc.cst = IOP_CS_RGB;
+  img->loader = LOADER_LIBRAW;
+
+  img->raw_black_level = 0;
+  for(int c = 0; c < 4; c++)
+    img->raw_black_level_separate[c] = 0;
+  img->raw_white_point = UINT16_MAX;
+
+  float *buf = dt_mipmap_cache_alloc(mbuf, img);
+  if(!buf)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[libraw_open] could not alloc full buffer for image `%s'",
+             img->filename);
+    return DT_IMAGEIO_CACHE_FULL;
+  }
+
+  const float black = raw->rawdata.color.black;
+  const float range = MAX(1.0f, raw->rawdata.color.maximum - black);
+  const float *cam_mul = raw->rawdata.color.cam_mul;
+  float scale[3];
+  for(int c = 0; c < 3; c++)
+    scale[c] = (cam_mul[c] > 0.0f && cam_mul[1] > 0.0f ? cam_mul[1] / cam_mul[c] : 1.0f) / range;
+
+  const ushort(*const in)[4] = raw->rawdata.color4_image;
+  const size_t pitch = raw->rawdata.sizes.raw_pitch / sizeof(in[0]);
+  const int width = img->width;
+  const int height = img->height;
+
+  DT_OMP_FOR()
+  for(int j = 0; j < height; j++)
+  {
+    float *out = buf + (size_t)4 * j * width;
+    for(int i = 0; i < width; i++, out += 4)
+    {
+      for(int c = 0; c < 3; c++)
+        out[c] = ((float)in[j * pitch + i][c] - black) * scale[c];
+      out[3] = 0.0f;
+    }
+  }
+
+  return DT_IMAGEIO_OK;
+}
+
 // Issue a warning, but only if we haven't done so
 // for that particular model in this darktable session
 void _check_libraw_missing_support(const struct dt_image_t *img)
@@ -385,7 +457,8 @@ dt_imageio_retval_t dt_imageio_open_libraw(dt_image_t *img,
   int err = DT_IMAGEIO_LOAD_FAILED;
   int libraw_err = LIBRAW_SUCCESS;
 
-  if(!_supported_image(filename))
+  const gboolean whitelisted = _supported_image(filename);
+  if(!whitelisted && !_is_arw(filename))
     return DT_IMAGEIO_LOAD_FAILED;
   if(!img->exif_inited)
     (void)dt_exif_read(img, filename);
@@ -404,6 +477,13 @@ dt_imageio_retval_t dt_imageio_open_libraw(dt_image_t *img,
   if(libraw_err != LIBRAW_SUCCESS)
     goto error;
 
+  const gboolean sony_ycbcr = _is_sony_ycbcr(raw);
+  if(!whitelisted && !sony_ycbcr)
+  {
+    err = DT_IMAGEIO_LOAD_FAILED;
+    goto error;
+  }
+
   libraw_err = libraw_unpack(raw);
   if(libraw_err != LIBRAW_SUCCESS)
     goto error;
@@ -414,7 +494,7 @@ dt_imageio_retval_t dt_imageio_open_libraw(dt_image_t *img,
   // are not populated into libraw structure, or image is not of CFA type.
   if(raw->rawdata.color.cam_mul[0] == 0.0f
      || dt_isnan(raw->rawdata.color.cam_mul[0])
-     || !raw->rawdata.raw_image)
+     || !(raw->rawdata.raw_image || (sony_ycbcr && raw->rawdata.color4_image)))
   {
     dt_print(DT_DEBUG_ALWAYS,
              "[libraw_open] detected unsupported image `%s'", img->filename);
@@ -468,6 +548,14 @@ dt_imageio_retval_t dt_imageio_open_libraw(dt_image_t *img,
 
   img->p_width = img->width - img->crop_x - img->crop_right;
   img->p_height = img->height - img->crop_y - img->crop_bottom;
+
+  if(sony_ycbcr)
+  {
+    dt_exif_img_check_additional_tags(img, filename);
+    err = _open_sony_ycbcr(img, raw, mbuf);
+    goto error;
+  }
+
   // We can reuse the libraw filters property, it's already well-handled in dt.
   // It contains (for CR3) the Bayer pattern, but we have to undo some LibRaw logic.
   if(raw->rawdata.iparams.colors == 3)

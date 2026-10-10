@@ -202,6 +202,10 @@ static dt_imageio_retval_t _try_open_as_tiff_on_failure_fallback_to_rawspeed
     const char *filename,
     dt_mipmap_buffer_t *mbuf);
 
+static dt_imageio_retval_t _open_arw(dt_image_t *img,
+                                     const char *filename,
+                                     dt_mipmap_buffer_t *mbuf);
+
 // the signatures for the file types we know about.  More specific ones need to come before
 // less specific ones, e.g. TIFF needs to come after DNG and nearly all camera formats, since
 // the latter are all TIFF containers
@@ -336,9 +340,9 @@ static const dt_magic_bytes_t _magic_signatures[] = {
   { DT_FILETYPE_SRW, FALSE, 0, 4, _try_open_as_tiff_on_failure_fallback_to_rawspeed,
     { 'M', 'M', 0x00, '*' }, "SAMSUNG" },
   // Sony ARW files are TIFFs with the string "SONY" early in the file
-  { DT_FILETYPE_ARW, FALSE, 0, 4, _try_open_as_tiff_on_failure_fallback_to_rawspeed,
+  { DT_FILETYPE_ARW, FALSE, 0, 4, _open_arw,
     { 'I', 'I', '*', 0x00 }, "SONY" },
-  { DT_FILETYPE_ARW, FALSE, 0, 4, _try_open_as_tiff_on_failure_fallback_to_rawspeed,
+  { DT_FILETYPE_ARW, FALSE, 0, 4, _open_arw,
     { 'M', 'M', 0x00, '*' }, "SONY" },
   // little-endian (Intel) TIFF
   { DT_FILETYPE_TIFF, FALSE, 0, 4, NULL, // may be DNG or any of many camera raw types
@@ -598,6 +602,25 @@ static dt_imageio_retval_t _try_open_as_tiff_on_failure_fallback_to_rawspeed
   ret = dt_imageio_open_tiff(img, filename, mbuf);
   if(!_image_handled(ret))
     ret = dt_imageio_open_rawspeed(img, filename, mbuf);
+
+  return ret;
+}
+
+static dt_imageio_retval_t _open_arw(dt_image_t *img,
+                                     const char *filename,
+                                     dt_mipmap_buffer_t *mbuf)
+{
+  dt_imageio_retval_t ret =
+    _try_open_as_tiff_on_failure_fallback_to_rawspeed(img, filename, mbuf);
+
+  // rawspeed rejects the YCbCr ARWs of Sony's lossless compressed M/S raw
+  // sizes as an unsupported feature, which ends the regular fallback chain
+  if(ret == DT_IMAGEIO_UNSUPPORTED_FEATURE)
+  {
+    const dt_imageio_retval_t libraw_ret = dt_imageio_open_libraw(img, filename, mbuf);
+    if(libraw_ret == DT_IMAGEIO_OK || libraw_ret == DT_IMAGEIO_CACHE_FULL)
+      ret = libraw_ret;
+  }
 
   return ret;
 }
