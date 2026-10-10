@@ -18,6 +18,7 @@
 
 #include "common/darktable.h"
 #include "common/file_location.h"
+#include "develop/lightroom_map.h"
 #include "mcp/dt_bridge.h"
 #include "mcp/mcp_jsonrpc.h"
 #include "mcp/mcp_tools.h"
@@ -112,6 +113,21 @@ int main(int argc, char **argv)
     fprintf(stderr, "darktable-mcp: dt_init failed\n");
     g_ptr_array_free(m, TRUE);
     return 1;
+  }
+
+  // headless self-check for the Lightroom mapping table: resolve every row's
+  // op and field through introspection and exit (needs the modules loaded,
+  // hence a flag on this binary rather than a standalone tool)
+  if(g_getenv("DT_LR_MAP_VALIDATE"))
+  {
+    char *verr = NULL;
+    const gboolean ok = dt_lr_map_validate(&verr);
+    fprintf(stderr, "lightroom_map: %s\n",
+            ok ? "all rows resolve" : verr ? verr : "validation failed");
+    g_free(verr);
+    dt_cleanup();
+    g_ptr_array_free(m, TRUE);
+    return ok ? 0 : 1;
   }
 
   // tool descriptions and schemas live in the data folder, editable without a rebuild

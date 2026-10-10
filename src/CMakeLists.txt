@@ -128,6 +128,7 @@ FILE(GLOB SOURCE_FILES
   "develop/imageop_math.c"
   "develop/iop_params.c"
   "develop/lightroom.c"
+  "develop/lightroom_map.c"
   "develop/masks/brush.c"
   "develop/masks/circle.c"
   "develop/masks/ellipse.c"
