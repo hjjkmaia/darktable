@@ -136,6 +136,7 @@ typedef struct dt_lib_modulegroups_t
   gchar *edit_preset;
   gboolean edit_ro;
   gboolean edit_basics_show;
+  gboolean edit_basics_listed_order;
   GList *edit_basics;
 
   // editor dialog
@@ -148,6 +149,7 @@ typedef struct dt_lib_modulegroups_t
   GtkWidget *edit_autoapply_chkbox, *edit_autoapply_btn;
 
   gboolean basics_show;
+  gboolean basics_listed_order;
   GList *basics;
   GtkWidget *vbox_basic;
   GtkWidget *mod_vbox_basic;
@@ -716,6 +718,58 @@ static gchar *_action_id(dt_action_t *action)
     return g_strdup(action->id);
 }
 
+// next action in a walk over a module's actions, descending into sections
+static dt_action_t *_basics_next_action(dt_action_t *ac)
+{
+  if(ac->type == DT_ACTION_TYPE_SECTION)
+    return ac->target;
+  else if(!ac->next && ac->owner->type == DT_ACTION_TYPE_SECTION)
+    return ac->owner->next;
+  else
+    return ac->next;
+}
+
+// a widget can be the target of several actions (dt_bauhaus_widget_set_label()
+// defines a new one each time it is called), so all of them are compared
+static gboolean _basics_widget_has_id(dt_iop_module_t *module, GtkWidget *w, const gchar *id)
+{
+  for(dt_action_t *ac = module->so->actions.target; ac; ac = _basics_next_action(ac))
+  {
+    if(ac->type >= DT_ACTION_TYPE_WIDGET && ac->target == w)
+    {
+      gchar *action_id = _action_id(ac);
+      const gboolean found = !strcmp(id, action_id);
+      g_free(action_id);
+      if(found) return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+// find the widget in the module's widget tree whose action id equals id
+static GtkWidget *_basics_find_widget(dt_iop_module_t *module, GtkWidget *w, const gchar *id)
+{
+  if(!w) return NULL;
+
+  if(_basics_widget_has_id(module, w, id)) return w;
+
+  if(GTK_IS_CONTAINER(w))
+  {
+    GList *children = gtk_container_get_children(GTK_CONTAINER(w));
+    for(const GList *l = children; l; l = g_list_next(l))
+    {
+      GtkWidget *found = _basics_find_widget(module, l->data, id);
+      if(found)
+      {
+        g_list_free(children);
+        return found;
+      }
+    }
+    g_list_free(children);
+  }
+  return NULL;
+}
+
 static dt_lib_modulegroups_basic_item_position_t
 _basics_add_items_from_module_widget(dt_lib_module_t *self, dt_iop_module_t *module, GtkWidget *w,
                                      dt_lib_modulegroups_basic_item_position_t item_pos)
@@ -750,12 +804,7 @@ _basics_add_items_from_module_widget(dt_lib_module_t *self, dt_iop_module_t *mod
       g_free(action_id);
     }
 
-    if(ac->type == DT_ACTION_TYPE_SECTION)
-      ac = ac->target;
-    else if(!ac->next && ac->owner->type == DT_ACTION_TYPE_SECTION)
-      ac = ac->owner->next;
-    else
-      ac = ac->next;
+    ac = _basics_next_action(ac);
   }
 
   // if w is a container, test all subwidgets
@@ -770,6 +819,72 @@ _basics_add_items_from_module_widget(dt_lib_module_t *self, dt_iop_module_t *mod
   }
 
   return item_pos;
+}
+
+// build the quick access panel in the preset's stored order instead of
+// reverse pipeline order, rendering '@'-prefixed items as section headings
+static void _basics_show_listed(dt_lib_module_t *self)
+{
+  dt_lib_modulegroups_t *d = self->data;
+
+  gboolean first = TRUE;
+  gboolean after_heading = FALSE;
+  dt_iop_module_t *last_module = NULL;
+
+  for(const GList *l = d->basics; l; l = g_list_next(l))
+  {
+    dt_lib_modulegroups_basic_item_t *item = l->data;
+
+    // ids starting with '@' are section headings, not widgets; no module op
+    // starts with '@', so pipeline mode simply never matches them
+    if(item->id && item->id[0] == '@')
+    {
+      // the label is not stored in the item: _basics_hide() destroys
+      // vbox_basic as a whole
+      gchar *context_id = g_strdup_printf("modulegroup|%s", item->id + 1);
+      GtkWidget *lb = dt_ui_section_label_new(Q_(context_id));
+      g_free(context_id);
+      gtk_widget_show(lb);
+      gtk_box_pack_start(GTK_BOX(d->vbox_basic), lb, FALSE, FALSE, 0);
+      after_heading = TRUE;
+      continue;
+    }
+
+    // find the module instance the same way pipeline mode does
+    dt_iop_module_t *module = NULL;
+    for(GList *modules = g_list_last(darktable.develop->iop); modules; modules = g_list_previous(modules))
+    {
+      dt_iop_module_t *m = modules->data;
+      if(g_strcmp0(m->op, item->module_op) == 0
+         && !dt_iop_is_hidden(m)
+         && !(m->flags() & IOP_FLAGS_DEPRECATED)
+         && m->iop_order != INT_MAX)
+      {
+        module = m;
+        break;
+      }
+    }
+    if(!module) continue;
+
+    GtkWidget *w = NULL;
+    if(item->widget_type != WIDGET_TYPE_ACTIVATE_BTN)
+    {
+      w = _basics_find_widget(module, module->widget, item->id);
+      // a missing widget is skipped without touching the module tracking
+      if(!w) continue;
+    }
+
+    const dt_lib_modulegroups_basic_item_position_t item_pos =
+      first ? FIRST_MODULE
+            : (after_heading || module != last_module) ? NEW_MODULE : NORMAL;
+
+    item->module = module;
+    _basics_add_widget(self, item, w, item_pos);
+
+    first = FALSE;
+    after_heading = FALSE;
+    last_module = module;
+  }
 }
 
 static void _basics_show(dt_lib_module_t *self)
@@ -796,33 +911,40 @@ static void _basics_show(dt_lib_module_t *self)
     gtk_widget_set_name(d->vbox_basic, "basics-box");
   dt_gui_add_class(d->vbox_basic,"dt_plugin_ui");
 
-  dt_lib_modulegroups_basic_item_position_t item_pos = FIRST_MODULE;
-  for(GList *modules = g_list_last(darktable.develop->iop); modules; modules = g_list_previous(modules))
+  if(d->basics_listed_order)
   {
-    dt_iop_module_t *module = modules->data;
-
-    // we record if it's a new module or not to set css class and box structure
-    if(item_pos != FIRST_MODULE) item_pos = NEW_MODULE;
-
-    if(!dt_iop_is_hidden(module) && !(module->flags() & IOP_FLAGS_DEPRECATED) && module->iop_order != INT_MAX)
+    _basics_show_listed(self);
+  }
+  else
+  {
+    dt_lib_modulegroups_basic_item_position_t item_pos = FIRST_MODULE;
+    for(GList *modules = g_list_last(darktable.develop->iop); modules; modules = g_list_previous(modules))
     {
-      // first, we add on-off buttons if any
-      for(const GList *l = d->basics; l; l = g_list_next(l))
+      dt_iop_module_t *module = modules->data;
+
+      // we record if it's a new module or not to set css class and box structure
+      if(item_pos != FIRST_MODULE) item_pos = NEW_MODULE;
+
+      if(!dt_iop_is_hidden(module) && !(module->flags() & IOP_FLAGS_DEPRECATED) && module->iop_order != INT_MAX)
       {
-        dt_lib_modulegroups_basic_item_t *item = l->data;
-        if(!item->module && g_strcmp0(item->module_op, module->op) == 0)
+        // first, we add on-off buttons if any
+        for(const GList *l = d->basics; l; l = g_list_next(l))
         {
-          if(item->widget_type == WIDGET_TYPE_ACTIVATE_BTN)
+          dt_lib_modulegroups_basic_item_t *item = l->data;
+          if(!item->module && g_strcmp0(item->module_op, module->op) == 0)
           {
-            item->module = module;
-            _basics_add_widget(self, item, NULL, item_pos);
-            item_pos = NORMAL;
+            if(item->widget_type == WIDGET_TYPE_ACTIVATE_BTN)
+            {
+              item->module = module;
+              _basics_add_widget(self, item, NULL, item_pos);
+              item_pos = NORMAL;
+            }
           }
         }
-      }
 
-      // for the other items, we want them in same order as the module gui
-      _basics_add_items_from_module_widget(self, module, module->widget, item_pos);
+        // for the other items, we want them in same order as the module gui
+        _basics_add_items_from_module_widget(self, module, module->widget, item_pos);
+      }
     }
   }
 
@@ -1482,8 +1604,10 @@ static gchar *_preset_to_string(dt_lib_module_t *self, gboolean edition)
   GList *basics = edition ? d->edit_basics : d->basics;
   GList *groups = edition ? d->edit_groups : d->groups;
 
-  // basics widgets
-  dt_util_str_cat(&res, "ꬹ%d||", basics_show ? 1 : 0);
+  // basics widgets: field 1 of the section is the listed-order flag (display
+  // QAP items in stored order instead of pipeline order), field 2 stays reserved
+  const gboolean basics_listed_order = edition ? d->edit_basics_listed_order : d->basics_listed_order;
+  dt_util_str_cat(&res, "ꬹ%d|%d|", basics_show ? 1 : 0, basics_listed_order ? 1 : 0);
   for(const GList *l = basics; l; l = g_list_next(l))
   {
     dt_lib_modulegroups_basic_item_t *item = l->data;
@@ -1512,6 +1636,13 @@ static void _preset_from_string(dt_lib_module_t *self, gchar *txt, gboolean edit
   gboolean show_search = TRUE;
   gboolean full_active = FALSE;
 
+  // the flag is read from the preset string below; reset it first so that
+  // loading a preset without it cannot leak the previous preset's value
+  if(edition)
+    d->edit_basics_listed_order = FALSE;
+  else
+    d->basics_listed_order = FALSE;
+
   gchar **gr = g_strsplit(txt, "ꬹ", -1);
 
   // read the general options
@@ -1534,10 +1665,19 @@ static void _preset_from_string(dt_lib_module_t *self, gchar *txt, gboolean edit
       gchar **gr2 = g_strsplit(gr[1], "|", -1);
       gboolean basics_show = FALSE;
       if(g_strv_length(gr2) > 3 && (g_strcmp0(gr2[0], "1") == 0)) basics_show = TRUE;
+      // gr2[1] flags listed order, gr2[2] is reserved
+      const gboolean basics_listed_order =
+        g_strv_length(gr2) > 1 && g_strcmp0(gr2[1], "1") == 0;
       if(edition)
+      {
         d->edit_basics_show = basics_show;
+        d->edit_basics_listed_order = basics_listed_order;
+      }
       else
+      {
         d->basics_show = basics_show;
+        d->basics_listed_order = basics_listed_order;
+      }
 
       for(int j = 3; j < g_strv_length(gr2); j++)
       {
@@ -1606,6 +1746,15 @@ static void _preset_from_string(dt_lib_module_t *self, gchar *txt, gboolean edit
   {                                                                                                               \
     g_free(tx);                                                                                                   \
     tx = g_strdup("1|0ꬹ0||");                                                                                   \
+  }
+
+// start quick access in listed order: QAP items are displayed in the preset's
+// stored order instead of reverse pipeline order. the extra "1" is the
+// listed-order flag read from gr2[1] in _preset_from_string()
+#define SLQA()                                                                                                    \
+  {                                                                                                               \
+    g_free(tx);                                                                                                   \
+    tx = g_strdup("1|0ꬹ1|1|");                                                                                  \
   }
 
 // start quick access
@@ -1947,6 +2096,40 @@ void init_presets(dt_lib_module_t *self)
   dt_lib_presets_add(_("workflow: scene-referred"),
                      self->plugin_name, self->version(), tx, strlen(tx), TRUE, 0);
 
+  // lightroom
+
+  SLQA();
+  // section headings are stored as '@'-prefixed ids and translated at display
+  // time from the "modulegroup" context; NC_ marks their names for translation
+  (void)NC_("modulegroup", "basic");
+  (void)NC_("modulegroup", "tone curve");
+  AM("@basic");
+  AM("exposure/exposure");
+  AM("colorbalancergb/global vibrance");
+  AM("colorbalancergb/global saturation");
+  AM("@tone curve");
+  AM("rgbcurve/channel");
+  AM("rgbcurve/curve");
+
+  SMG(C_("modulegroup", "basic"), "basic");
+  AM("exposure");
+  if(wf_filmic || wf_none)
+    AM("filmicrgb");
+  if(wf_sigmoid || wf_none)
+    AM("sigmoid");
+  if(wf_agx || wf_none)
+    AM("agx");
+  if(wf_spektrafilm || wf_none)
+    AM("spektrafilm");
+  AM("temperature");
+  AM("channelmixerrgb");
+  AM("colorbalancergb");
+  AM("rgbcurve");
+  AM("tonecurve");
+
+  dt_lib_presets_add(_("workflow: lightroom"),
+                     self->plugin_name, self->version(), tx, strlen(tx), TRUE, 0);
+
   // search only (only active modules visible)
   SNQA();
   dt_lib_presets_add(_("search only"),
@@ -2033,6 +2216,7 @@ static gchar *_presets_get_minimal(dt_lib_module_t *self)
 }
 
 #undef SNQA
+#undef SLQA
 #undef SQA
 #undef SMG
 #undef AM
@@ -2128,6 +2312,35 @@ static int _manage_editor_module_find_multi(gconstpointer a, gconstpointer b)
   return 1;
 }
 
+static void _manage_editor_basics_add_row(dt_lib_module_t *self, dt_iop_module_t *module,
+                                          dt_lib_modulegroups_basic_item_t *item)
+{
+  dt_lib_modulegroups_t *d = self->data;
+
+  GtkWidget *hb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_set_name(hb, "modulegroups-iop-header");
+  gchar *lbn = g_strdup_printf("%s\n    %s", module->name(), item->widget_name);
+  GtkWidget *lb = gtk_label_new(lbn);
+  gtk_label_set_ellipsize(GTK_LABEL(lb), PANGO_ELLIPSIZE_END);
+  gtk_label_set_xalign(GTK_LABEL(lb), 0.0);
+  g_free(lbn);
+  gtk_widget_set_name(lb, "iop-panel-label");
+  gtk_box_pack_start(GTK_BOX(hb), lb, FALSE, TRUE, 0);
+  if(!d->edit_ro)
+  {
+    GtkWidget *btn = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("remove this widget"),
+        .clicked_cb = G_CALLBACK(_manage_editor_basics_remove),
+        .clicked_data = self,
+      });
+
+    g_object_set_data(G_OBJECT(btn), "widget_id", item->id);
+    gtk_box_pack_end(GTK_BOX(hb), btn, FALSE, TRUE, 0);
+  }
+  gtk_box_pack_start(GTK_BOX(d->edit_basics_box), hb, FALSE, TRUE, 0);
+}
+
 static void _manage_editor_basics_update_list(dt_lib_module_t *self)
 {
   dt_lib_modulegroups_t *d = self->data;
@@ -2135,45 +2348,52 @@ static void _manage_editor_basics_update_list(dt_lib_module_t *self)
   // first, we remove all existing modules
   dt_gui_container_destroy_children(GTK_CONTAINER(d->edit_basics_box));
 
-  // and we add the ones from the list
-  for(const GList *modules = g_list_last(darktable.develop->iop);
-      modules;
-      modules = g_list_previous(modules))
+  if(d->edit_basics_listed_order)
   {
-    dt_iop_module_t *module = modules->data;
+    // listed-order presets are shown in stored order; '@' items are section
+    // headings, not widgets, so they are skipped
     for(const GList *l = d->edit_basics; l; l = g_list_next(l))
     {
       dt_lib_modulegroups_basic_item_t *item = l->data;
+      if(!item->id || item->id[0] == '@') continue;
 
-      if(g_strcmp0(module->op, item->module_op) == 0 && !dt_iop_is_hidden(module))
+      for(const GList *modules = g_list_last(darktable.develop->iop);
+          modules;
+          modules = g_list_previous(modules))
       {
-        // we want to avoid showing multiple instances of the same module
-        if(module->multi_priority <= 0
-           || g_list_find_custom(darktable.develop->iop, module,
-                                 _manage_editor_module_find_multi) == NULL)
+        dt_iop_module_t *module = modules->data;
+        if(g_strcmp0(module->op, item->module_op) == 0 && !dt_iop_is_hidden(module)
+           && (module->multi_priority <= 0
+               || g_list_find_custom(darktable.develop->iop, module,
+                                     _manage_editor_module_find_multi) == NULL))
         {
-          GtkWidget *hb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-          gtk_widget_set_name(hb, "modulegroups-iop-header");
-          gchar *lbn = g_strdup_printf("%s\n    %s", module->name(), item->widget_name);
-          GtkWidget *lb = gtk_label_new(lbn);
-          gtk_label_set_ellipsize(GTK_LABEL(lb), PANGO_ELLIPSIZE_END);
-          gtk_label_set_xalign(GTK_LABEL(lb), 0.0);
-          g_free(lbn);
-          gtk_widget_set_name(lb, "iop-panel-label");
-          gtk_box_pack_start(GTK_BOX(hb), lb, FALSE, TRUE, 0);
-          if(!d->edit_ro)
-          {
-            GtkWidget *btn = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
-              &(dtgtk_button_config_t){
-                .tooltip = _("remove this widget"),
-                .clicked_cb = G_CALLBACK(_manage_editor_basics_remove),
-                .clicked_data = self,
-              });
+          _manage_editor_basics_add_row(self, module, item);
+          break;
+        }
+      }
+    }
+  }
+  else
+  {
+    // and we add the ones from the list
+    for(const GList *modules = g_list_last(darktable.develop->iop);
+        modules;
+        modules = g_list_previous(modules))
+    {
+      dt_iop_module_t *module = modules->data;
+      for(const GList *l = d->edit_basics; l; l = g_list_next(l))
+      {
+        dt_lib_modulegroups_basic_item_t *item = l->data;
 
-            g_object_set_data(G_OBJECT(btn), "widget_id", item->id);
-            gtk_box_pack_end(GTK_BOX(hb), btn, FALSE, TRUE, 0);
+        if(g_strcmp0(module->op, item->module_op) == 0 && !dt_iop_is_hidden(module))
+        {
+          // we want to avoid showing multiple instances of the same module
+          if(module->multi_priority <= 0
+             || g_list_find_custom(darktable.develop->iop, module,
+                                   _manage_editor_module_find_multi) == NULL)
+          {
+            _manage_editor_basics_add_row(self, module, item);
           }
-          gtk_box_pack_start(GTK_BOX(d->edit_basics_box), hb, FALSE, TRUE, 0);
         }
       }
     }
