@@ -1093,6 +1093,32 @@ notebook tabs,
   padding: 0.3em;
 }
 
+/* a few pixels of air above the histogram and below the group icons.
+ * side margins stay 0 so the field lines up with those rows. */
+#module-search-row
+{
+  margin: 6px 0;
+}
+
+#modules-tabs #module-search
+{
+  min-height: 2.1em;
+  margin: 0;
+  padding: 0.15em 0.35em;
+  border-width: 2px;
+  border-style: solid;
+  border-color: @fg_color;
+  border-radius: 0.2em;
+  background-color: alpha(@fg_color, 0.16);
+  color: @fg_color;
+}
+
+#modules-tabs #module-search:focus
+{
+  border-color: white;
+  background-color: alpha(@fg_color, 0.24);
+}
+
 /* Set notebook tabs */
 notebook tab label
 {

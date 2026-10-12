@@ -170,6 +170,7 @@ static GtkWidget *_active_popover_menu = NULL;
 static void _lib_modulegroups_toggle(GtkWidget *button, dt_lib_module_t *self);
 /* helper function to update iop module view depending on group */
 static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self);
+static dt_iop_module_t *_module_search_best(const gchar *query, int *out_score, int *out_ties);
 
 /* modulergroups proxy set group function
    \see dt_dev_modulegroups_set()
@@ -241,6 +242,26 @@ static void _text_entry_changed_callback(GtkEntry *entry, dt_lib_module_t *self)
 {
   DT_GUARD_GUI_UPDATE();
   _lib_modulegroups_update_iop_visibility(self);
+}
+
+/* Enter chooses the one best name match. A tie only filters the list, so a
+ * broad word does not open an arbitrary module. The search entry consumes
+ * the key; crop's Return shortcut does not run. */
+static void _text_entry_activate_callback(GtkEntry *entry, dt_lib_module_t *self)
+{
+  const gchar *text = gtk_entry_get_text(entry);
+  if(!text || !text[0] || !darktable.develop) return;
+
+  _lib_modulegroups_update_iop_visibility(self);
+
+  int ties = 0;
+  dt_iop_module_t *best = _module_search_best(text, NULL, &ties);
+  if(!best || ties != 1) return;
+
+  if(!best->expanded)
+    dt_iop_gui_set_expanded(best, TRUE, TRUE);
+  else if(darktable.develop->gui_module != best)
+    dt_iop_request_focus(best);
 }
 
 static DTGTKCairoPaintIconFunc _buttons_get_icon_fct(const gchar *icon)
@@ -447,7 +468,11 @@ static void _sync_visibility(GtkWidget *widget,
   if(widget == item->widget)
     gtk_widget_set_visible(item->temp_widget, gtk_widget_get_visible(item->widget));
 
-  gtk_widget_set_visible(item->box, !dt_action_widget_invisible(item->temp_widget));
+  // the quick-access copy stays up when its module is collapsed. it
+  // still follows the widget itself, so a control the module hides
+  // (the wrong mode, for example) stays hidden here too.
+  gtk_widget_set_visible(item->box,
+                         GTK_IS_WIDGET(item->widget) && gtk_widget_get_visible(item->widget));
 }
 
 static void _basics_off_sync(GtkToggleButton *toggle,
@@ -636,6 +661,7 @@ static void _basics_add_widget(dt_lib_module_t *self, dt_lib_modulegroups_basic_
     gtk_container_add(GTK_CONTAINER(evb), header_box);
     gtk_widget_show_all(evb);
     g_object_set_data(G_OBJECT(evb), "module", item->module->so);
+    g_object_set_data_full(G_OBJECT(evb), "qap-op", g_strdup(item->module->op), g_free);
     dt_gui_connect_click_secondary(evb, _manage_direct_module_popup, NULL, self);
     gtk_widget_set_name(header_box, "basics-header-box");
     dt_gui_add_class(header_box, "dt_big_btn_canvas");
@@ -746,6 +772,35 @@ static gboolean _basics_widget_has_id(dt_iop_module_t *module, GtkWidget *w, con
   return FALSE;
 }
 
+/* the action target can point at a destroyed slider after extra instances
+ * are created. the label still identifies the whole-photo control. */
+static GtkWidget *_basics_find_labeled(GtkWidget *w, const gchar *label)
+{
+  if(!w || !label) return NULL;
+
+  if(DT_IS_BAUHAUS_WIDGET(w))
+  {
+    const gchar *lab = dt_bauhaus_widget_get_label(w);
+    if(lab && !g_strcmp0(lab, label)) return w;
+  }
+
+  if(GTK_IS_CONTAINER(w))
+  {
+    GList *children = gtk_container_get_children(GTK_CONTAINER(w));
+    for(const GList *l = children; l; l = g_list_next(l))
+    {
+      GtkWidget *found = _basics_find_labeled(l->data, label);
+      if(found)
+      {
+        g_list_free(children);
+        return found;
+      }
+    }
+    g_list_free(children);
+  }
+  return NULL;
+}
+
 // find the widget in the module's widget tree whose action id equals id
 static GtkWidget *_basics_find_widget(dt_iop_module_t *module, GtkWidget *w, const gchar *id)
 {
@@ -821,6 +876,37 @@ _basics_add_items_from_module_widget(dt_lib_module_t *self, dt_iop_module_t *mod
   return item_pos;
 }
 
+static gboolean _basics_is_whole_photo_module(const dt_iop_module_t *module)
+{
+  return module
+         && !dt_iop_is_hidden(module)
+         && !(module->flags() & IOP_FLAGS_DEPRECATED)
+         && module->iop_order != INT_MAX
+         && module->multi_priority == 0;
+}
+
+/* one module's quick-access widgets, in the module's own control order */
+static dt_lib_modulegroups_basic_item_position_t
+_basics_add_module(dt_lib_module_t *self, dt_iop_module_t *module,
+                   dt_lib_modulegroups_basic_item_position_t item_pos)
+{
+  dt_lib_modulegroups_t *d = self->data;
+
+  for(const GList *l = d->basics; l; l = g_list_next(l))
+  {
+    dt_lib_modulegroups_basic_item_t *item = l->data;
+    if(!item->module && g_strcmp0(item->module_op, module->op) == 0
+       && item->widget_type == WIDGET_TYPE_ACTIVATE_BTN)
+    {
+      item->module = module;
+      _basics_add_widget(self, item, NULL, item_pos);
+      item_pos = NORMAL;
+    }
+  }
+
+  return _basics_add_items_from_module_widget(self, module, module->widget, item_pos);
+}
+
 // build the quick access panel in the preset's stored order instead of
 // reverse pipeline order, rendering '@'-prefixed items as section headings
 static void _basics_show_listed(dt_lib_module_t *self)
@@ -855,6 +941,11 @@ static void _basics_show_listed(dt_lib_module_t *self)
     for(GList *modules = g_list_last(darktable.develop->iop); modules; modules = g_list_previous(modules))
     {
       dt_iop_module_t *m = modules->data;
+      // the quick access panel is the whole-photo edit. a local
+      // instance is created after the base one, and this walk meets
+      // it first; binding that copy makes the exposure slider do
+      // nothing outside the mask.
+      if(m->multi_priority != 0) continue;
       if(g_strcmp0(m->op, item->module_op) == 0
          && !dt_iop_is_hidden(m)
          && !(m->flags() & IOP_FLAGS_DEPRECATED)
@@ -870,6 +961,9 @@ static void _basics_show_listed(dt_lib_module_t *self)
     if(item->widget_type != WIDGET_TYPE_ACTIVATE_BTN)
     {
       w = _basics_find_widget(module, module->widget, item->id);
+      // extra exposure instances drop the action link to the base slider
+      if(!w && !g_strcmp0(item->id, "exposure/exposure"))
+        w = _basics_find_labeled(module->widget, "exposure");
       // a missing widget is skipped without touching the module tracking
       if(!w) continue;
     }
@@ -885,6 +979,131 @@ static void _basics_show_listed(dt_lib_module_t *self)
     after_heading = FALSE;
     last_module = module;
   }
+}
+
+/* Lightroom Develop, top to bottom: white balance, tone, presence,
+ * tone curve, color, detail, lens and transform. Widgets this preset
+ * does not have are skipped. A heading is added only when something
+ * under it is present. */
+static const gchar *const _lr_qap_order[] = {
+  "@white balance",
+  "channelmixerrgb/illuminant",
+  "channelmixerrgb/temperature",
+  "channelmixerrgb/hue",
+  "channelmixerrgb/chroma",
+  "channelmixerrgb/F source",
+  "channelmixerrgb/LED source",
+  "@tone",
+  "exposure/exposure",
+  "sigmoid/contrast",
+  "sigmoid/skew",
+  "filmicrgb/contrast",
+  "agx/curve/contrast",
+  "@presence",
+  "bilat/detail",
+  "contrastntexture/medium details",
+  "contrastntexture/coarse details",
+  "hazeremoval/strength",
+  "colorbalancergb/global vibrance",
+  "colorbalancergb/global saturation",
+  "colorbalancergb/global brilliance",
+  "colorbalancergb/global chroma",
+  "@tone curve",
+  "toneequal/graph",
+  "toneequal/mask exposure compensation",
+  "toneequal/mask contrast compensation",
+  "@color",
+  "colorequal/page",
+  "colorequal/graph",
+  "colorequal/node placement",
+  "@detail",
+  "denoiseprofile/strength",
+  "@lens & transform",
+  "lens",
+  "ashift/rotation",
+};
+
+static gboolean _basics_list_has_id(const GList *list, const gchar *id)
+{
+  for(const GList *l = list; l; l = g_list_next(l))
+  {
+    const dt_lib_modulegroups_basic_item_t *item = l->data;
+    if(item->id && !g_strcmp0(item->id, id)) return TRUE;
+  }
+  return FALSE;
+}
+
+static dt_lib_modulegroups_basic_item_t *_basics_take_id(GList **list, const gchar *id)
+{
+  for(GList *l = *list; l; l = g_list_next(l))
+  {
+    dt_lib_modulegroups_basic_item_t *item = l->data;
+    if(item->id && !g_strcmp0(item->id, id))
+    {
+      *list = g_list_delete_link(*list, l);
+      return item;
+    }
+  }
+  return NULL;
+}
+
+static gboolean _lr_heading_has_widget(const GList *basics, const guint heading)
+{
+  for(guint i = heading + 1; i < G_N_ELEMENTS(_lr_qap_order); i++)
+  {
+    if(_lr_qap_order[i][0] == '@') break;
+    if(_basics_list_has_id(basics, _lr_qap_order[i])) return TRUE;
+  }
+  return FALSE;
+}
+
+static void _basics_apply_lightroom_order(dt_lib_modulegroups_t *d)
+{
+  GList *old = d->basics;
+  GList *ordered = NULL;
+
+  for(guint i = 0; i < G_N_ELEMENTS(_lr_qap_order); i++)
+  {
+    const gchar *id = _lr_qap_order[i];
+    if(id[0] == '@')
+    {
+      if(!_lr_heading_has_widget(old, i) && !_basics_list_has_id(old, id))
+        continue;
+      dt_lib_modulegroups_basic_item_t *heading = _basics_take_id(&old, id);
+      if(!heading)
+      {
+        heading = g_malloc0(sizeof(*heading));
+        heading->id = g_strdup(id);
+        _basics_init_item(heading);
+      }
+      ordered = g_list_append(ordered, heading);
+    }
+    else
+    {
+      dt_lib_modulegroups_basic_item_t *item = _basics_take_id(&old, id);
+      if(item) ordered = g_list_append(ordered, item);
+    }
+  }
+
+  ordered = g_list_concat(ordered, old);
+  d->basics = ordered;
+  d->basics_listed_order = TRUE;
+}
+
+static gboolean _basics_scroll_to_top(gpointer user_data)
+{
+  GtkWidget *box = user_data;
+  if(GTK_IS_WIDGET(box))
+  {
+    GtkWidget *sw = gtk_widget_get_ancestor(box, GTK_TYPE_SCROLLED_WINDOW);
+    if(sw)
+    {
+      GtkAdjustment *adj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw));
+      gtk_adjustment_set_value(adj, gtk_adjustment_get_lower(adj));
+    }
+  }
+  g_object_unref(box);
+  return G_SOURCE_REMOVE;
 }
 
 static void _basics_show(dt_lib_module_t *self)
@@ -911,6 +1130,8 @@ static void _basics_show(dt_lib_module_t *self)
     gtk_widget_set_name(d->vbox_basic, "basics-box");
   dt_gui_add_class(d->vbox_basic,"dt_plugin_ui");
 
+  _basics_apply_lightroom_order(d);
+
   if(d->basics_listed_order)
   {
     _basics_show_listed(self);
@@ -921,34 +1142,17 @@ static void _basics_show(dt_lib_module_t *self)
     for(GList *modules = g_list_last(darktable.develop->iop); modules; modules = g_list_previous(modules))
     {
       dt_iop_module_t *module = modules->data;
+      if(!_basics_is_whole_photo_module(module)) continue;
 
-      // we record if it's a new module or not to set css class and box structure
       if(item_pos != FIRST_MODULE) item_pos = NEW_MODULE;
-
-      if(!dt_iop_is_hidden(module) && !(module->flags() & IOP_FLAGS_DEPRECATED) && module->iop_order != INT_MAX)
-      {
-        // first, we add on-off buttons if any
-        for(const GList *l = d->basics; l; l = g_list_next(l))
-        {
-          dt_lib_modulegroups_basic_item_t *item = l->data;
-          if(!item->module && g_strcmp0(item->module_op, module->op) == 0)
-          {
-            if(item->widget_type == WIDGET_TYPE_ACTIVATE_BTN)
-            {
-              item->module = module;
-              _basics_add_widget(self, item, NULL, item_pos);
-              item_pos = NORMAL;
-            }
-          }
-        }
-
-        // for the other items, we want them in same order as the module gui
-        _basics_add_items_from_module_widget(self, module, module->widget, item_pos);
-      }
+      item_pos = _basics_add_module(self, module, item_pos);
     }
   }
 
   gtk_widget_show(d->vbox_basic);
+
+  /* open the panel at white balance, the first Lightroom section. */
+  g_idle_add(_basics_scroll_to_top, g_object_ref(d->vbox_basic));
 
   DT_LEAVE_GUI_UPDATE();
 }
@@ -972,6 +1176,114 @@ static gboolean _is_module_in_history(dt_iop_module_t *module)
     if(hist->module == module) return TRUE;
   }
   return FALSE;
+}
+
+/* "frame" is not a letter-prefix of "framing" (fram-e vs fram-ing). A short
+ * shared stem plus a light ending still counts as the module name. */
+static gboolean _search_light_ending(const gchar *ending)
+{
+  return !g_strcmp0(ending, "")
+      || !g_strcmp0(ending, "e")
+      || !g_strcmp0(ending, "s")
+      || !g_strcmp0(ending, "es")
+      || !g_strcmp0(ending, "ed")
+      || !g_strcmp0(ending, "ing")
+      || !g_strcmp0(ending, "ion");
+}
+
+static gboolean _search_stem_match(const gchar *name, const gchar *query)
+{
+  size_t n = 0;
+  while(name[n] && query[n] && name[n] == query[n]) n++;
+  if(n < 4) return FALSE;
+  return _search_light_ending(name + n) && _search_light_ending(query + n);
+}
+
+/* Name matches outrank aliases. An alias hits only when the query is the
+ * start of one alias (split on '|'), so "frame" opens framing and does not
+ * stick on crop just because crop's alias is "reframe". */
+static int _module_search_score(const dt_iop_module_t *module, const gchar *query)
+{
+  if(!module || !query || !query[0]) return 0;
+
+  gchar *q = g_utf8_casefold(query, -1);
+  if(!q) return 0;
+
+  int score = 0;
+  const gchar *localized = dt_iop_get_localized_name(module->op);
+  gchar *name = localized ? g_utf8_casefold(localized, -1) : NULL;
+  if(name && name[0])
+  {
+    if(!g_strcmp0(name, q))
+      score = 5;
+    else if(g_str_has_prefix(name, q))
+      score = 4;
+    else if(g_strstr_len(name, -1, q) || _search_stem_match(name, q))
+      score = 3;
+  }
+  g_free(name);
+
+  const gchar *aliases = dt_iop_get_localized_aliases(module->op);
+  if(aliases && aliases[0])
+  {
+    gchar *folded = g_utf8_casefold(aliases, -1);
+    gchar **tokens = g_strsplit(folded ? folded : "", "|", -1);
+    for(gchar **token = tokens; token && *token; token++)
+    {
+      g_strstrip(*token);
+      if(!(*token)[0]) continue;
+      if(!g_strcmp0(*token, q))
+        score = MAX(score, 2);
+      else if(g_str_has_prefix(*token, q))
+        score = MAX(score, 1);
+    }
+    g_strfreev(tokens);
+    g_free(folded);
+  }
+
+  if(module->multi_name[0])
+  {
+    gchar *mn = g_utf8_casefold(module->multi_name, -1);
+    if(mn && g_strstr_len(mn, -1, q))
+      score = MAX(score, 1);
+    g_free(mn);
+  }
+
+  g_free(q);
+  return score;
+}
+
+static dt_iop_module_t *_module_search_best(const gchar *query, int *out_score, int *out_ties)
+{
+  dt_iop_module_t *best = NULL;
+  int best_score = 0;
+  int ties = 0;
+
+  for(const GList *modules = darktable.develop ? darktable.develop->iop : NULL;
+      modules;
+      modules = g_list_next(modules))
+  {
+    dt_iop_module_t *module = modules->data;
+    if(!module || dt_iop_is_hidden(module) || !module->expander) continue;
+    if(module->iop_order == INT_MAX) continue;
+    if(dt_iop_is_local_sink(module)) continue;
+    if((module->flags() & IOP_FLAGS_DEPRECATED) && !module->enabled) continue;
+
+    const int score = _module_search_score(module, query);
+    if(score <= 0) continue;
+    if(score > best_score)
+    {
+      best = module;
+      best_score = score;
+      ties = 1;
+    }
+    else if(score == best_score)
+      ties++;
+  }
+
+  if(out_score) *out_score = best_score;
+  if(out_ties) *out_ties = ties;
+  return best;
 }
 
 static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
@@ -1032,6 +1344,14 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
       /* skip modules without an gui */
       if(dt_iop_is_hidden(module)) continue;
 
+      /* a local-mask sink stays in the pipe and in history, not in this list */
+      if(dt_iop_is_local_sink(module))
+      {
+        if(dt_dev_gui_module() == module) dt_iop_request_focus(NULL);
+        if(w) gtk_widget_hide(w);
+        continue;
+      }
+
       // do not show non-active modules
       // we don't want the user to mess with those
       if(module->iop_order == INT_MAX)
@@ -1063,21 +1383,17 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
         }
         else
         {
-           const int is_match = (g_strstr_len(g_utf8_casefold(dt_iop_get_localized_name(module->op), -1), -1,
-                                              g_utf8_casefold(text_entered, -1))
-                                 != NULL) ||
-                                 (g_strstr_len(g_utf8_casefold(dt_iop_get_localized_aliases(module->op), -1), -1,
-                                               g_utf8_casefold(text_entered, -1))
-                                 != NULL) ||
-                                 (g_strstr_len(g_utf8_casefold(module->multi_name, -1), -1,
-                                               g_utf8_casefold(text_entered, -1))
-                                 != NULL);
-
+          const int is_match = _module_search_score(module, text_entered) > 0;
 
           if(is_match)
             gtk_widget_show(w);
           else
-            gtk_widget_hide(w);
+          {
+            /* a module that no longer matches must not keep the keyboard,
+             * or Enter still belongs to it (crop confirm) instead of the search */
+            if(dt_dev_gui_module() == module) dt_iop_request_focus(NULL);
+            if(w) gtk_widget_hide(w);
+          }
         }
         continue;
       }
@@ -1250,8 +1566,9 @@ static void _lib_modulegroups_toggle(GtkWidget *button, dt_lib_module_t *self)
   }
   if(button == d->basic_btn) gid = DT_MODULEGROUP_BASICS;
 
-  /* only deselect button if not currently searching else re-enable module */
-  if(d->current == gid && gid != DT_MODULEGROUP_BASICS && !(text_entered && text_entered[0] != '\0'))
+  /* clicking the selected group again, including quick access, leaves
+   * it and shows every module. searching keeps the current group. */
+  if(d->current == gid && !(text_entered && text_entered[0] != '\0'))
     _lib_modulegroups_switch_to(self, DT_MODULEGROUP_NONE);
   else
     _lib_modulegroups_switch_to(self, gid);
@@ -3628,13 +3945,19 @@ void gui_init(dt_lib_module_t *self)
   gtk_box_pack_start(GTK_BOX(d->hbox_buttons), self->presets_button, FALSE, FALSE, 0);
   dt_gui_connect_click(self->presets_button, _presets_pressed_cb, NULL, self);
 
-  /* search box */
+  /* search box sits at the top of the panel. the field itself is the
+   * landmark: a light fill and a bright edge, no title above it. */
   d->text_entry = gtk_search_entry_new();
+  gtk_widget_set_name(d->text_entry, "module-search");
   dt_action_define(&darktable.view_manager->proxy.darkroom.view->actions, NULL, N_("search modules"), d->text_entry, &dt_action_def_entry);
   gtk_entry_set_placeholder_text(GTK_ENTRY(d->text_entry),
-                                 _("search modules by name or tag"));
+                                 _("type a module name"));
+  gtk_widget_set_tooltip_text(d->text_entry,
+                              _("type a module name to show it in the list below"));
   g_signal_connect(G_OBJECT(d->text_entry), "search-changed",
                    G_CALLBACK(_text_entry_changed_callback), self);
+  g_signal_connect(G_OBJECT(d->text_entry), "activate",
+                   G_CALLBACK(_text_entry_activate_callback), self);
   g_signal_connect(G_OBJECT(d->text_entry), "stop-search",
                    G_CALLBACK(dt_gui_search_stop), dt_ui_center(darktable.gui->ui));
   g_signal_connect_data(G_OBJECT(d->text_entry), "focus-in-event",
@@ -3642,15 +3965,21 @@ void gui_init(dt_lib_module_t *self)
                         d->hbox_search_box, NULL, G_CONNECT_AFTER | G_CONNECT_SWAPPED);
 
   GtkWidget *visibility_wrapper = gtk_event_box_new(); // extra layer prevents disabling shortcuts when hidden
+  gtk_widget_set_hexpand(visibility_wrapper, TRUE);
+  gtk_widget_set_hexpand(d->text_entry, TRUE);
   gtk_container_add(GTK_CONTAINER(visibility_wrapper), d->text_entry);
   gtk_box_pack_start(GTK_BOX(d->hbox_search_box), visibility_wrapper, TRUE, TRUE, 0);
+  /* natural width must not cap the field, or the right edge stops
+   * short of the group icons */
   gtk_entry_set_width_chars(GTK_ENTRY(d->text_entry), 0);
-  gtk_entry_set_max_width_chars(GTK_ENTRY(d->text_entry), 35);
+  gtk_entry_set_max_width_chars(GTK_ENTRY(d->text_entry), -1);
+  gtk_widget_set_name(d->hbox_search_box, "module-search-row");
+  gtk_widget_set_hexpand(d->hbox_search_box, TRUE);
   gtk_entry_set_icon_tooltip_text(GTK_ENTRY(d->text_entry),
                                   GTK_ENTRY_ICON_SECONDARY, _("clear text"));
 
+  gtk_box_pack_start(GTK_BOX(self->widget), d->hbox_search_box, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(self->widget), d->hbox_buttons, TRUE, TRUE, 0);
-  gtk_box_pack_start(GTK_BOX(self->widget), d->hbox_search_box, TRUE, TRUE, 0);
 
   // deprecated message
   d->deprecated

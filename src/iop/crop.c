@@ -105,6 +105,8 @@ typedef struct dt_iop_crop_gui_data_t
   gboolean ctrl_hold;
   gboolean preview_ready;
   gint64 focus_time;
+  // crop rectangle at the moment the tool was opened, so Escape can put it back
+  float saved_x, saved_y, saved_w, saved_h;
   dt_gui_collapsible_section_t cs;
 } dt_iop_crop_gui_data_t;
 
@@ -143,8 +145,12 @@ int default_group()
 
 int flags()
 {
+  // No fast pipe. Focusing this module used to switch the preview onto the
+  // cheap pipe, so denoise, demosaic and the tone mapper changed and the
+  // photo looked like its exposure had moved. Lightroom keeps the same
+  // rendering while the crop tool is open.
   return IOP_FLAGS_ALLOW_TILING | IOP_FLAGS_TILING_FULL_ROI
-    | IOP_FLAGS_ONE_INSTANCE | IOP_FLAGS_ALLOW_FAST_PIPE
+    | IOP_FLAGS_ONE_INSTANCE
     | IOP_FLAGS_GUIDES_SPECIAL_DRAW | IOP_FLAGS_GUIDES_WIDGET | IOP_FLAGS_CROP_EXPOSER;
 }
 
@@ -654,6 +660,9 @@ void commit_params(dt_iop_module_t *self,
   dt_print(DT_DEBUG_PARAMS, "[crop] commit ratio_d=%d ratio_n=%d", d->ratio_d, d->ratio_n);
 }
 
+static void _update_sliders_and_limit(dt_iop_crop_gui_data_t *g);
+static void _crop_reflect_params(dt_iop_module_t *self);
+
 static void _event_preview_updated_callback(gpointer instance, dt_iop_module_t *self)
 {
   dt_iop_crop_gui_data_t *g = self->gui_data;
@@ -681,10 +690,11 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
     {
       // got focus, grab stuff to gui:
       // need to get gui stuff for the first time for this image,
-      g->clip_x = CLAMPF(p->cx, 0.0f, 1.f - MIN_CROP_SIZE);
-      g->clip_y = CLAMPF(p->cy, 0.0f, 1.f - MIN_CROP_SIZE);
-      g->clip_w = CLAMPF(p->cw - p->cx, MIN_CROP_SIZE, 1.0f - g->clip_x);
-      g->clip_h = CLAMPF(p->ch - p->cy, MIN_CROP_SIZE, 1.0f - g->clip_y);
+      _crop_reflect_params(self);
+      g->saved_x = g->clip_x;
+      g->saved_y = g->clip_y;
+      g->saved_w = g->clip_w;
+      g->saved_h = g->clip_h;
       g->preview_ready = FALSE;
     }
     else if(g->preview_ready)
@@ -698,6 +708,8 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
       self->dev->gui_module = old_gui;
       g->clip_max_pipe_hash = DT_INVALID_HASH;
     }
+    if(!in)
+      _crop_reflect_params(self);
   }
   else if(in)
     g->preview_ready = TRUE;
@@ -1143,6 +1155,24 @@ static void _update_sliders_and_limit(dt_iop_crop_gui_data_t *g)
   dt_bauhaus_slider_set_soft_min(g->cw, g->clip_x + MIN_CROP_SIZE);
 }
 
+/* Margin sliders show the stored crop. Called with the GUI-update guard so
+ * moving a slider here does not write another history step. */
+static void _crop_reflect_params(dt_iop_module_t *self)
+{
+  dt_iop_crop_gui_data_t *g = self->gui_data;
+  dt_iop_crop_params_t *p = self->params;
+  if(!g || !p) return;
+
+  g->clip_x = CLAMPF(p->cx, 0.0f, 1.f - MIN_CROP_SIZE);
+  g->clip_y = CLAMPF(p->cy, 0.0f, 1.f - MIN_CROP_SIZE);
+  g->clip_w = CLAMPF(p->cw - p->cx, MIN_CROP_SIZE, 1.0f - g->clip_x);
+  g->clip_h = CLAMPF(p->ch - p->cy, MIN_CROP_SIZE, 1.0f - g->clip_y);
+
+  DT_ENTER_GUI_UPDATE();
+  _update_sliders_and_limit(g);
+  DT_LEAVE_GUI_UPDATE();
+}
+
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
   dt_iop_crop_gui_data_t *g = self->gui_data;
@@ -1309,6 +1339,46 @@ static void _crop_handle_flip(dt_iop_module_t *self, const dt_image_orientation_
   dt_dev_add_history_item(darktable.develop, self, self->enabled);
 }
 
+/* The shortcut lives on the module plugin, not on one image's instance.
+ * An instance action has no stable id, and saving it wrote a broken shortcut
+ * that crashed the next launch. */
+static dt_iop_module_t *_focused_crop(void)
+{
+  dt_develop_t *dev = darktable.develop;
+  dt_iop_module_t *self = dev ? dev->gui_module : NULL;
+  if(!self || g_strcmp0(self->op, "crop"))
+    return NULL;
+  return self;
+}
+
+/* Enter confirms, as in Lightroom: keep the rectangle and leave the tool.
+ * Leaving focus runs gui_focus(), which writes the on-screen box. */
+static void _crop_confirm(dt_action_t *action)
+{
+  (void)action;
+  dt_iop_module_t *self = _focused_crop();
+  if(!self) return;
+  dt_iop_request_focus(NULL);
+}
+
+/* Escape puts back the rectangle from when the tool was opened, then leaves. */
+static void _crop_cancel(dt_action_t *action)
+{
+  (void)action;
+  dt_iop_module_t *self = _focused_crop();
+  if(!self) return;
+
+  dt_iop_crop_gui_data_t *g = self->gui_data;
+  if(g)
+  {
+    g->clip_x = g->saved_x;
+    g->clip_y = g->saved_y;
+    g->clip_w = g->saved_w;
+    g->clip_h = g->saved_h;
+  }
+  dt_iop_request_focus(NULL);
+}
+
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_crop_gui_data_t *g = IOP_GUI_ALLOC(crop);
@@ -1323,6 +1393,8 @@ void gui_init(dt_iop_module_t *self)
   g->shift_hold = FALSE;
   g->ctrl_hold = FALSE;
   g->preview_ready = FALSE;
+  g->saved_x = g->saved_y = 0.0f;
+  g->saved_w = g->saved_h = 1.0f;
 
   dt_iop_crop_aspect_t aspects[] = {
     { _("freehand"), 0, 0 },
@@ -1464,6 +1536,11 @@ void gui_init(dt_iop_module_t *self)
                              _("flip crop orientation between horizontal and vertical"));
 
   GtkWidget *box_enabled = dt_gui_vbox(g->aspect_presets);
+
+  dt_action_t *confirm = dt_action_register(DT_ACTION(self->so), N_("confirm"),
+                                            _crop_confirm, GDK_KEY_Return, 0);
+  dt_shortcut_register(confirm, 0, 0, GDK_KEY_KP_Enter, 0);
+  dt_action_register(DT_ACTION(self->so), N_("cancel"), _crop_cancel, GDK_KEY_Escape, 0);
 
   // we put margins values under an expander
   dt_gui_new_collapsible_section

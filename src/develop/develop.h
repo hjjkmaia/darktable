@@ -311,6 +311,24 @@ typedef struct dt_develop_t
                                struct dt_iop_module_t *module,
                                const dt_mask_id_t selectid);
     } masks;
+
+    /* local-adjustment mask that should own a newly created shape */
+    struct
+    {
+      struct dt_lib_module_t *module;
+      /* selected local mask, or NULL when none is selected */
+      struct dt_iop_module_t *(*selected_mask)(struct dt_lib_module_t *self);
+      /* select the existing owner of a mask-manager row, or clear an ambiguous owner */
+      void (*select_mask)(struct dt_lib_module_t *self,
+                          struct dt_iop_module_t *owner);
+      /* confirm if needed, then return the mask that owns the new shape.
+       * NULL means the user cancelled and no shape should be created. */
+      struct dt_iop_module_t *(*begin_shape)(struct dt_lib_module_t *self);
+      /* the shape was saved into the mask */
+      void (*shape_committed)(struct dt_lib_module_t *self);
+      /* shape creation was cancelled before a shape existed */
+      void (*shape_cancelled)(struct dt_lib_module_t *self);
+    } localadjust;
   } proxy;
 
   dt_dev_chroma_t chroma;

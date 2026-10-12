@@ -21,6 +21,7 @@
 #include "develop/masks.h"
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
+#include "common/undo.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -66,6 +67,9 @@ typedef struct dt_lib_masks_t
   dt_gui_collapsible_section_t cs;
   GtkWidget *property[DT_MASKS_PROPERTY_LAST];
   GtkWidget *pressure, *smoothing;
+  /* shown only while the brush is armed */
+  GtkWidget *brush_box, *brush_size, *brush_feather, *brush_flow, *brush_density, *brush_erase;
+  gboolean brush_updating;
   float last_value[DT_MASKS_PROPERTY_LAST];
   GtkWidget *none_label;
   // path-only shrink/grow (outset/inset) control. The slider is a signed offset
@@ -595,6 +599,106 @@ static void _resize_update(dt_lib_masks_t *d)
   gtk_widget_set_visible(d->resize_box, path != NULL);
 }
 
+static dt_masks_type_t _brush_conf_type(void)
+{
+  const dt_masks_form_t *form = darktable.develop->form_visible;
+  if(form && (form->type & DT_MASKS_BRUSH)) return form->type;
+  return DT_MASKS_BRUSH;
+}
+
+static void _brush_size_changed(GtkWidget *w, dt_lib_masks_t *d)
+{
+  if(d->brush_updating) return;
+  const float border = CLAMP(dt_bauhaus_slider_get(w) * 0.5f, 0.00005f, 0.5f);
+  dt_conf_set_float(DT_MASKS_CONF(_brush_conf_type(), brush, border), border);
+  dt_control_queue_redraw_center();
+}
+
+static void _brush_feather_changed(GtkWidget *w, dt_lib_masks_t *d)
+{
+  if(d->brush_updating) return;
+  const float hardness = CLAMP(1.0f - dt_bauhaus_slider_get(w), 0.0005f, 1.0f);
+  dt_conf_set_float(DT_MASKS_CONF(_brush_conf_type(), brush, hardness), hardness);
+  dt_control_queue_redraw_center();
+}
+
+static void _brush_density_changed(GtkWidget *w, dt_lib_masks_t *d)
+{
+  if(d->brush_updating) return;
+  const float density = CLAMP(dt_bauhaus_slider_get(w), 0.05f, 1.0f);
+  dt_conf_set_float(DT_MASKS_CONF(_brush_conf_type(), brush, density), density);
+}
+
+static void _brush_flow_changed(GtkWidget *w, dt_lib_masks_t *d)
+{
+  if(d->brush_updating) return;
+  const float flow = CLAMP(dt_bauhaus_slider_get(w), 0.01f, 1.0f);
+  dt_conf_set_float("plugins/darkroom/masks/brush/flow", flow);
+}
+
+static void _brush_erase_changed(GtkWidget *w, dt_lib_masks_t *d)
+{
+  if(d->brush_updating) return;
+  const gboolean erase = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w));
+  // Arming refreshes the selection and brush panel synchronously. Publish
+  // the requested mode first so that refresh cannot restore the old toggle.
+  dt_conf_set_bool("plugins/darkroom/masks/brush/erase", erase);
+  dt_mask_id_t id = NO_MASKID;
+  dt_iop_module_t *owner = NULL;
+  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(d->treeview));
+  GtkTreeModel *model = NULL;
+  GList *rows = gtk_tree_selection_get_selected_rows(selection, &model);
+  if(g_list_length(rows) == 1)
+  {
+    GtkTreeIter iter;
+    if(gtk_tree_model_get_iter(model, &iter, rows->data))
+      gtk_tree_model_get(model, &iter, TREE_MODULE, &owner, TREE_FORMID, &id, -1);
+  }
+  g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+  if(erase && !dt_masks_brush_start_erase(id, owner))
+  {
+    dt_conf_set_bool("plugins/darkroom/masks/brush/erase", FALSE);
+    d->brush_updating = TRUE;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(w), FALSE);
+    d->brush_updating = FALSE;
+    dt_control_log(_("select one brush component to erase"));
+    return;
+  }
+}
+
+static void _brush_panel_sync(dt_lib_masks_t *d, const gboolean show)
+{
+  if(!d->brush_box) return;
+  /* no-show-all skips the box and every child. Clear it, show the
+   * sliders, then put the flag back so a later show-all of the mask
+   * manager cannot pop the panel open on its own. */
+  if(show)
+  {
+    gtk_widget_set_no_show_all(d->brush_box, FALSE);
+    gtk_widget_show_all(d->brush_box);
+    gtk_widget_set_no_show_all(d->brush_box, TRUE);
+  }
+  else
+    gtk_widget_hide(d->brush_box);
+  if(!show) return;
+
+  const dt_masks_type_t type = _brush_conf_type();
+  const float border = dt_conf_get_float(DT_MASKS_CONF(type, brush, border));
+  const float hardness = dt_conf_get_float(DT_MASKS_CONF(type, brush, hardness));
+  const float density = dt_conf_get_float(DT_MASKS_CONF(type, brush, density));
+  float flow = dt_conf_get_float("plugins/darkroom/masks/brush/flow");
+  if(flow <= 0.0f) flow = 1.0f;
+
+  d->brush_updating = TRUE;
+  dt_bauhaus_slider_set(d->brush_size, CLAMP(border / 0.5f, 0.0002f, 1.0f));
+  dt_bauhaus_slider_set(d->brush_feather, CLAMP(1.0f - hardness, 0.0f, 1.0f));
+  dt_bauhaus_slider_set(d->brush_density, CLAMP(density <= 0.0f ? 1.0f : density, 0.05f, 1.0f));
+  dt_bauhaus_slider_set(d->brush_flow, CLAMP(flow, 0.01f, 1.0f));
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->brush_erase),
+                               dt_conf_get_bool("plugins/darkroom/masks/brush/erase"));
+  d->brush_updating = FALSE;
+}
+
 static void _update_all_properties(dt_lib_masks_t *self)
 {
   gtk_widget_show(self->none_label);
@@ -604,9 +708,17 @@ static void _update_all_properties(dt_lib_masks_t *self)
 
   dt_masks_form_t *form = darktable.develop->form_visible;
   gboolean drawing_brush = form && form->type & DT_MASKS_BRUSH;
+  if(form && (form->type & DT_MASKS_GROUP) && g_list_length(form->points) == 1)
+  {
+    const dt_mask_id_t id = ((dt_masks_point_group_t *)form->points->data)->formid;
+    const dt_masks_form_t *selected = dt_masks_get_from_id(darktable.develop, id);
+    drawing_brush = selected && (selected->type & DT_MASKS_BRUSH)
+                    && !(selected->type & (DT_MASKS_CLONE | DT_MASKS_NON_CLONE));
+  }
 
   gtk_widget_set_visible(self->pressure, drawing_brush && darktable.gui->have_pen_pressure);
   gtk_widget_set_visible(self->smoothing, drawing_brush);
+  _brush_panel_sync(self, drawing_brush);
 
   // shrink/grow applies only to a single path shape
   _resize_update(self);
@@ -639,30 +751,58 @@ static void _lib_masks_inactivate_icons(dt_lib_module_t *self)
 #endif
 }
 
-static void _tree_add_shape(GtkButton *button, gpointer shape)
+/* A click can run both the toggle signal and the press gesture. The
+ * second call must not open the dialog again or create a second shape. */
+static gboolean _shape_add_busy = FALSE;
+static gboolean _shape_add_ok = FALSE;
+
+static gboolean _shape_add_clear_busy(gpointer unused)
 {
+  _shape_add_busy = FALSE;
+  _shape_add_ok = FALSE;
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean _tree_add_shape(GtkButton *button, gpointer shape)
+{
+  if(_shape_add_busy) return _shape_add_ok;
+  _shape_add_busy = TRUE;
+
+  dt_develop_t *dev = darktable.develop;
   dt_iop_module_t *module = NULL;
 
-  dt_lib_masks_t *lm = darktable.develop->proxy.masks.module->data;
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
-  GtkTreeModel *model = NULL;
-  GList *selected = gtk_tree_selection_get_selected_rows(selection, &model);
-  if(selected)
+  /* Workspace shapes belong to a local mask. Another module's own
+   * blend-toolbar buttons do not come through here. */
+  if(dev->proxy.localadjust.module && dev->proxy.localadjust.begin_shape)
+    module = dev->proxy.localadjust.begin_shape(dev->proxy.localadjust.module);
+
+  // begin_shape may run a modal dialog's recursive main loop. Keep the guard
+  // set throughout that loop, then clear it after this activation completes.
+  g_idle_add(_shape_add_clear_busy, NULL);
+
+  if(!module)
   {
-    GtkTreeIter iter;
-    if(gtk_tree_model_get_iter(model, &iter, selected->data))
-      _lib_masks_get_values(model, &iter, &module, NULL, NULL);
-    g_list_free_full(selected, (GDestroyNotify) gtk_tree_path_free);
+    _shape_add_ok = FALSE;
+    _lib_masks_inactivate_icons(dev->proxy.masks.module);
+    return FALSE;
   }
 
-  // we create the new form
+  if(GPOINTER_TO_INT(shape) == DT_MASKS_BRUSH)
+    dt_masks_brush_arm_new_component();
+
   dt_masks_form_t *spot = dt_masks_create(GPOINTER_TO_INT(shape));
   dt_masks_change_form_gui(spot);
-  darktable.develop->form_gui->creation_module = module;
-  darktable.develop->form_gui->group_selected = 0;
-  // the new form must be editable
-  darktable.develop->form_gui->edit_mode = DT_MASKS_EDIT_FULL;
+  dev->form_gui->creation_module = module;
+  dev->form_gui->group_selected = 0;
+  dev->form_gui->edit_mode = DT_MASKS_EDIT_FULL;
   dt_control_queue_redraw_center();
+  _shape_add_ok = TRUE;
+  return TRUE;
+}
+
+static void _tree_add_shape_menu(GtkButton *button, gpointer shape)
+{
+  _tree_add_shape(button, shape);
 }
 
 static void _bt_add_shape_cb(GtkGestureSingle *gesture, int n_press, double x, double y, gpointer shape)
@@ -677,7 +817,7 @@ static void _bt_add_shape_cb(GtkGestureSingle *gesture, int n_press, double x, d
       return;
     }
 #endif
-    _tree_add_shape(NULL, shape);
+    if(!_tree_add_shape(NULL, shape)) return;
 
     if(dt_modifier_is(dt_gui_current_state(gesture), GDK_CONTROL_MASK))
     {
@@ -688,6 +828,23 @@ static void _bt_add_shape_cb(GtkGestureSingle *gesture, int n_press, double x, d
 
     _lib_masks_inactivate_icons(darktable.develop->proxy.masks.module);
   }
+}
+
+/* The shape button is a toggle. A click can light the button without the
+ * press gesture running, which leaves no brush form and therefore no
+ * panel. If the brush is not already armed, arm it, then show the panel. */
+static void _brush_button_toggled(GtkToggleButton *button, dt_lib_masks_t *d)
+{
+  if(d->brush_updating) return;
+  if(!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(button))) return;
+
+  dt_develop_t *dev = darktable.develop;
+  const dt_masks_form_t *form = dev ? dev->form_visible : NULL;
+  const gboolean armed = form && (form->type & DT_MASKS_BRUSH)
+                         && dev->form_gui && dev->form_gui->creation;
+  if(!armed && !_tree_add_shape(NULL, GINT_TO_POINTER(DT_MASKS_BRUSH)))
+    return;
+  _brush_panel_sync(d, TRUE);
 }
 
 static void _tree_add_exist(GtkButton *button, dt_masks_form_t *grp)
@@ -701,8 +858,10 @@ static void _tree_add_exist(GtkButton *button, dt_masks_form_t *grp)
   dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, id);
   if(form && dt_masks_group_add_form(grp, form))
   {
-    // we save the group
-    dt_dev_add_masks_history_item(darktable.develop, NULL, FALSE);
+    // A newly populated localmask needs its drawn mode in the same snapshot.
+    const gboolean mode_changed = dt_masks_iop_sync_localmask_mode(module);
+    dt_dev_add_masks_history_item(darktable.develop,
+                                  mode_changed ? module : NULL, FALSE);
 
     // and we apply the change
     dt_masks_iop_update(module);
@@ -1048,6 +1207,7 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
   dt_iop_module_t *module = NULL;
 
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
+  dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
 
   for(const GList *items_iter = items;
       items_iter;
@@ -1090,6 +1250,7 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
   g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
 
   dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
+  dt_undo_end_group(darktable.undo);
   _lib_masks_recreate_list(self);
 }
 
@@ -1146,18 +1307,84 @@ static void _tree_cell_edited(GtkCellRendererText *cell,
   dt_dev_add_masks_history_item(darktable.develop, NULL, FALSE);
 }
 
+static dt_iop_module_t *_selection_owner(GtkTreeModel *model, const GList *items)
+{
+  if(!items || items->next) return NULL;
+
+  // a reused leaf is disambiguated by the top-level group the user selected it under
+  GtkTreePath *root_path = gtk_tree_path_copy(items->data);
+  const gboolean in_group = gtk_tree_path_get_depth(root_path) > 1;
+  while(gtk_tree_path_get_depth(root_path) > 1) gtk_tree_path_up(root_path);
+  GtkTreeIter root_iter;
+  dt_mask_id_t root_id = NO_MASKID;
+  if(gtk_tree_model_get_iter(model, &root_iter, root_path))
+    _lib_masks_get_values(model, &root_iter, NULL, NULL, &root_id);
+  gtk_tree_path_free(root_path);
+  if(!dt_is_valid_maskid(root_id)) return NULL;
+
+  const dt_masks_form_t *root = dt_masks_get_from_id(darktable.develop, root_id);
+  const gboolean exact_root = in_group || (root && (root->type & DT_MASKS_GROUP));
+  dt_iop_module_t *owner = NULL;
+  for(const GList *it = darktable.develop->iop; it; it = g_list_next(it))
+  {
+    dt_iop_module_t *module = it->data;
+    if(!module->blend_params) continue;
+    const gboolean uses = exact_root ? module->blend_params->mask_id == root_id
+                                    : dt_masks_is_in_module(root_id, module);
+    if(!uses) continue;
+    // disabled and legacy users count too: a shared root has no unique owner
+    if(owner) return NULL;
+    owner = module;
+  }
+  return owner && (owner->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+    && !(owner->flags() & IOP_FLAGS_NO_MASKS) ? owner : NULL;
+}
+
 static void _tree_selection_change(GtkTreeSelection *selection, dt_lib_masks_t *self)
 {
   DT_GUARD_GUI_UPDATE();
+  dt_masks_brush_arm_new_component();
   // we reset all "show mask" icon of iops
   dt_masks_reset_show_masks_icons();
 
-  const int nb = gtk_tree_selection_count_selected_rows(selection);
-
-  // else, we create a new form group with the selection and display it
+  int nb = gtk_tree_selection_count_selected_rows(selection);
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(self->treeview));
-  dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
+  dt_iop_module_t *owner = _selection_owner(model, items);
+  if(nb > 0)
+  {
+    GList *rows = NULL;
+    for(const GList *it = items; it; it = g_list_next(it))
+      rows = g_list_append(rows, gtk_tree_row_reference_new(model, it->data));
+
+    dt_develop_t *dev = darktable.develop;
+    if(dev->proxy.localadjust.module && dev->proxy.localadjust.select_mask)
+      dev->proxy.localadjust.select_mask(dev->proxy.localadjust.module, owner);
+
+    // focus clears the mask overlay and selection; restore the rows afterwards
+    // disabled owners stay disabled and are edited through the mask manager
+    dt_iop_request_focus(owner && owner->enabled ? owner : NULL);
+    DT_ENTER_GUI_UPDATE();
+    gtk_tree_selection_unselect_all(selection);
+    for(const GList *it = rows; it; it = g_list_next(it))
+    {
+      GtkTreePath *path = gtk_tree_row_reference_get_path(it->data);
+      if(path)
+      {
+        gtk_tree_view_expand_to_path(GTK_TREE_VIEW(self->treeview), path);
+        gtk_tree_selection_select_path(selection, path);
+        gtk_tree_path_free(path);
+      }
+    }
+    DT_LEAVE_GUI_UPDATE();
+    g_list_free_full(rows, (GDestroyNotify)gtk_tree_row_reference_free);
+    g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+    items = gtk_tree_selection_get_selected_rows(selection, NULL);
+    nb = gtk_tree_selection_count_selected_rows(selection);
+  }
+
+  // create the visible group only after the owning module has canvas focus
+  dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
 
   for(const GList *items_iter = items;
       items_iter;
@@ -1184,10 +1411,9 @@ static void _tree_selection_change(GtkTreeSelection *selection, dt_lib_masks_t *
         // we eventually set the "show masks" icon of iops
         if(nb == 1 && (form->type & DT_MASKS_GROUP))
         {
-          dt_iop_module_t *module = NULL;
-          _lib_masks_get_values(model, &iter, &module, NULL, NULL);
+          dt_iop_module_t *module = owner;
 
-          if(module && module->blend_data
+          if(module && module->enabled && module->blend_data
              && (module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
              && !(module->flags() & IOP_FLAGS_NO_MASKS))
           {
@@ -1348,27 +1574,22 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
     if(nb == 0 || (grp && grp->type & DT_MASKS_GROUP))
     {
       item = gtk_menu_item_new_with_label(_("add brush"));
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape),
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape_menu),
                        GINT_TO_POINTER(DT_MASKS_BRUSH));
       gtk_menu_shell_append(menu, item);
 
-      item = gtk_menu_item_new_with_label(_("add circle"));
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape),
-                       GINT_TO_POINTER(DT_MASKS_CIRCLE));
-      gtk_menu_shell_append(menu, item);
-
-      item = gtk_menu_item_new_with_label(_("add ellipse"));
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape),
+      item = gtk_menu_item_new_with_label(_("add radial gradient"));
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape_menu),
                        GINT_TO_POINTER(DT_MASKS_ELLIPSE));
       gtk_menu_shell_append(menu, item);
 
       item = gtk_menu_item_new_with_label(_("add path"));
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape),
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape_menu),
                        GINT_TO_POINTER(DT_MASKS_PATH));
       gtk_menu_shell_append(menu, item);
 
       item = gtk_menu_item_new_with_label(_("add gradient"));
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape),
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape_menu),
                        GINT_TO_POINTER(DT_MASKS_GRADIENT));
       gtk_menu_shell_append(menu, item);
     }
@@ -2230,7 +2451,8 @@ static void _lib_masks_selection_change(dt_lib_module_t *self,
   // a property slider, making the sliders visibly jump. gui_update applies (and
   // clears) the pending selection. dt_lib_gui_update is a no-op unless a rebuild
   // was already queued (dt_dev_masks_list_change, which creation triggers).
-  if(dt_is_valid_maskid(lm->pending_selectid))
+  // nested GUI updates skip the rebuild, so preserve its queued dirty flag
+  if(dt_is_valid_maskid(lm->pending_selectid) && !DT_IN_GUI_UPDATE())
     dt_lib_gui_update(self);
 }
 
@@ -2299,10 +2521,10 @@ void gui_init(dt_lib_module_t *self)
 
   d->bt_ellipse = dtgtk_togglebutton_new_full(dtgtk_cairo_paint_masks_ellipse, 0, NULL,
     &(dtgtk_button_config_t){
-      .tooltip = _("add ellipse"),
+      .tooltip = _("radial gradient. shift while placing it makes a circle"),
       .action = DT_ACTION(self),
       .action_section = N_("shapes"),
-      .action_label = N_("add ellipse"),
+      .action_label = N_("radial gradient"),
       .action_def = &dt_action_def_toggle,
     });
   g_object_set_data(G_OBJECT(d->bt_ellipse), DT_ACTION_GESTURE_KEY,
@@ -2322,6 +2544,9 @@ void gui_init(dt_lib_module_t *self)
                     dt_gui_connect_click(d->bt_circle, _bt_add_shape_cb, NULL,
                                          GINT_TO_POINTER(DT_MASKS_CIRCLE)));
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_circle), FALSE);
+  /* Circle is the round case of the radial gradient, not a second tool. */
+  gtk_widget_set_no_show_all(d->bt_circle, TRUE);
+  gtk_widget_hide(d->bt_circle);
 
   d->bt_brush = dtgtk_togglebutton_new_full(dtgtk_cairo_paint_masks_brush, 0, NULL,
     &(dtgtk_button_config_t){
@@ -2392,8 +2617,53 @@ void gui_init(dt_lib_module_t *self)
   dt_gui_box_add(shape_buttons, d->bt_object);
 #endif
 
+  /* "%" format subtracts 2 digits. 2 leaves 1% steps; 1 is 10% steps and 0 snaps to 0% or 100%. */
+  d->brush_size = dt_bauhaus_slider_new_action(DT_ACTION(self), 0.0002, 1.0, 0, 0.1, 2);
+  dt_bauhaus_widget_set_label(d->brush_size, N_("brush"), N_("size"));
+  dt_bauhaus_slider_set_format(d->brush_size, "%");
+  gtk_widget_set_tooltip_text(d->brush_size,
+                              _("width of the brush. scroll over the photo to change it too"));
+  g_signal_connect(d->brush_size, "value-changed", G_CALLBACK(_brush_size_changed), d);
+
+  d->brush_feather = dt_bauhaus_slider_new_action(DT_ACTION(self), 0.0, 1.0, 0, 0.34, 2);
+  dt_bauhaus_widget_set_label(d->brush_feather, N_("brush"), N_("feather"));
+  dt_bauhaus_slider_set_format(d->brush_feather, "%");
+  gtk_widget_set_tooltip_text(d->brush_feather,
+                              _("softness of the edge. 0 is a hard edge. shift-scroll over the photo to change it too"));
+  g_signal_connect(d->brush_feather, "value-changed", G_CALLBACK(_brush_feather_changed), d);
+
+  d->brush_flow = dt_bauhaus_slider_new_action(DT_ACTION(self), 0.01, 1.0, 0, 1.0, 2);
+  dt_bauhaus_widget_set_label(d->brush_flow, N_("brush"), N_("flow"));
+  dt_bauhaus_slider_set_format(d->brush_flow, "%");
+  gtk_widget_set_tooltip_text(d->brush_flow,
+                              _("how strong each dab is, as a fraction of density"));
+  g_signal_connect(d->brush_flow, "value-changed", G_CALLBACK(_brush_flow_changed), d);
+
+  d->brush_density = dt_bauhaus_slider_new_action(DT_ACTION(self), 0.05, 1.0, 0, 1.0, 2);
+  dt_bauhaus_widget_set_label(d->brush_density, N_("brush"), N_("density"));
+  dt_bauhaus_slider_set_format(d->brush_density, "%");
+  gtk_widget_set_tooltip_text(d->brush_density,
+                              _("the strongest the stroke can be"));
+  g_signal_connect(d->brush_density, "value-changed", G_CALLBACK(_brush_density_changed), d);
+
+  d->brush_erase = gtk_check_button_new_with_label(_("erase"));
+  gtk_widget_set_tooltip_text(d->brush_erase,
+                              _("the next stroke removes paint from the selected brush component"));
+  g_signal_connect(d->brush_erase, "toggled", G_CALLBACK(_brush_erase_changed), d);
+
+  d->brush_box = dt_gui_vbox(d->brush_size, d->brush_feather, d->brush_flow,
+                             d->brush_density, d->brush_erase);
+  /* Show the sliders once while no-show-all is still off. Setting the
+   * flag first leaves them hidden forever: showing the box later does
+   * not show children that were never shown, and the box stays 0px tall. */
+  gtk_widget_show_all(d->brush_box);
+  gtk_widget_set_no_show_all(d->brush_box, TRUE);
+  gtk_widget_hide(d->brush_box);
+  g_signal_connect(d->bt_brush, "toggled", G_CALLBACK(_brush_button_toggled), d);
+
   self->widget = dt_gui_vbox
     (shape_buttons,
+     d->brush_box,
      dt_ui_resize_wrap(d->treeview, 200, "plugins/darkroom/masks/heightview"));
 
   dt_gui_new_collapsible_section

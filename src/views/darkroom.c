@@ -1715,6 +1715,17 @@ static void _dev_change_image(dt_develop_t *dev,
     dt_control_log(_("can't change image in GIMP plugin mode"));
     return;
   }
+  // resolve unfinished old-image shapes before focus teardown and history persistence
+  dt_masks_cancel_creation();
+  if(dev->proxy.localadjust.module && dev->proxy.localadjust.shape_cancelled)
+    dev->proxy.localadjust.shape_cancelled(dev->proxy.localadjust.module);
+  if(dev->form_gui)
+  {
+    dev->form_gui->creation_continuous = FALSE;
+    dev->form_gui->creation_continuous_module = NULL;
+  }
+  dt_masks_brush_arm_new_component();
+
   // Pipe reset needed when changing image
   // FIXME: synch with dev_init() and dev_cleanup() instead of redoing it
 

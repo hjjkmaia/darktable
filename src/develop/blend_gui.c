@@ -610,6 +610,14 @@ static void _box_set_visible(GtkBox *box, gboolean visible)
   gtk_revealer_set_reveal_child(revealer, visible);
 }
 
+static gboolean _localmask_empty_drawn_controls(const dt_iop_module_t *module,
+                                                const dt_develop_mask_mode_t mask_mode)
+{
+  return module->enabled && module->multi_priority > 0
+         && dt_iop_module_is(module, "localmask")
+         && mask_mode == DEVELOP_MASK_ENABLED;
+}
+
 static void _blendop_masks_mode_callback(const dt_develop_mask_mode_t mask_mode,
                                          dt_iop_gui_blend_data_t *data)
 {
@@ -675,7 +683,8 @@ static void _blendop_masks_mode_callback(const dt_develop_mask_mode_t mask_mode,
     _box_set_visible(data->refine_box, data->raster_inited && mode_raster);
   }
 
-  if(data->masks_inited && mode_drawn)
+  if(data->masks_inited
+     && (mode_drawn || _localmask_empty_drawn_controls(data->module, mask_mode)))
   {
     _box_set_visible(data->masks_box, TRUE);
   }
@@ -1159,9 +1168,14 @@ static void _update_gradient_slider_pickers(GtkWidget *callback_dummy,
 static void _blendop_blendif_update_tab(dt_iop_module_t *module,
                                         const int tab)
 {
-  dt_iop_gui_blend_data_t *data = module->blend_data;
-  dt_develop_blend_params_t *bp = module->blend_params;
-  dt_develop_blend_params_t *dp = module->default_blendop_params;
+  dt_iop_gui_blend_data_t *data = module ? module->blend_data : NULL;
+  dt_develop_blend_params_t *bp = module ? module->blend_params : NULL;
+  dt_develop_blend_params_t *dp = module ? module->default_blendop_params : NULL;
+
+  // undo can refresh blendif before a channel table exists. a null
+  // channel is the Ctrl+Z crash (fault at param_channels[1], 0x2c).
+  // return before the GUI-update guard so it cannot stay held.
+  if(!data || !bp || !dp || !data->channel) return;
 
   DT_ENTER_GUI_UPDATE();
 
@@ -1177,7 +1191,11 @@ static void _blendop_blendif_update_tab(dt_iop_module_t *module,
 
     const int polarity = !(bp->blendif & (1 << (ch + 16)));
 
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sl->polarity), polarity);
+    if(sl->polarity)
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sl->polarity), polarity);
+
+    if(!sl->slider)
+      continue;
 
     dtgtk_gradient_slider_multivalue_set_marker
       (sl->slider,
@@ -1664,7 +1682,9 @@ static void _blendop_masks_add_shape(GtkGestureSingle *gesture,
   }
 #endif
 
-  _blendop_masks_modes_toggle(NULL, self, DEVELOP_MASK_MASK);
+  // Empty local masks must stay inactive until save_creation attaches geometry.
+  if(!dt_iop_module_is(self, "localmask"))
+    _blendop_masks_modes_toggle(NULL, self, DEVELOP_MASK_MASK);
 
   // set all shape buttons to inactive
   for(int n = 0; n < DEVELOP_MASKS_NB_SHAPES; n++)
@@ -1676,6 +1696,10 @@ static void _blendop_masks_add_shape(GtkGestureSingle *gesture,
   bd->masks_shown = DT_MASKS_EDIT_FULL;
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), TRUE);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->masks_edit), FALSE);
+  // an explicit brush request starts a separate component
+  if(bd->masks_type[this] & DT_MASKS_BRUSH)
+    dt_masks_brush_arm_new_component();
+
   // we create the new form
   dt_masks_form_t *form = dt_masks_create(bd->masks_type[this]);
   dt_masks_change_form_gui(form);
@@ -3345,7 +3369,8 @@ void dt_iop_gui_update_blending(dt_iop_module_t *module)
     _box_set_visible(bd->refine_box, bd->raster_inited && mode_raster);
   }
 
-  if(bd->masks_inited && mode_drawn)
+  if(bd->masks_inited
+     && (mode_drawn || _localmask_empty_drawn_controls(module, mask_mode)))
   {
     _box_set_visible(bd->masks_box, TRUE);
   }

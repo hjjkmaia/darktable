@@ -58,6 +58,11 @@ typedef struct dt_iop_localmask_params_t
   int reserved; // $DEFAULT: 0
 } dt_iop_localmask_params_t;
 
+typedef struct dt_iop_localmask_gui_data_t
+{
+  GtkWidget *label;
+} dt_iop_localmask_gui_data_t;
+
 const char *name()
 {
   return _("mask");
@@ -118,7 +123,9 @@ void init(dt_iop_module_t *self)
 
 void gui_init(dt_iop_module_t *self)
 {
-  GtkWidget *label = dt_ui_label_new(_("managed by the local adjustments panel"));
+  // Normal GUI updates refresh blending only for modules with GUI data.
+  dt_iop_localmask_gui_data_t *g = IOP_GUI_ALLOC(localmask);
+  GtkWidget *label = g->label = dt_ui_label_new(_("managed by the local adjustments panel"));
   gtk_widget_set_tooltip_text
     (label,
      _("this instance owns one mask shared by the local adjustment's sliders\n"

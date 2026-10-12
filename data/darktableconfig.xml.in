@@ -2894,7 +2894,7 @@
   <dtconfig>
     <name>plugins/imageio/storage/disk/file_directory</name>
     <type>string</type>
-    <default>$(FILE_FOLDER)/darktable_exported/$(FILE_NAME)</default>
+    <default>$(HOME)/Desktop/$(EXIF.YEAR)$(EXIF.MONTH)$(EXIF.DAY)_$(FILE_NAME)</default>
     <shortdescription/>
     <longdescription/>
   </dtconfig>
@@ -3768,6 +3768,20 @@
     <default>0.66</default>
     <shortdescription/>
     <longdescription/>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/darkroom/masks/brush/flow</name>
+    <type>float</type>
+    <default>1.0</default>
+    <shortdescription>brush flow</shortdescription>
+    <longdescription>fraction of density applied by each dab of a new brush stroke</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/darkroom/masks/brush/erase</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>brush erase</shortdescription>
+    <longdescription>the next brush stroke removes paint instead of adding it</longdescription>
   </dtconfig>
   <dtconfig>
     <name>plugins/darkroom/masks/heightview</name>

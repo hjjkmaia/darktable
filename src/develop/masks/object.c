@@ -1302,6 +1302,12 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
       dt_dev_add_masks_history_item(dev, module, TRUE);
     }
 
+    if(!new_grp)
+    {
+      dt_masks_cancel_creation();
+      return 1;
+    }
+
     // cleanup and exit creation mode
     gui->creation = FALSE;
     gui->creation_continuous = FALSE;

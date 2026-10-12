@@ -1094,7 +1094,7 @@ static void _gui_multiinstance_callback(GtkButton *button,
   GMenu *section = g_menu_new();
   g_menu_append(section, _("rename"), "instances.rename");
   g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
-  
+
   GActionGroup *action_group = gtk_widget_get_action_group(GTK_WIDGET(button), "instances");
   GAction *action;
 
@@ -1327,6 +1327,22 @@ gboolean dt_iop_so_is_hidden(const dt_iop_module_so_t *module)
 gboolean dt_iop_is_hidden(const dt_iop_module_t *module)
 {
   return !module || !module->so || dt_iop_so_is_hidden(module->so);
+}
+
+gboolean dt_iop_is_local_sink(const dt_iop_module_t *module)
+{
+  if(!module || module->multi_priority == 0 || !module->blend_params || !module->dev)
+    return FALSE;
+
+  const dt_develop_blend_params_t *bp = module->blend_params;
+  if(!(bp->mask_mode & DEVELOP_MASK_RASTER)) return FALSE;
+  if(bp->raster_mask_id != BLEND_RASTER_ID) return FALSE;
+  if(bp->raster_mask_instance <= 0) return FALSE;
+  if(!g_str_equal(bp->raster_mask_source, "localmask")) return FALSE;
+
+  /* a stale raster name must not hide a real duplicate */
+  return dt_iop_get_module_by_op_priority(module->dev->iop, "localmask",
+                                          bp->raster_mask_instance) != NULL;
 }
 
 gboolean dt_iop_shown_in_group(dt_iop_module_t *module, const uint32_t group)
@@ -2092,25 +2108,32 @@ void dt_iop_advertise_rastermask(dt_iop_module_t *module, const int mask_mode)
       any pipe commits, so a global flag is already consumed by the time a real
       per-pipe commit happens and would never fire.
 */
-void dt_iop_commit_blend_params(dt_iop_module_t *module,
-                                const dt_develop_blend_params_t *blendop_params,
-                                dt_dev_pixelpipe_t *pipe)
+static void _commit_blend_params(dt_iop_module_t *module,
+                                  const dt_develop_blend_params_t *blendop_params,
+                                  dt_dev_pixelpipe_t *pipe,
+                                  const gboolean update_module)
 {
-  memcpy(module->blend_params, blendop_params, sizeof(dt_develop_blend_params_t));
-  if(blendop_params->blend_cst == DEVELOP_BLEND_CS_NONE)
+  if(update_module)
   {
-    module->blend_params->blend_cst =
-      dt_develop_blend_default_module_blend_colorspace(module);
+    memcpy(module->blend_params, blendop_params, sizeof(dt_develop_blend_params_t));
+    if(blendop_params->blend_cst == DEVELOP_BLEND_CS_NONE)
+    {
+      module->blend_params->blend_cst =
+        dt_develop_blend_default_module_blend_colorspace(module);
+    }
+    dt_iop_advertise_rastermask(module, blendop_params->mask_mode);
   }
-  dt_iop_advertise_rastermask(module, blendop_params->mask_mode);
 
   // If we use default blending parameters or don't have a dev
   // we don't manage raster mask users and set all stuff to defaults
   if(blendop_params == module->default_blendop_params
      || module->dev == NULL)
   {
-    module->raster_mask.sink.source = NULL;
-    module->raster_mask.sink.id = INVALID_MASKID;
+    if(update_module)
+    {
+      module->raster_mask.sink.source = NULL;
+      module->raster_mask.sink.id = INVALID_MASKID;
+    }
     return;
   }
 
@@ -2121,29 +2144,36 @@ void dt_iop_commit_blend_params(dt_iop_module_t *module,
     {
       if(candidate->multi_priority == blendop_params->raster_mask_instance)
       {
-        dt_iop_raster_users_lock(candidate);
-        const gboolean new = g_hash_table_insert(candidate->raster_mask.source.users,
-                            module,
-                            GINT_TO_POINTER(blendop_params->raster_mask_id));
-        dt_iop_raster_users_unlock(candidate);
-        module->raster_mask.sink.source = candidate;
-        module->raster_mask.sink.id = blendop_params->raster_mask_id;
+        // exports also register consumers, without changing live gui bindings.
+        if(update_module || pipe)
+        {
+          dt_iop_raster_users_lock(candidate);
+          const gboolean new = g_hash_table_insert(candidate->raster_mask.source.users,
+                              module,
+                              GINT_TO_POINTER(blendop_params->raster_mask_id));
+          dt_iop_raster_users_unlock(candidate);
+          if(update_module)
+          {
+            module->raster_mask.sink.source = candidate;
+            module->raster_mask.sink.id = blendop_params->raster_mask_id;
+          }
 
-        // Only the genuinely-new case is interesting for the debug log: it's the
-        // one time this exact user/source pairing gets registered. Logging every
-        // "replaced" would just repeat on every commit for as long as the raster
-        // mask is in use.
-        if(new)
-          dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS | DT_DEBUG_VERBOSE,
-                        "request raster mask",
-                        NULL,
-                        module,
-                        DT_DEVICE_NONE,
-                        NULL,
-                        NULL,
-                        "from '%s%s' new",
-                        candidate->op,
-                        dt_iop_get_instance_id(candidate));
+          // Only the genuinely-new case is interesting for the debug log: it's the
+          // one time this exact user/source pairing gets registered. Logging every
+          // "replaced" would just repeat on every commit for as long as the raster
+          // mask is in use.
+          if(new)
+            dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS | DT_DEBUG_VERBOSE,
+                          "request raster mask",
+                          NULL,
+                          module,
+                          DT_DEVICE_NONE,
+                          NULL,
+                          NULL,
+                          "from '%s%s' new",
+                          candidate->op,
+                          dt_iop_get_instance_id(candidate));
+        }
 
         // Whether *this pipe* needs to invalidate the source's cacheline must
         // not be decided from `new`: that flag is shared across all pipes via
@@ -2179,6 +2209,8 @@ void dt_iop_commit_blend_params(dt_iop_module_t *module,
     }
   }
 
+  if(!update_module) return;
+
   /* We don't use a raster mask as source so we will remove this
      module as a user from the hash table and set sink source and id
      to default == 'nothing'
@@ -2196,6 +2228,13 @@ void dt_iop_commit_blend_params(dt_iop_module_t *module,
   }
   module->raster_mask.sink.source = NULL;
   module->raster_mask.sink.id = INVALID_MASKID;
+}
+
+void dt_iop_commit_blend_params(dt_iop_module_t *module,
+                                const dt_develop_blend_params_t *blendop_params,
+                                dt_dev_pixelpipe_t *pipe)
+{
+  _commit_blend_params(module, blendop_params, pipe, TRUE);
 }
 
 gboolean _iop_validate_params(dt_introspection_field_t *field,
@@ -2401,16 +2440,19 @@ void dt_iop_commit_params(dt_iop_module_t *module,
     piece->enabled && module->flags() & IOP_FLAGS_SUPPORTS_BLENDING &&
     (blendop_params->mask_mode != DEVELOP_MASK_DISABLED || dt_dev_gui_module() == module);
 
-  /* 1. make blendop_params available dt_iop_module_t struct.
-        Also checks for a new source raster mask module. This is important as we
+  /* register raster consumers and check this pipe's source mask.
+        This is important as we
         can't know from here if that raster mask is actually available: we handle
         this case by having dt_iop_commit_blend_params() partly invalidate the cache
         to enforce a valid raster, but only when the raster mask is actually in use.
   */
-  dt_iop_commit_blend_params(
+  // pipe replay must not overwrite the live editing state with defaults
+  // or earlier history entries while the gui is recording a new edit.
+  _commit_blend_params(
     module,
     blendop_params,
-    (blendop_params->mask_mode & DEVELOP_MASK_RASTER) && is_blending ? pipe : NULL);
+    (blendop_params->mask_mode & DEVELOP_MASK_RASTER) && is_blending ? pipe : NULL,
+    FALSE);
 
 #ifdef HAVE_OPENCL
   // assume process_cl is ready, commit_params can overwrite this.
@@ -2979,7 +3021,7 @@ static void _iop_plugin_header_released(GtkGestureSingle *gesture,
   }
   else if(button == GDK_BUTTON_SECONDARY)
   {
-    GtkWidget *widget = dt_gui_get_widget(gesture); 
+    GtkWidget *widget = dt_gui_get_widget(gesture);
     _presets_popup_callback(widget, NULL, module);
     return;
   }

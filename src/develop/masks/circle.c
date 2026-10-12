@@ -255,11 +255,7 @@ static int _circle_events_button_pressed(dt_iop_module_t *module,
   }
   else if(which == GDK_BUTTON_SECONDARY)
   {
-    gui->creation_continuous = FALSE;
-    gui->creation_continuous_module = NULL;
-    dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
-    dt_masks_iop_update(module);
-    dt_control_queue_redraw_center();
+    dt_masks_cancel_creation();
     return 1;
   }
   else if(which == GDK_BUTTON_PRIMARY
@@ -593,15 +589,15 @@ static int _circle_events_mouse_moved(dt_iop_module_t *module,
     {
       dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
 
-      const float as2 = sqf(as);
+      const float grab2 = sqf(dt_masks_anchor_sensitive_dist(zoom_scale));
       const float dist_b = sqf(x - gpt->border[2]) + sqf(y - gpt->border[3]);
       const float dist_p = sqf(x - gpt->points[2]) + sqf(y - gpt->points[3]);
 
-      if(!gui->select_only_border && dist_p < as2)
+      if(!gui->select_only_border && dist_p < grab2)
       {
         gui->point_selected = 1;
       }
-      else if(dist_b < as2)
+      else if(dist_b < grab2)
       {
         gui->point_border_selected = 1;
       }

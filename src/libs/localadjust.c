@@ -24,8 +24,14 @@
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
+#include "common/undo.h"
+#include "control/conf.h"
+#include "develop/masks.h"
 #include "gui/gtk.h"
 #include "libs/lib.h"
+#ifdef GDK_WINDOWING_QUARTZ
+#include "osx/osx.h"
+#endif
 
 #include <gtk/gtk.h>
 #include <stdlib.h>
@@ -96,10 +102,16 @@ typedef struct dt_lib_localadjust_t
 {
   GtkWidget *list;
   GtkWidget *add_button, *delete_button;
+  GtkWidget *mode_label;
   GtkWidget *sliders_box;
   GtkWidget *slider[SLIDER_COUNT];
   GArray *groups;   // multi_priorities of the localmask instances shown
   int selected;     // multi_priority of the selected localmask, -1 = none
+  /* set when Confirm created a mask for a shape that is not drawn yet */
+  int provisional;
+  /* Confirm opened one undo group; the shape commit or cancel closes it */
+  gboolean undo_hold;
+  guint undo_hold_idle;
   gboolean updating;
 } dt_lib_localadjust_t;
 
@@ -126,10 +138,15 @@ uint32_t container(dt_lib_module_t *self)
 
 int position(const dt_lib_module_t *self)
 {
-  return 20;
+  /* Panels are packed from the highest position, so a larger number
+   * sits higher. 15 is directly above the mask manager (10): the
+   * effect sliders stay on screen while a component is selected. */
+  return 15;
 }
 
 static void _update(dt_lib_module_t *self);
+static void _refresh_sliders(dt_lib_module_t *self);
+static void _show_mode(dt_lib_module_t *self);
 
 static dt_iop_module_t *_find_mask_instance(dt_develop_t *dev, const int priority)
 {
@@ -180,6 +197,40 @@ static float _field_to_slider(const int k, const float v)
   return _sliders[k].percent ? v * 100.0f : v;
 }
 
+static void _end_undo_hold(dt_lib_localadjust_t *d);
+static void _abandon_shape(dt_lib_module_t *self, dt_iop_module_t *owner);
+
+static void _sync_source_drawn(dt_iop_module_t *mask)
+{
+  // a brush stroke stores a shape and a mask id, but the pipe only
+  // uses that shape when the drawn bit is set. without it the module
+  // blends uniformly and the local exposure hits the whole frame.
+  if(!mask || !mask->blend_params || !mask->dev) return;
+
+  dt_develop_blend_params_t bp = *mask->blend_params;
+  const gboolean id_ok = dt_is_valid_maskid(bp.mask_id);
+  const dt_masks_form_t *grp = id_ok
+    ? dt_masks_get_from_id(mask->dev, bp.mask_id) : NULL;
+  /* forms may be mid-reload. do not write "no shape" over a link
+   * we cannot see yet, or the undo leaves an empty mask beside the brush. */
+  if(id_ok && !grp) return;
+
+  const gboolean has_shape = grp && (grp->type & DT_MASKS_GROUP) && grp->points;
+  if(!has_shape && !id_ok) return;
+
+  const uint32_t want = has_shape
+    ? (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK)
+    : DEVELOP_MASK_ENABLED;
+  bp.mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
+  if(bp.mask_mode == want && bp.mask_combine == mask->blend_params->mask_combine)
+    return;
+
+  bp.mask_mode = want;
+  dt_iop_commit_blend_params(mask, &bp, NULL);
+  /* same history row as the shapes, so undo restores the link and the brush together */
+  dt_dev_add_masks_history_item(mask->dev, mask, TRUE);
+}
+
 static void _commit_sink_blend(dt_iop_module_t *module, const int source_priority)
 {
   dt_develop_blend_params_t bp = *module->blend_params;
@@ -192,6 +243,43 @@ static void _commit_sink_blend(dt_iop_module_t *module, const int source_priorit
   dt_iop_commit_blend_params(module, &bp, NULL);
 }
 
+static void _keep_global_module(dt_iop_module_t *sink)
+{
+  // duplicating a module opens the new instance and, when only one
+  // module may be open, closes the global one. the open module on
+  // the right is what a whole-photo edit uses, so the masked copy
+  // must not stay open in its place.
+  if(!sink || !sink->dev) return;
+
+  if(!sink->multi_name_hand_edited)
+  {
+    g_strlcpy(sink->multi_name, _("local"), sizeof(sink->multi_name));
+    sink->multi_name_hand_edited = TRUE;
+    if(sink->dev->gui_attached)
+      dt_iop_gui_update_header(sink);
+  }
+
+  dt_iop_module_t *base = dt_iop_get_module_by_op_priority(sink->dev->iop,
+                                                           sink->op, 0);
+  if(sink->expanded)
+    dt_iop_gui_set_expanded(sink, FALSE, FALSE);
+  if(base && base != sink
+     && dt_conf_get_bool("darkroom/ui/single_module")
+     && !base->expanded)
+    dt_iop_gui_set_expanded(base, TRUE, FALSE);
+}
+
+/* A drag on one slider is one undo. merge_same_secs (default 10s) skips
+ * a new snapshot when the same widget moves again. An empty undo group
+ * around that second move would still consume one Undo and do nothing,
+ * so the group is only opened when this call writes more than the value. */
+static gboolean _same_slider_drag(dt_develop_t *dev, GtkWidget *slider)
+{
+  if(!dev || !slider || slider != dev->gui_previous_target) return FALSE;
+  const float merge = dt_conf_get_float("darkroom/undo/merge_same_secs");
+  return dt_get_wtime() < dev->gui_previous_time + merge;
+}
+
 static void _set_sink_value(dt_lib_module_t *self, const int k, const float lr_value)
 {
   dt_lib_localadjust_t *d = self->data;
@@ -199,11 +287,41 @@ static void _set_sink_value(dt_lib_module_t *self, const int k, const float lr_v
   dt_iop_module_t *mask = _find_mask_instance(dev, d->selected);
   if(!mask) return;
 
+  /* a finished shape must not stay inside the confirm group, or one
+   * Undo of this slider also removes the brush */
+  if(d->provisional < 0) _end_undo_hold(d);
+
+  GtkWidget *slider = d->slider[k];
+  const gboolean same_drag = _same_slider_drag(dev, slider);
   dt_iop_module_t *sink = _find_sink(dev, _sliders[k].op, d->selected);
-  if(lr_value == 0.0f)
+  const gboolean creating = lr_value != 0.0f && !sink;
+  gboolean removing = lr_value == 0.0f && sink;
+  for(int j = 0; removing && j < SLIDER_COUNT; j++)
   {
-    // a zero local slider removes that instance
-    if(sink) dt_iop_gui_delete(sink);
+    if(j == k || !g_str_equal(_sliders[j].op, _sliders[k].op)) continue;
+    float *value = _field_ptr(sink, _sliders[j].field);
+    if(value && *value != 0.0f) removing = FALSE;
+  }
+  /* Confirm may already be holding one group for the shape being drawn.
+   * A nested group stops Undo at the inner marker. */
+  const gboolean nest = d->undo_hold
+                        || (darktable.undo && darktable.undo->group != DT_UNDO_NONE);
+  const gboolean group = !same_drag && !nest && (creating || removing);
+
+  if(group) dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+  // the brush may have arrived since the adjustment was created
+  _sync_source_drawn(mask);
+
+  if(lr_value == 0.0f && (!sink || removing))
+  {
+    // remove the instance only when all of its local sliders are zero. during one drag the
+    // removal stays in the drag's snapshot instead of a second Undo.
+    if(sink)
+    {
+      if(same_drag) dt_undo_disable_next(darktable.undo);
+      dt_iop_gui_delete(sink);
+    }
+    if(group) dt_undo_end_group(darktable.undo);
     return;
   }
 
@@ -211,20 +329,40 @@ static void _set_sink_value(dt_lib_module_t *self, const int k, const float lr_v
   {
     dt_iop_module_t *base = dt_iop_get_module_by_op_priority(dev->iop,
                                                              _sliders[k].op, 0);
-    if(!base) return;
+    if(!base)
+    {
+      if(group) dt_undo_end_group(darktable.undo);
+      return;
+    }
     // default params, not the priority-0 blob: an exposure instance
     // reloads at 0 EV with compensation off (exposure.c reload_defaults)
     sink = dt_iop_gui_duplicate(base, FALSE);
-    if(!sink) return;
+    if(!sink)
+    {
+      if(group) dt_undo_end_group(darktable.undo);
+      return;
+    }
     _commit_sink_blend(sink, mask->multi_priority);
   }
 
   float *f = _field_ptr(sink, _sliders[k].field);
-  if(!f) return;
+  if(!f)
+  {
+    dt_dev_modulegroups_update_visibility(dev);
+    if(group) dt_undo_end_group(darktable.undo);
+    return;
+  }
   *f = _slider_to_field(k, lr_value);
-  // records the value and keeps the instance enabled
-  dt_dev_add_history_item(dev, sink, TRUE);
+  // name and fold the masked copy before it is recorded, so the
+  // instance on the right reads as local and the global one stays open
+  _keep_global_module(sink);
   dt_iop_gui_update(sink);
+  _keep_global_module(sink);
+  /* blend params are written after duplicate's own visibility refresh */
+  dt_dev_modulegroups_update_visibility(dev);
+  /* last, so a later drag of this slider merges into this edit */
+  dt_dev_add_history_item_target(dev, sink, TRUE, slider);
+  if(group) dt_undo_end_group(darktable.undo);
 }
 
 static void _slider_changed(GtkWidget *w, dt_lib_module_t *self)
@@ -246,33 +384,320 @@ static void _slider_changed(GtkWidget *w, dt_lib_module_t *self)
   dt_iop_request_focus(_find_mask_instance(darktable.develop, d->selected));
 }
 
-static void _add_clicked(GtkWidget *w, dt_lib_module_t *self)
+static gboolean _mask_has_shape(const dt_iop_module_t *mask)
+{
+  if(!mask || !mask->blend_params) return FALSE;
+  if(!dt_is_valid_maskid(mask->blend_params->mask_id)) return FALSE;
+  const dt_masks_form_t *grp = dt_masks_get_from_id(mask->dev, mask->blend_params->mask_id);
+  return grp && (grp->type & DT_MASKS_GROUP) && grp->points;
+}
+
+static int _shape_owner_count(dt_develop_t *dev, const dt_mask_id_t id)
+{
+  int owners = 0;
+  for(GList *m = dev->iop; m; m = g_list_next(m))
+  {
+    dt_iop_module_t *mod = m->data;
+    if(dt_masks_is_in_module(id, mod)) owners++;
+  }
+  return owners;
+}
+
+/* Drop shapes that belong only to this mask. A shape another module
+ * also uses is unlinked here and left in place for that module. */
+static void _remove_exclusive_shapes(dt_iop_module_t *mask)
+{
+  if(!mask || !mask->blend_params) return;
+  if(!dt_is_valid_maskid(mask->blend_params->mask_id)) return;
+
+  dt_masks_form_t *grp = dt_masks_get_from_id(mask->dev, mask->blend_params->mask_id);
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return;
+
+  // Another module may reference this root group directly or as a child group.
+  // Deleting this localmask must leave that group's contents and links intact.
+  if(_shape_owner_count(mask->dev, grp->formid) > 1) return;
+
+  GArray *ids = g_array_new(FALSE, FALSE, sizeof(dt_mask_id_t));
+  for(GList *p = grp->points; p; p = g_list_next(p))
+  {
+    const dt_masks_point_group_t *pt = p->data;
+    g_array_append_val(ids, pt->formid);
+  }
+
+  for(guint i = 0; i < ids->len; i++)
+  {
+    const dt_mask_id_t id = g_array_index(ids, dt_mask_id_t, i);
+    dt_masks_form_t *form = dt_masks_get_from_id(mask->dev, id);
+    if(!form || (form->type & DT_MASKS_GROUP)) continue;
+
+    grp = dt_masks_get_from_id(mask->dev, mask->blend_params->mask_id);
+    if(!grp) break;
+    if(_shape_owner_count(mask->dev, id) <= 1)
+      dt_masks_form_remove(mask, NULL, form);
+    else
+      dt_masks_form_remove(mask, grp, form);
+  }
+  g_array_free(ids, TRUE);
+
+  if(mask->blend_params
+     && dt_is_valid_maskid(mask->blend_params->mask_id))
+  {
+    grp = dt_masks_get_from_id(mask->dev, mask->blend_params->mask_id);
+    if(grp) dt_masks_form_remove(mask, NULL, grp);
+  }
+}
+
+static void _end_undo_hold(dt_lib_localadjust_t *d)
+{
+  if(!d) return;
+  if(d->undo_hold_idle)
+  {
+    g_source_remove(d->undo_hold_idle);
+    d->undo_hold_idle = 0;
+  }
+  if(!d->undo_hold) return;
+  d->undo_hold = FALSE;
+  if(darktable.undo && darktable.undo->group != DT_UNDO_NONE)
+    dt_undo_end_group(darktable.undo);
+}
+
+/* The brush/ellipse caller still writes the module history item after
+ * shape_committed returns. Closing the group on idle keeps that write
+ * inside the same Undo. */
+static gboolean _end_undo_hold_idle(gpointer user_data)
+{
+  dt_lib_module_t *self = user_data;
+  dt_lib_localadjust_t *d = self->data;
+  if(!d) return G_SOURCE_REMOVE;
+  d->undo_hold_idle = 0;
+  _end_undo_hold(d);
+  return G_SOURCE_REMOVE;
+}
+
+/* sinks, exclusive shapes, then the mask. the caller owns the undo group. */
+static void _destroy_mask(dt_lib_module_t *self, dt_iop_module_t *mask)
 {
   dt_lib_localadjust_t *d = self->data;
   dt_develop_t *dev = darktable.develop;
-  if(!dev->gui_attached) return;
+  if(!mask || !dev) return;
+
+  const int priority = mask->multi_priority;
+  GList *victims = NULL;
+  for(GList *m = dev->iop; m; m = g_list_next(m))
+  {
+    dt_iop_module_t *mod = m->data;
+    if(mod->multi_priority == 0) continue;
+    const dt_develop_blend_params_t *bp = mod->blend_params;
+    if(!bp || !(bp->mask_mode & DEVELOP_MASK_RASTER)) continue;
+    if(bp->raster_mask_instance != priority
+       || !g_str_equal(bp->raster_mask_source, "localmask"))
+      continue;
+    victims = g_list_prepend(victims, mod);
+  }
+  for(GList *v = victims; v; v = g_list_next(v))
+    dt_iop_gui_delete(v->data);
+  g_list_free(victims);
+
+  _remove_exclusive_shapes(mask);
+  if(d->provisional == priority) d->provisional = -1;
+  if(d->selected == priority) d->selected = -1;
+  dt_iop_gui_delete(mask);
+  // preserve remaining shapes independently of the removed module
+  dt_dev_add_masks_history_item(dev, NULL, FALSE);
+}
+
+static dt_iop_module_t *_create_mask(dt_lib_module_t *self, const gboolean grouped)
+{
+  dt_lib_localadjust_t *d = self->data;
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached) return NULL;
 
   dt_iop_module_t *base = dt_iop_get_module_by_op_priority(dev->iop, "localmask", 0);
-  if(!base) return;
+  if(!base) return NULL;
 
   d->updating = TRUE;
+  if(grouped) dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
   dt_iop_module_t *mask = dt_iop_gui_duplicate(base, FALSE);
   if(mask)
   {
-    // the empty state: enabled, mask_mode uniformly, none of the drawn,
-    // conditional or raster bits, so the sinks fill 0 until a shape exists
+    /* empty until a shape is drawn: sinks fill 0, so the sliders
+     * do not change the photo yet */
     dt_develop_blend_params_t bp = *mask->blend_params;
     bp.mask_mode = DEVELOP_MASK_ENABLED;
     dt_iop_commit_blend_params(mask, &bp, NULL);
-    // the instance stays enabled for the life of the group
     dt_dev_add_history_item(dev, mask, TRUE);
+    dt_iop_gui_update_blending(mask);
     d->selected = mask->multi_priority;
   }
+  if(grouped) dt_undo_end_group(darktable.undo);
   d->updating = FALSE;
 
   _update(self);
-  // the mask manager edits dev->gui_module, so the brush applies here
   if(mask) dt_iop_request_focus(mask);
+  return mask;
+}
+
+static gboolean _confirm_new_mask(void)
+{
+  GtkWindow *win = GTK_WINDOW(dt_ui_main_window(darktable.gui->ui));
+  for(GList *wins = gtk_window_list_toplevels();
+      wins;
+      wins = g_list_delete_link(wins, wins))
+  {
+    if(gtk_window_is_active(wins->data))
+      win = wins->data;
+  }
+
+  GtkWidget *dialog = gtk_message_dialog_new
+    (win, GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
+     "%s", _("No mask is selected. A new mask will be created for this shape."));
+  gtk_dialog_add_buttons(GTK_DIALOG(dialog),
+                         _("Confirm"), GTK_RESPONSE_ACCEPT,
+                         _("Cancel"), GTK_RESPONSE_CANCEL,
+                         NULL);
+  gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
+  gtk_window_set_title(GTK_WINDOW(dialog), _("New mask"));
+#ifdef GDK_WINDOWING_QUARTZ
+  dt_osx_disallow_fullscreen(dialog);
+#endif
+  const int resp = gtk_dialog_run(GTK_DIALOG(dialog));
+  gtk_widget_destroy(dialog);
+  return resp == GTK_RESPONSE_ACCEPT;
+}
+
+static dt_iop_module_t *_selected_mask(dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  if(d->selected < 0) return NULL;
+  return _find_mask_instance(darktable.develop, d->selected);
+}
+
+static void _select_mask(dt_lib_module_t *self, dt_iop_module_t *owner)
+{
+  dt_lib_localadjust_t *d = self->data;
+  dt_develop_t *dev = darktable.develop;
+  if(d->updating) return;
+
+  const int priority = owner && g_list_find(dev->iop, owner)
+    && dt_iop_module_is(owner, "localmask")
+    && owner->multi_priority > 0
+    && _find_mask_instance(dev, owner->multi_priority) == owner
+    ? owner->multi_priority : -1;
+  if(priority != d->selected) _abandon_shape(self, _selected_mask(self));
+  // cleanup can change the row inventory; apply the resolved selection afterwards
+  _update(self);
+
+  d->updating = TRUE;
+  d->selected = priority;
+  GList *rows = gtk_container_get_children(GTK_CONTAINER(d->list));
+  for(GList *it = rows; it; it = g_list_next(it))
+  {
+    GtkWidget *row = it->data;
+    const int row_priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-priority"));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(row), row_priority == priority);
+  }
+  g_list_free(rows);
+  d->updating = FALSE;
+
+  _refresh_sliders(self);
+  gtk_widget_set_sensitive(d->sliders_box, priority >= 0);
+  gtk_widget_set_sensitive(d->delete_button, priority >= 0);
+  _show_mode(self);
+  dt_lib_gui_queue_update(self);
+}
+
+static dt_iop_module_t *_begin_shape(dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  dt_iop_module_t *mask = _selected_mask(self);
+  if(d->provisional >= 0 && (!mask || d->provisional != mask->multi_priority))
+  {
+    _abandon_shape(self, _find_mask_instance(darktable.develop, d->provisional));
+    mask = _selected_mask(self);
+  }
+  if(mask)
+  {
+    // a tool switch before the first shape keeps the same provisional mask
+    dt_iop_request_focus(mask);
+    return mask;
+  }
+
+  if(!_confirm_new_mask()) return NULL;
+
+  /* the mask and the shape that follows are one edit. the group stays
+   * open until the shape is committed or cancelled. */
+  if(darktable.undo && darktable.undo->group == DT_UNDO_NONE)
+  {
+    dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+    d->undo_hold = TRUE;
+  }
+  mask = _create_mask(self, FALSE);
+  if(!mask)
+  {
+    _end_undo_hold(d);
+    return NULL;
+  }
+  d->provisional = mask->multi_priority;
+  return mask;
+}
+
+static void _shape_committed(dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  d->provisional = -1;
+  _sync_source_drawn(_find_mask_instance(darktable.develop, d->selected));
+  _update(self);
+  if(d->undo_hold && !d->undo_hold_idle)
+    d->undo_hold_idle = g_idle_add(_end_undo_hold_idle, self);
+}
+
+static void _shape_cancelled(dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  if(d->provisional < 0)
+  {
+    _end_undo_hold(d);
+    return;
+  }
+
+  dt_iop_module_t *mask = _find_mask_instance(darktable.develop, d->provisional);
+  d->provisional = -1;
+  gboolean has_adjustment = FALSE;
+  for(int k = 0; mask && k < SLIDER_COUNT; k++)
+  {
+    dt_iop_module_t *sink = _find_sink(darktable.develop, _sliders[k].op, mask->multi_priority);
+    float *value = sink ? _field_ptr(sink, _sliders[k].field) : NULL;
+    if(value && *value != 0.0f) has_adjustment = TRUE;
+  }
+  if(mask && !_mask_has_shape(mask) && !has_adjustment)
+  {
+    const gboolean own_group = !d->undo_hold;
+    if(own_group) dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+    _destroy_mask(self, mask);
+    if(own_group) dt_undo_end_group(darktable.undo);
+    _update(self);
+  }
+  _end_undo_hold(d);
+}
+
+static void _abandon_shape(dt_lib_module_t *self, dt_iop_module_t *owner)
+{
+  dt_lib_localadjust_t *d = self->data;
+  const gboolean updating = d->updating;
+  d->updating = TRUE;
+  dt_masks_form_gui_t *gui = darktable.develop->form_gui;
+  if(owner && gui && gui->creation && gui->creation_module == owner)
+    dt_masks_cancel_creation();
+  _shape_cancelled(self);
+  d->updating = updating;
+}
+
+static void _add_clicked(GtkWidget *w, dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  if(d->updating) return;
+  _abandon_shape(self, _selected_mask(self));
+  _create_mask(self, TRUE);
 }
 
 static void _delete_clicked(GtkWidget *w, dt_lib_module_t *self)
@@ -285,23 +710,10 @@ static void _delete_clicked(GtkWidget *w, dt_lib_module_t *self)
   if(!mask) return;
 
   d->updating = TRUE;
-  // collect before deleting: dt_iop_gui_delete() frees the module
-  GList *victims = NULL;
-  for(GList *m = dev->iop; m; m = g_list_next(m))
-  {
-    dt_iop_module_t *mod = m->data;
-    if(mod->multi_priority == 0) continue;
-    const dt_develop_blend_params_t *bp = mod->blend_params;
-    if(!bp || !(bp->mask_mode & DEVELOP_MASK_RASTER)) continue;
-    if(bp->raster_mask_instance != d->selected
-       || !g_str_equal(bp->raster_mask_source, "localmask"))
-      continue;
-    victims = g_list_prepend(victims, mod);
-  }
-  for(GList *v = victims; v; v = g_list_next(v))
-    dt_iop_gui_delete(v->data);
-  g_list_free(victims);
-  dt_iop_gui_delete(mask);
+  _end_undo_hold(d);
+  dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+  _destroy_mask(self, mask);
+  dt_undo_end_group(darktable.undo);
   d->selected = -1;
   d->updating = FALSE;
 
@@ -332,6 +744,37 @@ static void _refresh_sliders(dt_lib_module_t *self)
 }
 
 static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self);
+
+static void _show_mode(dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  dt_develop_t *dev = darktable.develop;
+
+  if(d->selected < 0)
+  {
+    gtk_label_set_markup
+      (GTK_LABEL(d->mode_label),
+       _("<b>whole photo</b>\n"
+         "the modules on the right change the entire picture"));
+    return;
+  }
+
+  dt_iop_module_t *mask = _find_mask_instance(dev, d->selected);
+  gchar *name = mask ? dt_history_item_get_name(mask) : g_strdup(_("mask"));
+  gchar *esc = g_markup_escape_text(name, -1);
+  const char *empty = _mask_has_shape(mask)
+    ? ""
+    : _("\nthis mask has no shape yet. the sliders are saved, "
+        "and they will not change the photo until a shape is added.");
+  gchar *markup = g_strdup_printf
+    (_("<b>mask</b> — %s\n"
+       "the sliders below change only this mask%s"),
+     esc, empty);
+  gtk_label_set_markup(GTK_LABEL(d->mode_label), markup);
+  g_free(markup);
+  g_free(esc);
+  g_free(name);
+}
 
 static gboolean _has_group(const GArray *groups, const int priority)
 {
@@ -407,6 +850,7 @@ static void _update(dt_lib_module_t *self)
   _refresh_sliders(self);
   gtk_widget_set_sensitive(d->sliders_box, d->selected >= 0);
   gtk_widget_set_sensitive(d->delete_button, d->selected >= 0);
+  _show_mode(self);
 }
 
 static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self)
@@ -430,27 +874,47 @@ static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self)
   }
 
   d->updating = TRUE;
+  if(priority != d->selected) _abandon_shape(self, _selected_mask(self));
   GList *rows = gtk_container_get_children(GTK_CONTAINER(d->list));
   for(GList *it = rows; it; it = g_list_next(it))
     if(it->data != button && gtk_toggle_button_get_active(it->data))
       gtk_toggle_button_set_active(it->data, FALSE);
   g_list_free(rows);
+  d->selected = priority;
   d->updating = FALSE;
 
-  d->selected = priority;
   _refresh_sliders(self);
   gtk_widget_set_sensitive(d->sliders_box, d->selected >= 0);
   gtk_widget_set_sensitive(d->delete_button, d->selected >= 0);
+  _show_mode(self);
 
   // the existing mask manager edits this mask through the module focus
   dt_iop_request_focus(_find_mask_instance(darktable.develop, d->selected));
+  // cleanup can remove a row; rebuild only after this callback releases it
+  dt_lib_gui_queue_update(self);
+}
+
+void gui_update(dt_lib_module_t *self)
+{
+  if(dt_view_get_current() == DT_VIEW_DARKROOM)
+    _update(self);
 }
 
 static void _signal_callback(gpointer instance, dt_lib_module_t *self)
 {
-  // only in darkroom, so let's avoid any update when in lighttable
+  // Image initialization signals can precede history replay. Refresh on
+  // the next draw so the panel reads the completed live module state.
   if(dt_view_get_current() == DT_VIEW_DARKROOM)
-    _update(self);
+    dt_lib_gui_queue_update(self);
+}
+
+static void _image_changed_callback(gpointer instance, dt_lib_module_t *self)
+{
+  /* a shape group must not stay open across photos */
+  dt_lib_localadjust_t *d = self->data;
+  _end_undo_hold(d);
+  d->provisional = -1;
+  _signal_callback(instance, self);
 }
 
 void gui_init(dt_lib_module_t *self)
@@ -459,6 +923,7 @@ void gui_init(dt_lib_module_t *self)
 
   self->data = (void *)d;
   d->selected = -1;
+  d->provisional = -1;
   d->groups = g_array_new(FALSE, FALSE, sizeof(int));
 
   d->add_button = gtk_button_new_with_label(_("new adjustment"));
@@ -477,6 +942,17 @@ void gui_init(dt_lib_module_t *self)
 
   d->list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
+  d->mode_label = gtk_label_new(NULL);
+  gtk_label_set_line_wrap(GTK_LABEL(d->mode_label), TRUE);
+  gtk_label_set_xalign(GTK_LABEL(d->mode_label), 0.0f);
+  gtk_widget_set_margin_top(d->mode_label, 6);
+  gtk_widget_set_margin_bottom(d->mode_label, 4);
+  gtk_widget_set_tooltip_text
+    (d->mode_label,
+     _("a selected mask is edited with the sliders in this panel.\n"
+       "the modules on the right always edit the whole photo.\n"
+       "a module named \"local\" belongs to the selected mask."));
+
   d->sliders_box = dt_gui_vbox();
   for(int k = 0; k < SLIDER_COUNT; k++)
   {
@@ -494,11 +970,18 @@ void gui_init(dt_lib_module_t *self)
   }
 
   self->widget = dt_gui_vbox(dt_gui_hbox(d->add_button, d->delete_button),
-                             d->list, d->sliders_box);
+                             d->list, d->mode_label, d->sliders_box);
 
-  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _signal_callback);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _image_changed_callback);
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_INITIALIZE, _signal_callback);
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_HISTORY_CHANGE, _signal_callback);
+
+  darktable.develop->proxy.localadjust.module = self;
+  darktable.develop->proxy.localadjust.selected_mask = _selected_mask;
+  darktable.develop->proxy.localadjust.select_mask = _select_mask;
+  darktable.develop->proxy.localadjust.begin_shape = _begin_shape;
+  darktable.develop->proxy.localadjust.shape_committed = _shape_committed;
+  darktable.develop->proxy.localadjust.shape_cancelled = _shape_cancelled;
 
   _update(self);
 }
@@ -506,6 +989,16 @@ void gui_init(dt_lib_module_t *self)
 void gui_cleanup(dt_lib_module_t *self)
 {
   dt_lib_localadjust_t *d = self->data;
+  _end_undo_hold(d);
+  if(darktable.develop->proxy.localadjust.module == self)
+  {
+    darktable.develop->proxy.localadjust.module = NULL;
+    darktable.develop->proxy.localadjust.selected_mask = NULL;
+    darktable.develop->proxy.localadjust.select_mask = NULL;
+    darktable.develop->proxy.localadjust.begin_shape = NULL;
+    darktable.develop->proxy.localadjust.shape_committed = NULL;
+    darktable.develop->proxy.localadjust.shape_cancelled = NULL;
+  }
   g_array_free(d->groups, TRUE);
   free(d);
   self->data = NULL;

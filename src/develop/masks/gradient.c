@@ -244,9 +244,7 @@ static int _gradient_events_button_pressed(dt_iop_module_t *module,
   }
   else if(gui->creation && (which == GDK_BUTTON_SECONDARY))
   {
-    dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
-    dt_masks_iop_update(module);
-    dt_control_queue_redraw_center();
+    dt_masks_cancel_creation();
     return 1;
   }
   else if(gui->creation)
@@ -579,7 +577,6 @@ static int _gradient_events_mouse_moved(dt_iop_module_t *module,
     float wd, ht, iwidth, iheight;
     dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
     const float as = dt_masks_sensitive_dist(zoom_scale);
-    const float as2 = sqf(as);
     const float x = pzx * wd;
     const float y = pzy * ht;
     gboolean in, inb, ins;
@@ -593,7 +590,8 @@ static int _gradient_events_mouse_moved(dt_iop_module_t *module,
     const float dist_ps = gpt ? sqf(x - gpt->points[2]) + sqf(y - gpt->points[3]) : FLT_MAX;
     const float dist_pe = gpt ? sqf(x - gpt->points[4]) + sqf(y - gpt->points[5]) : FLT_MAX;
 
-    if(dist_ps < as2 || dist_pe < as2)
+    const float grab2 = sqf(dt_masks_anchor_sensitive_dist(zoom_scale));
+    if(dist_ps < grab2 || dist_pe < grab2)
     {
       gui->pivot_selected = TRUE;
       gui->form_selected = TRUE;

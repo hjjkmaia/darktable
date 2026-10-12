@@ -22,7 +22,7 @@ git log --oneline -5                # see "Status board" for what each commit is
 cmake --build build                 # incremental build, ~5 s after small edits
 # quit any running darktable GUI first (Cmd+Q in the darktable window), then:
 cmake --install build               # installs into build/macosx
-open -a Terminal ~/tools/darktable/run-dev.sh   # launch the GUI (~40 s to start)
+~/tools/darktable/restart-dev.sh            # one Terminal window; ~40 s to start
 ```
 
 Then read: section 6 (status board), `ARCHITECTURE-lightroom-workflow.md`
@@ -76,7 +76,7 @@ Making those files open at all was Phase 0.
 | repo (main worktree) | `~/tools/darktable` |
 | build tree | `~/tools/darktable/build` (Ninja, Release) |
 | installed app | `~/tools/darktable/build/macosx` (`bin/darktable`, `bin/darktable-cli`) |
-| launcher | `~/tools/darktable/run-dev.sh` (git-ignored via `.git/info/exclude`) |
+| launcher | `~/tools/darktable/restart-dev.sh` (reuses one Terminal window; git-ignored, as is `run-dev.sh`) |
 | logs, scratch notes, agent task briefs | `~/tools/darktable/.local-logs/` (git-ignored) |
 | Kimi's read-only worktree | `~/tools/darktable-kimi` (detached HEAD) |
 | darktable config/library on this Mac | `~/.config/darktable/` |
@@ -161,15 +161,18 @@ OpenEXR, WebP enabled; OpenCV, GraphicsMagick, colord, AI disabled.
 ```bash
 cmake --build build                 # always build before claiming anything works
 cmake --install build               # only with the GUI closed (see below)
-open -a Terminal ~/tools/darktable/run-dev.sh
+~/tools/darktable/restart-dev.sh
 ```
 
 - **Close the GUI before installing.** `cmake --install` overwrites
   libraries the running app has mapped; that can crash it. Quit darktable
   with **Cmd+Q** in its window (Ctrl+Q does nothing on macOS).
-- **Launch through Terminal** (`open -a Terminal .../run-dev.sh`). A GUI
-  started in the background from an agent's shell is killed when that shell
-  command ends.
+- **Launch with `restart-dev.sh`.** A GUI started in the background from an
+  agent's shell is killed when that shell command ends, so the script still
+  opens Terminal. It closes finished `run-dev.sh` windows first and does
+  nothing if this dev darktable is already running. Do not use
+  `open -a Terminal` or `do script` for this; each of those leaves the
+  previous window open.
 - **Startup takes about 40 s** on this Mac: each of the 97 plugin modules
   takes ~0.35 s to load (`-d common` shows `[iop_load_module]` lines). It is
   not a hang. (Unconfirmed guess: macOS scanning freshly built, unsigned

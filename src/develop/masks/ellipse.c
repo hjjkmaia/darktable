@@ -653,16 +653,13 @@ static int _ellipse_events_button_pressed(dt_iop_module_t *module,
   }
   else if(which == GDK_BUTTON_SECONDARY)
   {
-    gui->creation_continuous = FALSE;
-    gui->creation_continuous_module = NULL;
-    dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
-    dt_masks_iop_update(module);
-    dt_control_queue_redraw_center();
+    dt_masks_cancel_creation();
     return 1;
   }
   else if(which == GDK_BUTTON_PRIMARY
           && (dt_modifier_is(state, GDK_CONTROL_MASK | GDK_SHIFT_MASK)
-              || dt_modifier_is(state, GDK_SHIFT_MASK)))
+              || (dt_modifier_is(state, GDK_SHIFT_MASK)
+                  && (form->type & DT_MASKS_CLONE))))
   {
     // set some absolute or relative position for the source of the clone mask
     if(form->type & DT_MASKS_CLONE)
@@ -692,6 +689,9 @@ static int _ellipse_events_button_pressed(dt_iop_module_t *module,
     }
     ellipse->radius[0] = dt_conf_get_float(DT_MASKS_CONF(form->type, ellipse, radius_a));
     ellipse->radius[1] = dt_conf_get_float(DT_MASKS_CONF(form->type, ellipse, radius_b));
+    /* Shift places the radial gradient as a circle. */
+    if(dt_modifier_is(state, GDK_SHIFT_MASK))
+      ellipse->radius[1] = ellipse->radius[0];
     ellipse->border = dt_conf_get_float(DT_MASKS_CONF(form->type, ellipse, border));
     ellipse->rotation = dt_conf_get_float(DT_MASKS_CONF(form->type, ellipse, rotation));
     ellipse->flags = dt_conf_get_int(DT_MASKS_CONF(form->type, ellipse, flags));
@@ -1215,19 +1215,19 @@ static int _ellipse_events_mouse_moved(dt_iop_module_t *module,
     if(gui->form_selected)
     {
       const dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
-      const float as2 = sqf(as);
+      const float grab2 = sqf(dt_masks_anchor_sensitive_dist(zoom_scale));
 
       for(int i = 1; i < _nb_ctrl_point() - 1; i++)
       {
         const float dist_b = sqf(x - gpt->border[i * 2]) + sqf(y - gpt->border[i * 2 +1]);
         const float dist_p = sqf(x - gpt->points[i * 2]) + sqf(y - gpt->points[i * 2 + 1]);
 
-        if(!gui->select_only_border && dist_p < as2)
+        if(!gui->select_only_border && dist_p < grab2)
         {
           gui->point_selected = i;
           break;
         }
-        if(dist_b < as2)
+        if(dist_b < grab2)
         {
           gui->point_border_selected = i;
           break;

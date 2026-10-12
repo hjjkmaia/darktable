@@ -85,7 +85,11 @@ typedef enum dt_masks_property_t
 typedef enum dt_masks_points_states_t
 {
   DT_MASKS_POINT_STATE_NORMAL = 1,
-  DT_MASKS_POINT_STATE_USER = 2
+  DT_MASKS_POINT_STATE_USER = 2,
+  /* first point of an additional stroke in the same brush component */
+  DT_MASKS_POINT_STATE_BREAK = 4,
+  /* subtract this stroke from earlier strokes in this Brush only */
+  DT_MASKS_POINT_STATE_ERASE = 8
 } dt_masks_points_states_t;
 
 typedef enum dt_masks_gradient_states_t
@@ -585,6 +589,8 @@ dt_masks_form_t *dt_masks_get_from_id_ext(GList *forms, dt_mask_id_t id);
 dt_masks_form_t *dt_masks_get_from_id(const dt_develop_t *dev, dt_mask_id_t id);
 /** check if a form is used by a given module (directly or as a child of its group) */
 gboolean dt_masks_is_in_module(dt_mask_id_t maskid, const struct dt_iop_module_t *module);
+/** synchronize localmask drawn mode before recording inserted forms; return whether it changed */
+gboolean dt_masks_iop_sync_localmask_mode(struct dt_iop_module_t *module);
 /** register forms into the mask manager */
 void dt_masks_register_forms(dt_develop_t *dev,
                              GList *forms);
@@ -667,6 +673,10 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
                                      dt_masks_form_gui_t *gui);
 void dt_masks_group_ungroup(dt_masks_form_t *dest_grp, dt_masks_form_t *grp);
 void dt_masks_group_update_name(dt_iop_module_t *module);
+/* The next brush stroke starts a new component instead of extending
+ * the one currently being painted. */
+void dt_masks_brush_arm_new_component(void);
+gboolean dt_masks_brush_start_erase(const dt_mask_id_t id, struct dt_iop_module_t *owner);
 dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
                                                 const dt_masks_form_t *form);
 
@@ -1235,6 +1245,14 @@ void dt_masks_stroke_polyline(cairo_t *cr,
 static inline float dt_masks_sensitive_dist(const float zoom_scale)
 {
   return DT_PIXEL_APPLY_DPI(7) / zoom_scale;
+}
+
+// the resize square is only a few pixels across. the pointer may sit
+// near it without being on those pixels, so the grab is wider than
+// the drawn square and wider than the border hit above.
+static inline float dt_masks_anchor_sensitive_dist(const float zoom_scale)
+{
+  return DT_PIXEL_APPLY_DPI(18) / zoom_scale;
 }
 
 static inline void dt_masks_get_image_size(float *width,

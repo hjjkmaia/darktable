@@ -651,11 +651,19 @@ static void _pop_undo(gpointer user_data,
         hist->request_mask_display;
       dt_iop_gui_update_blendif(darktable.develop->gui_module);
       dt_iop_gui_blend_data_t *bd = dev->gui_module->blend_data;
-      if(bd)
+      if(bd && bd->showmask)
         gtk_toggle_button_set_active
           (GTK_TOGGLE_BUTTON(bd->showmask),
            hist->request_mask_display == DT_DEV_PIXELPIPE_DISPLAY_MASK);
     }
+
+    /* the shape list is not part of the history snapshot. rebuild it
+     * from the restored forms, or a removed brush stays on screen.
+     * record_undo is still false, so this refresh does not become
+     * another undo step or wipe redo. */
+    dt_dev_masks_list_change(dev);
+    if(dev->gui_attached)
+      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_HISTORY_CHANGE);
   }
 }
 
@@ -1144,7 +1152,10 @@ static void _lib_history_change_callback(gpointer instance,
 {
   dt_lib_history_t *d = self->data;
 
-  d->record_history_level--;
+  /* a nested history change must not push the counter below zero.
+   * once it is negative, later edits never open an undo snapshot,
+   * so one Undo jumps back to the empty mask. */
+  if(d->record_history_level > 0) d->record_history_level--;
   d->record_undo = TRUE;
 
   dt_lib_gui_queue_update(self);
@@ -1272,7 +1283,7 @@ static void _lib_history_button_clicked_callback(GtkGestureSingle *gesture,
 
     const int num = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "history-number"));
     dt_dev_history_item_t *hist = g_list_nth_data(darktable.develop->history, num - 1);
-    if(hist)
+    if(hist && !dt_iop_is_local_sink(hist->module))
     {
       dt_dev_modulegroups_switch(darktable.develop, hist->module);
       dt_iop_gui_set_expanded(hist->module, TRUE, TRUE);

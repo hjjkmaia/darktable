@@ -340,6 +340,8 @@ void dt_iop_init_pipe(dt_iop_module_t *module,
 /** checks if iop do have an ui */
 gboolean dt_iop_so_is_hidden(const dt_iop_module_so_t *module);
 gboolean dt_iop_is_hidden(const dt_iop_module_t *module);
+/** a local-adjustment raster sink, not a hand-made duplicate */
+gboolean dt_iop_is_local_sink(const dt_iop_module_t *module);
 /** checks whether iop is shown in specified group */
 gboolean dt_iop_shown_in_group(dt_iop_module_t *module, const uint32_t group);
 /** enter a GUI critical section by acquiring gui_data->lock **/

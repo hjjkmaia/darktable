@@ -3127,15 +3127,7 @@ static int _path_events_button_pressed(dt_iop_module_t *module,
     // we don't want a form with less than 3 points
     if(g_list_shorter_than(form->points, 4))
     {
-      // we don't really have a way to know if the user wants to
-      // cancel the continuous add here or just cancelling this mask,
-      // let's assume that this is not a mistake and cancel the
-      // continuous add
-      gui->creation_continuous = FALSE;
-      gui->creation_continuous_module = NULL;
-      dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
-      dt_masks_iop_update(module);
-      dt_control_queue_redraw_center();
+      dt_masks_cancel_creation();
       return 1;
     }
     else
@@ -4077,6 +4069,7 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
   gui->point_border_selected = -1;
   // are we near a point or feather ?
   const guint nb = g_list_length(form->points);
+  const float grab = dt_masks_anchor_sensitive_dist(zoom_scale);
 
   pzx *= wd;
   pzy *= ht;
@@ -4088,20 +4081,20 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
     if(gpt->points[k * 6 + 2] != gpt->points[k * 6 + 4]
        && gpt->points[k * 6 + 3] != gpt->points[k * 6 + 5])
     {
-      if(pzx - gpt->points[k * 6] > -as
-         && pzx - gpt->points[k * 6] < as
-         && pzy - gpt->points[k * 6 + 1] > -as
-         && pzy - gpt->points[k * 6 + 1] < as)
+      if(pzx - gpt->points[k * 6] > -grab
+         && pzx - gpt->points[k * 6] < grab
+         && pzy - gpt->points[k * 6 + 1] > -grab
+         && pzy - gpt->points[k * 6 + 1] < grab)
       {
         gui->feather_selected = k;
         gui->bezier_ctrl = DT_MASKS_PATH_CTRL1;
         return 1;
       }
 
-      if(pzx - gpt->points[k * 6 + 4] > -as
-         && pzx - gpt->points[k * 6 + 4] < as
-         && pzy - gpt->points[k * 6 + 5] > -as
-         && pzy - gpt->points[k * 6 + 5] < as)
+      if(pzx - gpt->points[k * 6 + 4] > -grab
+         && pzx - gpt->points[k * 6 + 4] < grab
+         && pzy - gpt->points[k * 6 + 5] > -grab
+         && pzy - gpt->points[k * 6 + 5] < grab)
       {
         gui->feather_selected = k;
         gui->bezier_ctrl = DT_MASKS_PATH_CTRL2;
@@ -4109,10 +4102,10 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
       }
     }
     // corner ??
-    if(pzx - gpt->points[k * 6 + 2] > -as
-       && pzx - gpt->points[k * 6 + 2] < as
-       && pzy - gpt->points[k * 6 + 3] > -as
-       && pzy - gpt->points[k * 6 + 3] < as)
+    if(pzx - gpt->points[k * 6 + 2] > -grab
+       && pzx - gpt->points[k * 6 + 2] < grab
+       && pzy - gpt->points[k * 6 + 3] > -grab
+       && pzy - gpt->points[k * 6 + 3] < grab)
     {
       gui->point_selected = k;
       return 1;
@@ -4123,20 +4116,20 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
   {
     // corner ??
     if(!gui->select_only_border
-       && pzx - gpt->points[k * 6 + 2] > -as
-       && pzx - gpt->points[k * 6 + 2] < as
-       && pzy - gpt->points[k * 6 + 3] > -as
-       && pzy - gpt->points[k * 6 + 3] < as)
+       && pzx - gpt->points[k * 6 + 2] > -grab
+       && pzx - gpt->points[k * 6 + 2] < grab
+       && pzy - gpt->points[k * 6 + 3] > -grab
+       && pzy - gpt->points[k * 6 + 3] < grab)
     {
       gui->point_selected = k;
       return 1;
     }
 
     // border corner ??
-    if(pzx - gpt->border[k * 6] > -as
-       && pzx - gpt->border[k * 6] < as
-       && pzy - gpt->border[k * 6 + 1] > -as
-       && pzy - gpt->border[k * 6 + 1] < as)
+    if(pzx - gpt->border[k * 6] > -grab
+       && pzx - gpt->border[k * 6] < grab
+       && pzy - gpt->border[k * 6 + 1] > -grab
+       && pzy - gpt->border[k * 6 + 1] < grab)
     {
       gui->point_border_selected = k;
       return 1;

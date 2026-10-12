@@ -334,6 +334,26 @@ static dt_masks_form_t *_group_from_module(const dt_develop_t *dev,
   return dt_masks_get_from_id(dev, module->blend_params->mask_id);
 }
 
+gboolean dt_masks_iop_sync_localmask_mode(dt_iop_module_t *module)
+{
+  if(!module || !module->dev || !module->blend_params
+     || !dt_iop_module_is(module, "localmask")) return FALSE;
+
+  const dt_masks_form_t *grp = _group_from_module(module->dev, module);
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return FALSE;
+
+  const uint32_t mode = grp->points
+    ? DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+    : DEVELOP_MASK_ENABLED;
+  const uint32_t combine = module->blend_params->mask_combine
+                           & ~DEVELOP_COMBINE_MASKS_POS;
+  const gboolean changed = module->blend_params->mask_mode != mode
+                           || module->blend_params->mask_combine != combine;
+  module->blend_params->mask_mode = mode;
+  module->blend_params->mask_combine = combine;
+  return changed;
+}
+
 static gboolean _form_is_in_group(const dt_develop_t *dev,
                                   const dt_masks_form_t *group,
                                   const dt_mask_id_t maskid)
@@ -425,8 +445,6 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
 
   dev->forms = g_list_append(dev->forms, form);
 
-  dt_dev_add_masks_history_item(dev, module, TRUE);
-
   if(module)
   {
     // is there already a masks group for this module ?
@@ -446,19 +464,30 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
     grpt->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE;
     if(grp->points)
     {
-      if(form->type == DT_MASKS_BRUSH)
+      if(form->type & DT_MASKS_BRUSH)
         grpt->state |= DT_MASKS_STATE_SUM;
       else
         grpt->state |= DT_MASKS_STATE_UNION;
     }
     grpt->opacity = dt_conf_get_float("plugins/darkroom/masks/opacity");
     grp->points = g_list_append(grp->points, grpt);
-    // we save the group
+    if(dt_iop_module_is(module, "localmask"))
+    {
+      module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+      module->blend_params->mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
+    }
+    // we save the completed shape and its owner group
     dt_dev_add_masks_history_item(dev, module, TRUE);
     // we update module gui
     if(gui) dt_masks_iop_update(module);
-    //dt_dev_add_history_item(dev, module, TRUE);
+    // the shape is in the group now; tell the local-adjustment panel
+    // after that, so it does not record an empty mask
+    if(dt_iop_module_is(module, "localmask")
+       && dev->proxy.localadjust.shape_committed)
+      dev->proxy.localadjust.shape_committed(dev->proxy.localadjust.module);
   }
+  else
+    dt_dev_add_masks_history_item(dev, NULL, TRUE);
   // show the form if needed
   if(gui) dev->form_gui->formid = form->formid;
 }
@@ -1280,6 +1309,14 @@ static gboolean _gui_hover_state_equal(const dt_masks_form_gui_t *a,
 // through dt_masks_set_edit_mode() takes global_mutex, so it waits for the unlock
 static int _events_locked = 0;
 static gboolean _events_zoom_move = FALSE;
+static gboolean _events_creation_cancelled = FALSE;
+
+static void _notify_creation_cancelled(dt_develop_t *dev)
+{
+  if(dev && dev->proxy.localadjust.module
+     && dev->proxy.localadjust.shape_cancelled)
+    dev->proxy.localadjust.shape_cancelled(dev->proxy.localadjust.module);
+}
 
 static void _events_lock(dt_develop_t *dev)
   ACQUIRE(&dev->history_mutex)
@@ -1297,6 +1334,13 @@ static void _events_unlock(dt_develop_t *dev)
   {
     _events_zoom_move = FALSE;
     dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, 0.0f, 0, 0.0f, 0.0f, TRUE);
+  }
+  if(!_events_locked && _events_creation_cancelled)
+  {
+    // Removing a provisional module stops the pixelpipe workers. Do that only
+    // after releasing history_mutex, which those workers may still need.
+    _events_creation_cancelled = FALSE;
+    _notify_creation_cancelled(dev);
   }
 }
 
@@ -1347,9 +1391,11 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
   if(gui) before = *gui;
 
   int rep = 0;
-  if(form->functions)
+  if(form && form->functions)
     rep = form->functions->mouse_moved(module, pzx, pzy, pressure, which, zoom_scale, form, 0, gui, 0);
 
+  form = darktable.develop->form_visible;
+  gui = darktable.develop->form_gui;
   _events_unlock(darktable.develop);
 
   // brushes, paths and groups don't redraw for plain hovering (a long
@@ -1359,7 +1405,7 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
   if(gui && !_gui_hover_state_equal(&before, gui))
     dt_control_queue_redraw_center();
 
-  if(gui) _set_hinter_message(gui, form);
+  if(gui && form) _set_hinter_message(gui, form);
 
   return rep != 0;
 }
@@ -1381,13 +1427,17 @@ gboolean dt_masks_events_button_released(dt_iop_module_t *module,
   DT_LEAVE_GUI_UPDATE();
 
   gboolean ret = FALSE;
-  if(form->functions)
+  if(form && form->functions)
   {
     // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
     // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
     _events_lock(dev);
     ret = form->functions->button_released(module, pzx, pzy, which, state, form, 0, gui, 0);
-    form->functions->mouse_moved(module, pzx, pzy, 0, which, zoom_scale, form, 0, gui, 0);
+    // release may free the temporary form and arm another shape.
+    form = dev->form_visible;
+    gui = dev->form_gui;
+    if(form && gui && form->functions && form->functions->mouse_moved)
+      form->functions->mouse_moved(module, pzx, pzy, 0, which, zoom_scale, form, 0, gui, 0);
     _events_unlock(dev);
     // mouse_moved() no longer redraws for hovering, see dt_masks_events_mouse_moved()
     dt_control_queue_redraw_center();
@@ -1408,7 +1458,7 @@ gboolean dt_masks_events_button_pressed(dt_iop_module_t *module,
   dt_masks_form_gui_t *gui = darktable.develop->form_gui;
 
   // allow to select a shape inside an iop
-  if(gui && which == GDK_BUTTON_PRIMARY)
+  if(form && gui && which == GDK_BUTTON_PRIMARY)
   {
     const dt_masks_form_t *sel = NULL;
 
@@ -1430,7 +1480,7 @@ gboolean dt_masks_events_button_pressed(dt_iop_module_t *module,
     dt_masks_select_form(module, sel);
   }
 
-  if(form->functions)
+  if(form && form->functions)
   {
     // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
     // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
@@ -1473,7 +1523,7 @@ gboolean dt_masks_events_mouse_scrolled(dt_iop_module_t *module,
   gboolean ret = FALSE;
   const gboolean incr = dt_mask_scroll_increases(up);
 
-  if(form->functions)
+  if(form && form->functions)
   {
     // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
     // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
@@ -1481,10 +1531,12 @@ gboolean dt_masks_events_mouse_scrolled(dt_iop_module_t *module,
     ret = (form->functions->mouse_scrolled(module, pzx, pzy,
                                           incr ? 1 : 0,
                                           state, form, 0, gui, 0)) != 0;
+    form = darktable.develop->form_visible;
+    gui = darktable.develop->form_gui;
     _events_unlock(darktable.develop);
   }
 
-  if(gui)
+  if(gui && form)
   {
     // Do not update brush opacity here; it is mask density.
     if(gui->creation && dt_modifier_is(state, GDK_CONTROL_MASK))
@@ -1609,10 +1661,12 @@ void dt_masks_change_form_gui(dt_masks_form_t *newform)
 
 gboolean dt_masks_cancel_creation(void)
 {
-  dt_masks_form_gui_t *gui = darktable.develop ? darktable.develop->form_gui : NULL;
+  dt_develop_t *dev = darktable.develop;
+  dt_masks_form_gui_t *gui = dev ? dev->form_gui : NULL;
   if(!gui || !gui->creation) return FALSE;
 
   dt_iop_module_t *module = gui->creation_module;
+  dt_masks_brush_arm_new_component();
   gui->creation_continuous = FALSE;
   gui->creation_continuous_module = NULL;
   if(module)
@@ -1623,6 +1677,10 @@ gboolean dt_masks_cancel_creation(void)
   else
     dt_masks_change_form_gui(NULL);
   dt_control_queue_redraw_center();
+  if(_events_locked)
+    _events_creation_cancelled = TRUE;
+  else
+    _notify_creation_cancelled(dev);
   return TRUE;
 }
 
@@ -1797,6 +1855,9 @@ static void _menu_add_shape(dt_iop_module_t *module,
 {
   // we want to be sure that the iop has focus
   dt_iop_request_focus(module);
+  // an explicit brush request starts a separate component
+  if(type & DT_MASKS_BRUSH)
+    dt_masks_brush_arm_new_component();
   // we create the new form
   dt_masks_form_t *form = dt_masks_create(type);
   dt_masks_change_form_gui(form);
@@ -1819,6 +1880,7 @@ static void _menu_add_exist(dt_iop_module_t *module,
   }
   // we add the form in this group
   dt_masks_group_add_form(grp, form);
+  dt_masks_iop_sync_localmask_mode(module);
   // we save the group
   // and we ensure that we are in edit mode
   dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
@@ -1869,7 +1931,8 @@ void dt_masks_iop_use_same_as(dt_iop_module_t *module,
     }
   }
 
-  // we save the group
+  // record localmask mode together with the copied group
+  dt_masks_iop_sync_localmask_mode(module);
   dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 }
 
@@ -2081,12 +2144,16 @@ void dt_masks_form_remove(dt_iop_module_t *module,
         break;
       }
     }
-    if(ok)
+    if(ok && grp->points == NULL)
+    {
+      // Remove the empty root before capturing history and its mask mode.
+      dt_masks_form_remove(module, NULL, grp);
+    }
+    else if(ok)
     {
       dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
       dt_masks_iop_update(module);
     }
-    if(ok && grp->points == NULL) dt_masks_form_remove(module, NULL, grp);
     return;
   }
 
@@ -2118,6 +2185,11 @@ void dt_masks_form_remove(dt_iop_module_t *module,
       if(id == m->blend_params->mask_id)
       {
         m->blend_params->mask_id = NO_MASKID;
+        if(dt_iop_module_is(m, "localmask"))
+        {
+          m->blend_params->mask_mode = DEVELOP_MASK_ENABLED;
+          m->blend_params->mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
+        }
         dt_masks_iop_update(m);
         dt_dev_add_history_item(darktable.develop, m, TRUE);
       }
@@ -2942,7 +3014,7 @@ void dt_masks_draw_anchor(cairo_t *cr,
                           const float x,
                           const float y)
 {
-  const float anchor_size = DT_PIXEL_APPLY_DPI(selected ? 8.0f : 5.0f) / zoom_scale;
+  const float anchor_size = DT_PIXEL_APPLY_DPI(selected ? 12.0f : 9.0f) / zoom_scale;
 
   cairo_set_dash(cr, NULL, 0, 0);
   _masks_set_line_color(cr, 0.8);
