@@ -1021,6 +1021,7 @@ static const gchar *const _lr_qap_order[] = {
   "@lens & transform",
   "lens",
   "ashift/rotation",
+  "crop/aspect",
 };
 
 static gboolean _basics_list_has_id(const GList *list, const gchar *id)
@@ -2471,6 +2472,8 @@ void init_presets(dt_lib_module_t *self)
   AM("paramcurve/shadows");
   AM("rgbcurve/channel");
   AM("rgbcurve/curve");
+  AM("ashift/rotation");
+  AM("crop/aspect");
 
   SMG(C_("modulegroup", "basic"), "basic");
   AM("temperature");
