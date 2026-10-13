@@ -2471,6 +2471,7 @@ void init_presets(dt_lib_module_t *self)
   AM("paramcurve/shadows");
   AM("rgbcurve/channel");
   AM("rgbcurve/curve");
+  AM("ashift/rotation");
 
   SMG(C_("modulegroup", "basic"), "basic");
   AM("temperature");
