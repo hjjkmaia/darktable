@@ -413,6 +413,11 @@ typedef struct dt_iop_ashift_gui_data_t
   dt_iop_ashift_jobcode_t jobcode;
   int jobparams;
   gboolean adjust_crop;
+  /* focus-in baseline for cancel-on-Escape: the params struct is plain
+   * data, so a struct copy plus the enabled flag is the whole rollback
+   * state (see gui_focus() and _ashift_cancel()) */
+  dt_iop_ashift_params_t session_params;
+  gboolean session_enabled;
   float cl;	// shadow copy of dt_iop_ashift_data_t.cl
   float cr;	// shadow copy of dt_iop_ashift_data_t.cr
   float ct;	// shadow copy of dt_iop_ashift_data_t.ct
@@ -5883,10 +5888,20 @@ void gui_focus(dt_iop_module_t *self, const gboolean in)
   darktable.develop->history_postpone_invalidate = in
     && dt_dev_modulegroups_test_activated(darktable.develop);
 
+  dt_iop_ashift_params_t *p = self->params;
+  dt_iop_ashift_gui_data_t *g = self->gui_data;
+
+  /* refresh the cancel baseline on every real focus acquisition, never on
+   * gui updates, and also while disabled: an edit can switch the module on
+   * mid-session (develop.c:1351) without a new focus-in */
+  if(in)
+  {
+    g->session_params = *p;
+    g->session_enabled = self->enabled;
+  }
+
   if(self->enabled)
   {
-    dt_iop_ashift_params_t *p = self->params;
-    dt_iop_ashift_gui_data_t *g = self->gui_data;
     if(in)
     {
       _shadow_crop_box(p,g);
@@ -5899,6 +5914,56 @@ void gui_focus(dt_iop_module_t *self, const gboolean in)
       _do_clean_structure(self, p, TRUE);
     }
   }
+}
+
+/* Esc reverts the whole framing session: drop queued preview/fit jobs and
+ * unsaved structure lines so nothing rewrites the params afterwards,
+ * restore the focus-in snapshot including the enabled flag, and sync the
+ * shadow crop from it so the focus-out commit becomes a no-op */
+static void _ashift_cancel(dt_action_t *action)
+{
+  (void)action;
+  dt_iop_module_t *self = darktable.develop ? darktable.develop->gui_module : NULL;
+  if(!self || g_strcmp0(self->op, "ashift")) return;
+
+  dt_iop_ashift_params_t *p = self->params;
+  dt_iop_ashift_gui_data_t *g = self->gui_data;
+  if(!g) return;
+
+  /* a released crop-box drag and freshly drawn structure lines live
+   * outside the params until focus-out, so compare those as well: only a
+   * session with nothing pending at all may leave without the cleanup and
+   * without a history entry */
+  const gboolean pending =
+    self->enabled != g->session_enabled
+    || memcmp(p, &g->session_params, sizeof(g->session_params))
+    || (self->enabled
+        && (g->cl != p->cl || g->cr != p->cr || g->ct != p->ct || g->cb != p->cb))
+    || g->jobcode != ASHIFT_JOBCODE_NONE
+    || g->lines != NULL;
+
+  if(!pending)
+  {
+    dt_iop_request_focus(NULL);
+    return;
+  }
+
+  g->jobcode = ASHIFT_JOBCODE_NONE;
+  g->jobparams = 0;
+  _do_clean_structure(self, p, FALSE);
+
+  *p = g->session_params;
+  _shadow_crop_box(p, g);
+  self->enabled = g->session_enabled;
+
+  DT_ENTER_GUI_UPDATE();
+  dt_iop_gui_set_enable_button(self);
+  DT_LEAVE_GUI_UPDATE();
+  dt_iop_gui_update(self);
+
+  // record the restored state; FALSE records the enabled flag as-is
+  dt_dev_add_history_item(darktable.develop, self, FALSE);
+  dt_iop_request_focus(NULL);
 }
 
 static float log2_curve(const float inval, const dt_bauhaus_curve_t dir)
@@ -6215,6 +6280,10 @@ void gui_init(dt_iop_module_t *self)
                        N_("lines"), g->structure_lines, &dt_action_def_toggle);
   dt_action_define_iop(self, N_("structure"),
                        N_("auto"), g->structure_auto, &dt_action_def_toggle);
+
+  /* no default key: crop owns Enter/Escape and routes Escape here while
+   * rotate-and-perspective has focus (src/iop/crop.c:_crop_cancel) */
+  dt_action_register(DT_ACTION(self->so), N_("cancel"), _ashift_cancel, 0, 0);
 
   /* add signal handler for preview pipe finish to redraw the overlay */
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _event_process_after_preview_callback);
