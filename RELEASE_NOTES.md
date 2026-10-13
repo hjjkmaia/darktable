@@ -149,6 +149,12 @@ changes (where available).
 - Some safety checks when switching to the quick access panel were
   added.
 
+- The crop and rotate and perspective tools now share commit/cancel
+  keys: Enter applies the pending edit and closes the tool, while
+  Escape restores the state the tool had when it was opened. For
+  rotate and perspective this also restores the module's on/off
+  state; for crop the previous rectangle is restored.
+
 - On the color equalizer module a new collapside section with the
   color sliders has been added.
 
