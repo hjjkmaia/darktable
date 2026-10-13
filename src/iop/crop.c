@@ -1341,32 +1341,46 @@ static void _crop_handle_flip(dt_iop_module_t *self, const dt_image_orientation_
 
 /* The shortcut lives on the module plugin, not on one image's instance.
  * An instance action has no stable id, and saving it wrote a broken shortcut
- * that crashed the next launch. */
-static dt_iop_module_t *_focused_crop(void)
+ * that crashed the next launch. The two framing tools share Enter/Escape:
+ * crop registers the keys and the handlers serve whichever one is focused. */
+static dt_iop_module_t *_focused_framing(void)
 {
   dt_develop_t *dev = darktable.develop;
   dt_iop_module_t *self = dev ? dev->gui_module : NULL;
-  if(!self || g_strcmp0(self->op, "crop"))
+  if(!self
+     || (g_strcmp0(self->op, "crop") && g_strcmp0(self->op, "ashift")))
     return NULL;
   return self;
 }
 
-/* Enter confirms, as in Lightroom: keep the rectangle and leave the tool.
- * Leaving focus runs gui_focus(), which writes the on-screen box. */
+/* Enter confirms, as in Lightroom: keep the pending edit and leave the tool.
+ * Leaving focus runs gui_focus(), which commits the final state. */
 static void _crop_confirm(dt_action_t *action)
 {
   (void)action;
-  dt_iop_module_t *self = _focused_crop();
+  dt_iop_module_t *self = _focused_framing();
   if(!self) return;
   dt_iop_request_focus(NULL);
 }
 
-/* Escape puts back the rectangle from when the tool was opened, then leaves. */
+/* Escape reverts to the state the tool had when it was opened, then leaves.
+ * ashift keeps its own snapshot and revert; its cancel action is invoked the
+ * way the shortcut dispatcher invokes command actions (accelerators.c:4102). */
 static void _crop_cancel(dt_action_t *action)
 {
   (void)action;
-  dt_iop_module_t *self = _focused_crop();
+  dt_iop_module_t *self = _focused_framing();
   if(!self) return;
+
+  if(!g_strcmp0(self->op, "ashift"))
+  {
+    dt_action_t *ac = dt_action_locate(DT_ACTION(self->so),
+                                       (gchar **)(const gchar *[]){ "cancel", NULL },
+                                       FALSE);
+    if(ac && ac->type == DT_ACTION_TYPE_COMMAND && ac->target)
+      ((dt_action_callback_t *)ac->target)(ac);
+    return;
+  }
 
   dt_iop_crop_gui_data_t *g = self->gui_data;
   if(g)
