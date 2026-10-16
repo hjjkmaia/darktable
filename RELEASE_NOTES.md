@@ -375,6 +375,9 @@ changes (where available).
 
 ## Bug Fixes
 
+- Fixed the crop appearing to reset while adjusting the rotate and
+  perspective slider. The saved crop now stays visible during rotation.
+
 - Fixed an intermittent startup crash while loading the interface theme
   on macOS.
 
