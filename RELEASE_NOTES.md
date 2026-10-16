@@ -101,6 +101,15 @@ changes (where available).
 
 ## UI/UX Improvements
 
+- Import and disk-export folder pickers now reopen at their last selected
+  folders. New disk-export defaults add the export date and time to filenames.
+
+- On macOS, File groups import and export actions and Window offers panel
+  controls. Sidebar, Mask Manager, and tag context menus have clearer groups
+  and action labels. Each sidebar's empty-area menu lists only its own panels
+  in screen order; the darkroom processing sidebar also links to its module
+  layout controls.
+
 - Ellipse masks now show two curved-arrow rotation marks outside the selected
   outline. Drag either mark or the nearby outline to rotate while all four
   resize handles remain available.
@@ -109,6 +118,8 @@ changes (where available).
   editing; the overlay is not included in exports. Right-click menus now offer
   Add and Subtract shapes and, for supported local vector masks, Invert,
   Duplicate Mask, and Duplicate and Invert Mask.
+  Radial-gradient tooltips explain the inside default and the outside Invert
+  result.
   Eligible drawn masks on standard modules, including exposure, also support
   Subtract and Invert; shared, parametric, and raster masks are excluded.
 
