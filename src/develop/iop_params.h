@@ -53,6 +53,8 @@ dt_iop_params_err_t dt_iop_params_builder_set_int(dt_iop_params_builder_t *b,
                                                   const char *field, int v);
 dt_iop_params_err_t dt_iop_params_builder_get_float(const dt_iop_params_builder_t *b,
                                                     const char *field, float *v);
+dt_iop_params_err_t dt_iop_params_builder_get_int(const dt_iop_params_builder_t *b,
+                                                  const char *field, int *v);
 // blob stays owned by the builder until _free; version is so->version()
 const void *dt_iop_params_builder_blob(const dt_iop_params_builder_t *b,
                                        size_t *size, int *version);

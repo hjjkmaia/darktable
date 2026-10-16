@@ -2253,6 +2253,7 @@ static int _brush_events_button_released(dt_iop_module_t *module,
       else
       {
         dt_masks_gui_form_save_creation(darktable.develop, crea_module, form, gui);
+        if(!gui->formid) return 1;
 
         if(crea_module)
         {

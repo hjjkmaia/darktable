@@ -33,6 +33,7 @@ G_BEGIN_DECLS
 #define DT_DTDATA_EXT ".dtdata"
 #define DT_DTDATA_ENTRY_LEN 64
 #define DT_DTDATA_PRODUCER_LEN 64
+#define DT_DTDATA_SOURCE_SHA256_LEN 65
 
 typedef enum dt_dtdata_kind_t
 {
@@ -65,6 +66,16 @@ typedef struct dt_dtdata_ref_t
     unavailable rather than falling back to the database */
 gboolean dt_dtdata_enabled(void);
 
+/** SHA-256 of the actual source photo bytes used by the loader, as 64
+    lowercase hex characters plus NUL. A local copy is preferred when one
+    exists. Returns FALSE when the file cannot be read consistently. */
+gboolean dt_dtdata_source_sha256(const dt_imgid_t imgid,
+                                 char out[DT_DTDATA_SOURCE_SHA256_LEN]);
+
+/** File-level variant, also used by tests. */
+gboolean dt_dtdata_file_source_sha256(const char *path,
+                                      char out[DT_DTDATA_SOURCE_SHA256_LEN]);
+
 /** path of the sidecar for an image, next to its xmp */
 void dt_dtdata_path(const dt_imgid_t imgid, char *path, const size_t len);
 
@@ -95,6 +106,24 @@ float *dt_dtdata_read_gray(const dt_imgid_t imgid,
                            int *width,
                            int *height);
 
+/** store a cropped [0,1] RGBA patch as an 8- or 16-bit PNG. The four
+    channels are interleaved; alpha identifies the pixels to replace.
+    Accepted patches are authoritative so a model is not needed on reopen. */
+gboolean dt_dtdata_write_rgba(const dt_imgid_t imgid,
+                              const char *producer,
+                              const float *rgba,
+                              const int width,
+                              const int height,
+                              const int bpc,
+                              dt_dtdata_ref_t *ref);
+
+/** read a patch into aligned interleaved [0,1] RGBA floats. Returns NULL
+    for a missing, damaged, or metadata-mismatched entry. */
+float *dt_dtdata_read_rgba(const dt_imgid_t imgid,
+                           const dt_dtdata_ref_t *ref,
+                           int *width,
+                           int *height);
+
 /** entry names in the image's sidecar, without "version". a GList of
     strings, free with g_list_free_full(list, g_free) */
 GList *dt_dtdata_list_entries(const dt_imgid_t imgid);
@@ -107,6 +136,11 @@ int dt_dtdata_entry_kind(const char *entry);
     images, since references are copied verbatim with it. a missing
     source is not an error */
 gboolean dt_dtdata_merge(const dt_imgid_t src_imgid, const dt_imgid_t dst_imgid);
+
+/** refuse history-preserving duplication while either source sidecar exists,
+    then check that stored history has no missing raster references; writes
+    pending darkroom history first without creating or editing a sidecar */
+gboolean dt_dtdata_history_copyable(const dt_imgid_t imgid);
 
 /** a producer's params reader for the sweep: 1 and *entry filled when
     the blob references an entry, 0 when it does not, -1 when the blob
@@ -145,6 +179,17 @@ gboolean dt_dtdata_file_write_gray(const char *path,
                                    const int bpc,
                                    dt_dtdata_ref_t *ref);
 float *dt_dtdata_file_read_gray(const char *path,
+                                const dt_dtdata_ref_t *ref,
+                                int *width,
+                                int *height);
+gboolean dt_dtdata_file_write_rgba(const char *path,
+                                   const char *producer,
+                                   const float *rgba,
+                                   const int width,
+                                   const int height,
+                                   const int bpc,
+                                   dt_dtdata_ref_t *ref);
+float *dt_dtdata_file_read_rgba(const char *path,
                                 const dt_dtdata_ref_t *ref,
                                 int *width,
                                 int *height);

@@ -35,6 +35,7 @@
 
 #include <gtk/gtk.h>
 #include <stdlib.h>
+#include <string.h>
 
 // the local adjustments panel (ARCHITECTURE-lightroom-workflow.md
 // section 9): one local adjustment is one localmask instance (the mask
@@ -106,10 +107,13 @@ typedef struct dt_lib_localadjust_t
   GtkWidget *sliders_box;
   GtkWidget *slider[SLIDER_COUNT];
   GArray *groups;   // multi_priorities of the localmask instances shown
+  gchar *list_signature; // image, owner names, and root/component membership
+  dt_imgid_t listed_imgid;
   int selected;     // multi_priority of the selected localmask, -1 = none
+  dt_mask_id_t selected_child; // selected component in the chosen parent
   /* set when Confirm created a mask for a shape that is not drawn yet */
   int provisional;
-  /* Confirm opened one undo group; the shape commit or cancel closes it */
+  /* A new-mask or Subtract shape opened an undo group; commit/cancel closes it */
   gboolean undo_hold;
   guint undo_hold_idle;
   gboolean updating;
@@ -147,6 +151,8 @@ int position(const dt_lib_module_t *self)
 static void _update(dt_lib_module_t *self);
 static void _refresh_sliders(dt_lib_module_t *self);
 static void _show_mode(dt_lib_module_t *self);
+static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self);
+static void _child_toggled(GtkToggleButton *button, dt_lib_module_t *self);
 
 static dt_iop_module_t *_find_mask_instance(dt_develop_t *dev, const int priority)
 {
@@ -221,9 +227,7 @@ static void _sync_source_drawn(dt_iop_module_t *mask)
   const uint32_t want = has_shape
     ? (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK)
     : DEVELOP_MASK_ENABLED;
-  bp.mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
-  if(bp.mask_mode == want && bp.mask_combine == mask->blend_params->mask_combine)
-    return;
+  if(bp.mask_mode == want) return;
 
   bp.mask_mode = want;
   dt_iop_commit_blend_params(mask, &bp, NULL);
@@ -287,9 +291,16 @@ static void _set_sink_value(dt_lib_module_t *self, const int k, const float lr_v
   dt_iop_module_t *mask = _find_mask_instance(dev, d->selected);
   if(!mask) return;
 
-  /* a finished shape must not stay inside the confirm group, or one
-   * Undo of this slider also removes the brush */
-  if(d->provisional < 0) _end_undo_hold(d);
+  /* A slider edit is separate from shape creation, including a pending
+   * Subtract component on an existing mask. */
+  if(d->provisional < 0)
+  {
+    dt_masks_form_gui_t *gui = dev->form_gui;
+    if(gui && gui->creation && gui->creation_module == mask
+       && dt_is_valid_maskid(gui->subtract_parentid))
+      dt_masks_cancel_creation();
+    _end_undo_hold(d);
+  }
 
   GtkWidget *slider = d->slider[k];
   const gboolean same_drag = _same_slider_drag(dev, slider);
@@ -524,6 +535,7 @@ static dt_iop_module_t *_create_mask(dt_lib_module_t *self, const gboolean group
      * do not change the photo yet */
     dt_develop_blend_params_t bp = *mask->blend_params;
     bp.mask_mode = DEVELOP_MASK_ENABLED;
+    bp.mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
     dt_iop_commit_blend_params(mask, &bp, NULL);
     dt_dev_add_history_item(dev, mask, TRUE);
     dt_iop_gui_update_blending(mask);
@@ -572,6 +584,46 @@ static dt_iop_module_t *_selected_mask(dt_lib_module_t *self)
   return _find_mask_instance(darktable.develop, d->selected);
 }
 
+static void _sync_row_selection(dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  GList *items = gtk_container_get_children(GTK_CONTAINER(d->list));
+  for(GList *it = items; it; it = g_list_next(it))
+  {
+    GtkWidget *item = it->data;
+    const int priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "mask-priority"));
+    GtkWidget *parent = g_object_get_data(G_OBJECT(item), "mask-parent");
+    GtkWidget *components = g_object_get_data(G_OBJECT(item), "mask-components");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(parent), priority == d->selected);
+
+    GList *children = gtk_container_get_children(GTK_CONTAINER(components));
+    for(GList *child = children; child; child = g_list_next(child))
+    {
+      GtkWidget *row = child->data;
+      if(!GTK_IS_TOGGLE_BUTTON(row)) continue;
+      const dt_mask_id_t id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-formid"));
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(row),
+                                   priority == d->selected && id == d->selected_child);
+    }
+    g_list_free(children);
+  }
+  g_list_free(items);
+}
+
+static void _clear_overlay(dt_develop_t *dev)
+{
+  dev->mask_overlay_selected_id = NO_MASKID;
+  dev->mask_overlay_selected_group_id = NO_MASKID;
+  dev->mask_overlay_selected_state = DT_MASKS_STATE_NONE;
+  dev->mask_overlay_selected_owner = NULL;
+  dev->mask_overlay_hover_id = NO_MASKID;
+  dev->mask_overlay_hover_group_id = NO_MASKID;
+  dev->mask_overlay_hover_state = DT_MASKS_STATE_NONE;
+  dev->mask_overlay_hover_owner = NULL;
+  dev->mask_overlay_imgid = dev->image_storage.id;
+  dt_control_queue_redraw_center();
+}
+
 static void _select_mask(dt_lib_module_t *self, dt_iop_module_t *owner)
 {
   dt_lib_localadjust_t *d = self->data;
@@ -588,22 +640,150 @@ static void _select_mask(dt_lib_module_t *self, dt_iop_module_t *owner)
   _update(self);
 
   d->updating = TRUE;
+  if(priority != d->selected) d->selected_child = NO_MASKID;
   d->selected = priority;
-  GList *rows = gtk_container_get_children(GTK_CONTAINER(d->list));
-  for(GList *it = rows; it; it = g_list_next(it))
-  {
-    GtkWidget *row = it->data;
-    const int row_priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-priority"));
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(row), row_priority == priority);
-  }
-  g_list_free(rows);
+  _sync_row_selection(self);
   d->updating = FALSE;
+  if(priority < 0) _clear_overlay(dev);
 
   _refresh_sliders(self);
   gtk_widget_set_sensitive(d->sliders_box, priority >= 0);
   gtk_widget_set_sensitive(d->delete_button, priority >= 0);
   _show_mode(self);
   dt_lib_gui_queue_update(self);
+}
+
+static gboolean _duplicable_form(dt_develop_t *dev, const dt_masks_form_t *form,
+                                  const int depth)
+{
+  if(!form || depth > 1 || !form->functions
+     || !form->functions->duplicate_points)
+    return FALSE;
+
+  if(form->type != DT_MASKS_GROUP)
+    return form->type == DT_MASKS_BRUSH || form->type == DT_MASKS_ELLIPSE
+           || form->type == DT_MASKS_PATH || form->type == DT_MASKS_GRADIENT
+           || form->type == DT_MASKS_CIRCLE;
+
+  // Local-adjustment cleanup owns a flat parent with leaf components. Reject
+  // nested groups so a failed duplication can remove every new form safely.
+  if(depth != 0 || !form->points) return FALSE;
+  for(const GList *p = form->points; p; p = g_list_next(p))
+  {
+    const dt_masks_point_group_t *member = p->data;
+    if(!member || !_duplicable_form(dev, dt_masks_get_from_id(dev, member->formid),
+                                    depth + 1))
+      return FALSE;
+  }
+  return TRUE;
+}
+
+static dt_iop_module_t *_duplicate_mask(dt_lib_module_t *self,
+                                        dt_iop_module_t *owner,
+                                        const gboolean invert)
+{
+  dt_lib_localadjust_t *d = self->data;
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached || !darktable.undo || d->updating || d->undo_hold
+     || darktable.undo->group != DT_UNDO_NONE || !owner
+     || !g_list_find(dev->iop, owner) || !dt_iop_module_is(owner, "localmask")
+     || owner->multi_priority <= 0 || !owner->blend_params || !owner->params
+     || (dev->form_gui && dev->form_gui->creation))
+    return NULL;
+
+  const dt_masks_form_t *root =
+    dt_masks_get_from_id(dev, owner->blend_params->mask_id);
+  dt_iop_module_t *base = dt_iop_get_module_by_op_priority(dev->iop,
+                                                           "localmask", 0);
+  if(!root || !(root->type & DT_MASKS_GROUP)
+     || !_duplicable_form(dev, root, 0) || !base
+     || base->params_size != owner->params_size)
+    return NULL;
+
+  // A local adjustment owns every raster sink pointed at its source instance.
+  // Validate them all before changing history so none can be silently omitted.
+  GPtrArray *sinks = g_ptr_array_new();
+  for(const GList *it = dev->iop; it; it = g_list_next(it))
+  {
+    dt_iop_module_t *old = it->data;
+    const dt_develop_blend_params_t *bp = old->blend_params;
+    if(!bp || bp->raster_mask_instance != owner->multi_priority
+       || !g_str_equal(bp->raster_mask_source, "localmask"))
+      continue;
+
+    dt_iop_module_t *sink_base =
+      dt_iop_get_module_by_op_priority(dev->iop, old->op, 0);
+    if(old->multi_priority == 0
+       || !(bp->mask_mode & DEVELOP_MASK_RASTER)
+       || bp->raster_mask_id != BLEND_RASTER_ID
+       || (bp->mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL))
+       || !old->params || !sink_base || !sink_base->blend_params
+       || sink_base->params_size != old->params_size)
+    {
+      g_ptr_array_free(sinks, TRUE);
+      return NULL;
+    }
+    g_ptr_array_add(sinks, old);
+  }
+
+  d->updating = TRUE;
+  dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+  // Duplicate priority-zero bases: duplicating an active instance adds an
+  // unwanted history row for it before the new instance is even created.
+  dt_iop_module_t *copy = dt_iop_gui_duplicate(base, FALSE);
+  if(!copy) goto failed;
+
+  const dt_mask_id_t copyid =
+    dt_masks_form_duplicate(dev, owner->blend_params->mask_id);
+  if(!dt_is_valid_maskid(copyid)) goto failed;
+
+  memcpy(copy->params, owner->params, copy->params_size);
+  dt_develop_blend_params_t source_bp = *owner->blend_params;
+  source_bp.mask_id = copyid;
+  if(invert) source_bp.mask_combine ^= DEVELOP_COMBINE_MASKS_POS;
+  dt_iop_commit_blend_params(copy, &source_bp, NULL);
+  copy->enabled = owner->enabled;
+  dt_dev_add_masks_history_item(dev, copy, copy->enabled);
+  dt_iop_gui_update_blending(copy);
+
+  for(guint i = 0; i < sinks->len; i++)
+  {
+    dt_iop_module_t *old = g_ptr_array_index(sinks, i);
+    dt_iop_module_t *sink_base =
+      dt_iop_get_module_by_op_priority(dev->iop, old->op, 0);
+    dt_iop_module_t *new_sink = dt_iop_gui_duplicate(sink_base, FALSE);
+    if(!new_sink) goto failed;
+
+    memcpy(new_sink->params, old->params, old->params_size);
+    dt_develop_blend_params_t sink_bp = *old->blend_params;
+    sink_bp.raster_mask_instance = copy->multi_priority;
+    dt_iop_commit_blend_params(new_sink, &sink_bp, NULL);
+    new_sink->enabled = old->enabled;
+    _keep_global_module(new_sink);
+    if(old->multi_name_hand_edited && !g_str_equal(old->multi_name, "local"))
+    {
+      g_strlcpy(new_sink->multi_name, old->multi_name,
+                sizeof(new_sink->multi_name));
+      dt_iop_gui_update_header(new_sink);
+    }
+    dt_iop_gui_update(new_sink);
+    dt_dev_add_history_item(dev, new_sink, new_sink->enabled);
+  }
+
+  dt_undo_end_group(darktable.undo);
+  d->updating = FALSE;
+  g_ptr_array_free(sinks, TRUE);
+  _select_mask(self, copy);
+  dt_iop_request_focus(copy);
+  return copy;
+
+failed:
+  if(copy) _destroy_mask(self, copy);
+  dt_undo_end_group(darktable.undo);
+  d->updating = FALSE;
+  g_ptr_array_free(sinks, TRUE);
+  _update(self);
+  return NULL;
 }
 
 static dt_iop_module_t *_begin_shape(dt_lib_module_t *self)
@@ -639,6 +819,27 @@ static dt_iop_module_t *_begin_shape(dt_lib_module_t *self)
   }
   d->provisional = mask->multi_priority;
   return mask;
+}
+
+static gboolean _hold_shape_undo(dt_lib_module_t *self,
+                                 dt_iop_module_t *owner,
+                                 const dt_mask_id_t parentid)
+{
+  dt_lib_localadjust_t *d = self->data;
+  dt_masks_form_gui_t *gui = darktable.develop->form_gui;
+  if(!owner || _selected_mask(self) != owner || !gui || !gui->creation
+     || gui->creation_module != owner || gui->subtract_parentid != parentid
+     || owner->blend_params->mask_id != parentid)
+    return FALSE;
+
+  // Finish a prior shape before opening the group for this new component.
+  _end_undo_hold(d);
+  if(darktable.undo && darktable.undo->group == DT_UNDO_NONE)
+  {
+    dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+    d->undo_hold = TRUE;
+  }
+  return TRUE;
 }
 
 static void _shape_committed(dt_lib_module_t *self)
@@ -743,8 +944,6 @@ static void _refresh_sliders(dt_lib_module_t *self)
   d->updating = FALSE;
 }
 
-static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self);
-
 static void _show_mode(dt_lib_module_t *self)
 {
   dt_lib_localadjust_t *d = self->data;
@@ -783,6 +982,86 @@ static gboolean _has_group(const GArray *groups, const int priority)
   return FALSE;
 }
 
+static const dt_masks_point_group_t *_component_in_mask(const dt_iop_module_t *mask,
+                                                       const dt_mask_id_t id)
+{
+  if(!mask || !mask->blend_params) return NULL;
+  const dt_masks_form_t *root = dt_masks_get_from_id(mask->dev, mask->blend_params->mask_id);
+  if(!root || !(root->type & DT_MASKS_GROUP)) return NULL;
+  for(const GList *it = root->points; it; it = g_list_next(it))
+  {
+    const dt_masks_point_group_t *member = it->data;
+    if(member && member->formid == id) return member;
+  }
+  return NULL;
+}
+
+static GtkWidget *_named_row(const gchar *name)
+{
+  GtkWidget *row = gtk_toggle_button_new_with_label(name);
+  gtk_widget_set_hexpand(row, TRUE);
+  GtkWidget *label = gtk_bin_get_child(GTK_BIN(row));
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+  return row;
+}
+
+static void _disclosure_toggled(GtkToggleButton *button, gpointer user_data)
+{
+  GtkWidget *components = user_data;
+  const gboolean expanded = gtk_toggle_button_get_active(button);
+  gtk_button_set_label(GTK_BUTTON(button), expanded ? "▾" : "▸");
+  gtk_widget_set_visible(components, expanded);
+}
+
+static gboolean _row_enter(GtkWidget *row, GdkEventCrossing *event, gpointer user_data)
+{
+  (void)event;
+  (void)user_data;
+  dt_develop_t *dev = darktable.develop;
+  const int priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-priority"));
+  const dt_mask_id_t rootid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-rootid"));
+  const dt_mask_id_t id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-formid"));
+  dt_iop_module_t *mask = _find_mask_instance(dev, priority);
+  if(!mask || !mask->blend_params || mask->blend_params->mask_id != rootid) return FALSE;
+  const dt_masks_point_group_t *member = id ? _component_in_mask(mask, id) : NULL;
+  if(id && !member) return FALSE;
+  dev->mask_overlay_hover_id = id ? id : rootid;
+  dev->mask_overlay_hover_group_id = member ? rootid : NO_MASKID;
+  dev->mask_overlay_hover_state = member ? member->state : DT_MASKS_STATE_NONE;
+  dev->mask_overlay_hover_owner = mask;
+  dev->mask_overlay_imgid = dev->image_storage.id;
+  dt_control_queue_redraw_center();
+  return FALSE;
+}
+
+static gboolean _row_leave(GtkWidget *row, GdkEventCrossing *event, gpointer user_data)
+{
+  (void)event;
+  (void)user_data;
+  dt_develop_t *dev = darktable.develop;
+  const int priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-priority"));
+  const dt_mask_id_t rootid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-rootid"));
+  const dt_mask_id_t id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "mask-formid"));
+  if(dev->mask_overlay_hover_owner == _find_mask_instance(dev, priority)
+     && dev->mask_overlay_hover_id == (id ? id : rootid))
+  {
+    dev->mask_overlay_hover_id = NO_MASKID;
+    dev->mask_overlay_hover_group_id = NO_MASKID;
+    dev->mask_overlay_hover_state = DT_MASKS_STATE_NONE;
+    dev->mask_overlay_hover_owner = NULL;
+    dt_control_queue_redraw_center();
+  }
+  return FALSE;
+}
+
+typedef struct dt_lib_localadjust_expansion_t
+{
+  int priority;
+  dt_mask_id_t rootid;
+  gboolean expanded;
+} dt_lib_localadjust_expansion_t;
+
 static void _update(dt_lib_module_t *self)
 {
   dt_lib_localadjust_t *d = self->data;
@@ -798,52 +1077,169 @@ static void _update(dt_lib_module_t *self)
       g_array_append_val(groups, mod->multi_priority);
   }
 
-  const gboolean same = groups->len == d->groups->len
-    && (groups->len == 0
-        || !memcmp(groups->data, d->groups->data, groups->len * sizeof(int)));
+  // A priority-only cache misses renamed shapes, added components, and an
+  // image change with the same priorities. Keep the exact visible structure.
+  GString *signature = g_string_new(NULL);
+  g_string_append_printf(signature, "%d;", (int)dev->image_storage.id);
+  for(guint i = 0; i < groups->len; i++)
+  {
+    const int priority = g_array_index(groups, int, i);
+    dt_iop_module_t *mask = _find_mask_instance(dev, priority);
+    gchar *name = dt_history_item_get_name(mask);
+    const dt_mask_id_t rootid = mask->blend_params ? mask->blend_params->mask_id : NO_MASKID;
+    const dt_masks_form_t *root = dt_masks_get_from_id(dev, rootid);
+    g_string_append_printf(signature, "%d:%d:%zu:", priority, rootid, strlen(name));
+    g_string_append(signature, name);
+    g_free(name);
+    if(root && (root->type & DT_MASKS_GROUP))
+      for(const GList *it = root->points; it; it = g_list_next(it))
+      {
+        const dt_masks_point_group_t *member = it->data;
+        if(!member) continue;
+        const dt_masks_form_t *form = dt_masks_get_from_id(dev, member->formid);
+        const gchar *form_name = form ? form->name : "";
+        g_string_append_printf(signature, "/%d:%d:%zu:", member->formid,
+                               member->state, strlen(form_name));
+        g_string_append(signature, form_name);
+      }
+    g_string_append_c(signature, ';');
+  }
+
+  const gboolean same = g_strcmp0(d->list_signature, signature->str) == 0;
 
   if(same)
   {
     g_array_free(groups, TRUE);
+    g_string_free(signature, TRUE);
   }
   else
   {
     d->updating = TRUE;
 
+    // Preserve disclosure state for the same parent on this image when a
+    // component is renamed or added. A different image starts afresh.
+    GArray *expanded = g_array_new(FALSE, FALSE, sizeof(dt_lib_localadjust_expansion_t));
+    if(d->listed_imgid == dev->image_storage.id)
+    {
+      GList *old_items = gtk_container_get_children(GTK_CONTAINER(d->list));
+      for(GList *it = old_items; it; it = g_list_next(it))
+      {
+        GtkWidget *item = it->data;
+        GtkWidget *disclosure = g_object_get_data(G_OBJECT(item), "mask-disclosure");
+        dt_lib_localadjust_expansion_t state = {
+          .priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "mask-priority")),
+          .rootid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "mask-rootid")),
+          .expanded = disclosure && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(disclosure))
+        };
+        g_array_append_val(expanded, state);
+      }
+      g_list_free(old_items);
+    }
+
     gtk_container_foreach(GTK_CONTAINER(d->list),
                           (GtkCallback)gtk_widget_destroy, NULL);
 
     if(groups->len == 0)
+    {
       d->selected = -1;
+      d->selected_child = NO_MASKID;
+    }
     else if(!_has_group(groups, d->selected))
+    {
       d->selected = g_array_index(groups, int, 0);
+      d->selected_child = NO_MASKID;
+    }
+    if(d->selected_child
+       && !_component_in_mask(_find_mask_instance(dev, d->selected), d->selected_child))
+      d->selected_child = NO_MASKID;
 
     for(guint i = 0; i < groups->len; i++)
     {
       const int priority = g_array_index(groups, int, i);
       dt_iop_module_t *mask = _find_mask_instance(dev, priority);
       gchar *item_name = dt_history_item_get_name(mask);
-      // a plain list row has no visible selected state in this theme.
-      // a checked button uses the same highlight as the history list.
-      GtkWidget *row = gtk_toggle_button_new_with_label(item_name);
-      gtk_widget_set_hexpand(row, TRUE);
-      GtkWidget *lab = gtk_bin_get_child(GTK_BIN(row));
-      gtk_widget_set_halign(lab, GTK_ALIGN_START);
-      gtk_label_set_xalign(GTK_LABEL(lab), 0.0f);
+      const dt_mask_id_t rootid = mask->blend_params ? mask->blend_params->mask_id : NO_MASKID;
+      const dt_masks_form_t *root = dt_masks_get_from_id(dev, rootid);
+      GtkWidget *item = dt_gui_vbox();
+      GtkWidget *header = dt_gui_hbox();
+      GtkWidget *components = dt_gui_vbox();
+      GtkWidget *disclosure = gtk_toggle_button_new_with_label("▸");
+      GtkWidget *row = _named_row(item_name);
+      gtk_widget_set_tooltip_text(disclosure, _("show or hide this mask's components"));
       gtk_widget_set_tooltip_text
-        (row, _("one local adjustment: draw on this mask with the "
-                "mask manager, adjust it with the sliders below"));
+        (row, _("select this mask; the sliders below edit this adjustment"));
       g_free(item_name);
+      g_object_set_data(G_OBJECT(item), "mask-priority", GINT_TO_POINTER(priority));
+      g_object_set_data(G_OBJECT(item), "mask-rootid", GINT_TO_POINTER(rootid));
+      g_object_set_data(G_OBJECT(item), "mask-parent", row);
+      g_object_set_data(G_OBJECT(item), "mask-disclosure", disclosure);
+      g_object_set_data(G_OBJECT(item), "mask-components", components);
       g_object_set_data(G_OBJECT(row), "mask-priority", GINT_TO_POINTER(priority));
+      g_object_set_data(G_OBJECT(row), "mask-rootid", GINT_TO_POINTER(rootid));
       g_signal_connect(G_OBJECT(row), "toggled", G_CALLBACK(_row_toggled), self);
-      gtk_box_pack_start(GTK_BOX(d->list), row, FALSE, FALSE, 0);
-      if(priority == d->selected)
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(row), TRUE);
+      gtk_widget_add_events(row, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+      g_signal_connect(G_OBJECT(row), "enter-notify-event", G_CALLBACK(_row_enter), self);
+      g_signal_connect(G_OBJECT(row), "leave-notify-event", G_CALLBACK(_row_leave), self);
+      dt_gui_box_add(header, disclosure, row);
+      dt_gui_box_add(item, header, components);
+      dt_gui_box_add(d->list, item);
+
+      // A mask without shapes is still an editable adjustment, not a hidden row.
+      if(!root || !(root->type & DT_MASKS_GROUP) || !root->points)
+      {
+        GtkWidget *empty = dt_ui_label_new(_("no components yet"));
+        dt_gui_box_add(components, empty);
+      }
+      else
+      {
+        for(const GList *it = root->points; it; it = g_list_next(it))
+        {
+          const dt_masks_point_group_t *member = it->data;
+          const dt_masks_form_t *form = member
+            ? dt_masks_get_from_id(dev, member->formid) : NULL;
+          if(!form) continue;
+          GtkWidget *child = _named_row(form->name);
+          gtk_widget_set_tooltip_text(child, _("select and edit this mask component"));
+          g_object_set_data(G_OBJECT(child), "mask-priority", GINT_TO_POINTER(priority));
+          g_object_set_data(G_OBJECT(child), "mask-rootid", GINT_TO_POINTER(rootid));
+          g_object_set_data(G_OBJECT(child), "mask-formid", GINT_TO_POINTER(form->formid));
+          g_signal_connect(G_OBJECT(child), "toggled", G_CALLBACK(_child_toggled), self);
+          gtk_widget_add_events(child, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+          g_signal_connect(G_OBJECT(child), "enter-notify-event", G_CALLBACK(_row_enter), self);
+          g_signal_connect(G_OBJECT(child), "leave-notify-event", G_CALLBACK(_row_leave), self);
+          dt_gui_box_add(components, child);
+        }
+      }
+      gtk_widget_set_margin_start(components, 20);
+      gtk_widget_show_all(components);
+      gtk_widget_set_no_show_all(components, TRUE);
+      gboolean open = priority == d->selected;
+      for(guint n = 0; n < expanded->len; n++)
+      {
+        const dt_lib_localadjust_expansion_t state =
+          g_array_index(expanded, dt_lib_localadjust_expansion_t, n);
+        if(state.priority == priority && state.rootid == rootid)
+        {
+          open = state.expanded;
+          break;
+        }
+      }
+      g_signal_connect(G_OBJECT(disclosure), "toggled",
+                       G_CALLBACK(_disclosure_toggled), components);
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(disclosure), open);
+      gtk_widget_set_visible(components, open);
     }
     gtk_widget_show_all(d->list);
 
+    // no-show-all keeps collapsed contents hidden through the show_all above.
+    _sync_row_selection(self);
+
     g_array_free(d->groups, TRUE);
     d->groups = groups;
+    g_array_free(expanded, TRUE);
+    g_free(d->list_signature);
+    d->list_signature = g_string_free(signature, FALSE);
+    d->listed_imgid = dev->image_storage.id;
     d->updating = FALSE;
   }
 
@@ -860,11 +1256,61 @@ static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self)
 
   const int priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "mask-priority"));
 
-  // one adjustment stays chosen: clicking the highlighted row again
-  // must not turn the highlight off
+  // Clicking the parent after a child returns to the whole mask. Otherwise
+  // one adjustment stays chosen when its highlighted parent is clicked again.
   if(!gtk_toggle_button_get_active(button))
   {
-    if(priority == d->selected)
+    if(priority != d->selected) return;
+    if(d->selected_child == NO_MASKID)
+    {
+      d->updating = TRUE;
+      gtk_toggle_button_set_active(button, TRUE);
+      d->updating = FALSE;
+      return;
+    }
+  }
+
+  if(priority != d->selected) _abandon_shape(self, _selected_mask(self));
+  d->updating = TRUE;
+  d->selected = priority;
+  d->selected_child = NO_MASKID;
+  _sync_row_selection(self);
+  d->updating = FALSE;
+
+  _refresh_sliders(self);
+  gtk_widget_set_sensitive(d->sliders_box, d->selected >= 0);
+  gtk_widget_set_sensitive(d->delete_button, d->selected >= 0);
+  _show_mode(self);
+
+  dt_iop_module_t *mask = _find_mask_instance(darktable.develop, d->selected);
+  dt_iop_request_focus(mask);
+  if(_mask_has_shape(mask))
+  {
+    dt_masks_set_edit_mode(mask, DT_MASKS_EDIT_FULL);
+    dt_develop_t *dev = darktable.develop;
+    dev->mask_overlay_selected_id = mask->blend_params->mask_id;
+    dev->mask_overlay_selected_group_id = NO_MASKID;
+    dev->mask_overlay_selected_state = DT_MASKS_STATE_NONE;
+    dev->mask_overlay_selected_owner = mask;
+    dev->mask_overlay_imgid = dev->image_storage.id;
+    dt_control_queue_redraw_center();
+  }
+  else
+    _clear_overlay(darktable.develop);
+  // cleanup can remove a row; rebuild only after this callback releases it
+  dt_lib_gui_queue_update(self);
+}
+
+static void _child_toggled(GtkToggleButton *button, dt_lib_module_t *self)
+{
+  dt_lib_localadjust_t *d = self->data;
+  if(d->updating) return;
+  const int priority = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "mask-priority"));
+  const dt_mask_id_t rootid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "mask-rootid"));
+  const dt_mask_id_t id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "mask-formid"));
+  if(!gtk_toggle_button_get_active(button))
+  {
+    if(priority == d->selected && id == d->selected_child)
     {
       d->updating = TRUE;
       gtk_toggle_button_set_active(button, TRUE);
@@ -873,24 +1319,43 @@ static void _row_toggled(GtkToggleButton *button, dt_lib_module_t *self)
     return;
   }
 
-  d->updating = TRUE;
+  dt_develop_t *dev = darktable.develop;
+  dt_iop_module_t *mask = _find_mask_instance(dev, priority);
+  if(!mask || !mask->blend_params || mask->blend_params->mask_id != rootid)
+  {
+    dt_lib_gui_queue_update(self);
+    return;
+  }
+  const dt_masks_point_group_t *member = _component_in_mask(mask, id);
+  dt_masks_form_t *form = dt_masks_get_from_id(dev, id);
+  if(!member || !form)
+  {
+    dt_lib_gui_queue_update(self);
+    return;
+  }
+  const uint32_t state = member->state;
   if(priority != d->selected) _abandon_shape(self, _selected_mask(self));
-  GList *rows = gtk_container_get_children(GTK_CONTAINER(d->list));
-  for(GList *it = rows; it; it = g_list_next(it))
-    if(it->data != button && gtk_toggle_button_get_active(it->data))
-      gtk_toggle_button_set_active(it->data, FALSE);
-  g_list_free(rows);
+  d->updating = TRUE;
   d->selected = priority;
+  d->selected_child = id;
+  _sync_row_selection(self);
   d->updating = FALSE;
 
   _refresh_sliders(self);
-  gtk_widget_set_sensitive(d->sliders_box, d->selected >= 0);
-  gtk_widget_set_sensitive(d->delete_button, d->selected >= 0);
+  gtk_widget_set_sensitive(d->sliders_box, TRUE);
+  gtk_widget_set_sensitive(d->delete_button, TRUE);
   _show_mode(self);
 
-  // the existing mask manager edits this mask through the module focus
-  dt_iop_request_focus(_find_mask_instance(darktable.develop, d->selected));
-  // cleanup can remove a row; rebuild only after this callback releases it
+  // Select the canvas form directly: Mask Manager may hide localmask rows.
+  dt_iop_request_focus(mask);
+  dt_masks_set_edit_mode_single_form(mask, id, DT_MASKS_EDIT_FULL);
+  dt_masks_select_form(mask, form);
+  dev->mask_overlay_selected_id = id;
+  dev->mask_overlay_selected_group_id = rootid;
+  dev->mask_overlay_selected_state = state;
+  dev->mask_overlay_selected_owner = mask;
+  dev->mask_overlay_imgid = dev->image_storage.id;
+  dt_control_queue_redraw_center();
   dt_lib_gui_queue_update(self);
 }
 
@@ -914,6 +1379,8 @@ static void _image_changed_callback(gpointer instance, dt_lib_module_t *self)
   dt_lib_localadjust_t *d = self->data;
   _end_undo_hold(d);
   d->provisional = -1;
+  d->selected_child = NO_MASKID;
+  _clear_overlay(darktable.develop);
   _signal_callback(instance, self);
 }
 
@@ -923,6 +1390,8 @@ void gui_init(dt_lib_module_t *self)
 
   self->data = (void *)d;
   d->selected = -1;
+  d->selected_child = NO_MASKID;
+  d->listed_imgid = -1;
   d->provisional = -1;
   d->groups = g_array_new(FALSE, FALSE, sizeof(int));
 
@@ -940,7 +1409,7 @@ void gui_init(dt_lib_module_t *self)
   g_signal_connect(G_OBJECT(d->delete_button), "clicked",
                    G_CALLBACK(_delete_clicked), self);
 
-  d->list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+  d->list = dt_gui_vbox();
 
   d->mode_label = gtk_label_new(NULL);
   gtk_label_set_line_wrap(GTK_LABEL(d->mode_label), TRUE);
@@ -979,7 +1448,9 @@ void gui_init(dt_lib_module_t *self)
   darktable.develop->proxy.localadjust.module = self;
   darktable.develop->proxy.localadjust.selected_mask = _selected_mask;
   darktable.develop->proxy.localadjust.select_mask = _select_mask;
+  darktable.develop->proxy.localadjust.duplicate_mask = _duplicate_mask;
   darktable.develop->proxy.localadjust.begin_shape = _begin_shape;
+  darktable.develop->proxy.localadjust.hold_shape_undo = _hold_shape_undo;
   darktable.develop->proxy.localadjust.shape_committed = _shape_committed;
   darktable.develop->proxy.localadjust.shape_cancelled = _shape_cancelled;
 
@@ -995,11 +1466,14 @@ void gui_cleanup(dt_lib_module_t *self)
     darktable.develop->proxy.localadjust.module = NULL;
     darktable.develop->proxy.localadjust.selected_mask = NULL;
     darktable.develop->proxy.localadjust.select_mask = NULL;
+    darktable.develop->proxy.localadjust.duplicate_mask = NULL;
     darktable.develop->proxy.localadjust.begin_shape = NULL;
+    darktable.develop->proxy.localadjust.hold_shape_undo = NULL;
     darktable.develop->proxy.localadjust.shape_committed = NULL;
     darktable.develop->proxy.localadjust.shape_cancelled = NULL;
   }
   g_array_free(d->groups, TRUE);
+  g_free(d->list_signature);
   free(d);
   self->data = NULL;
 }

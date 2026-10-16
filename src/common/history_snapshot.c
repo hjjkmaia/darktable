@@ -154,10 +154,10 @@ void dt_history_snapshot_undo_create(const dt_imgid_t imgid,
   dt_unlock_image(imgid);
 }
 
-static void _history_snapshot_restore(const dt_imgid_t source_imgid,
-                                      const dt_imgid_t dest_imgid,
-                                      const int snap_id,
-                                      const int history_end)
+static gboolean _history_snapshot_restore(const dt_imgid_t source_imgid,
+                                          const dt_imgid_t dest_imgid,
+                                          const int snap_id,
+                                          const int history_end)
 {
   // restore the given snapshot from source to target
   sqlite3_stmt *stmt;
@@ -166,6 +166,35 @@ static void _history_snapshot_restore(const dt_imgid_t source_imgid,
   dt_lock_image(dest_imgid);
 
   dt_database_start_transaction(darktable.db);
+
+  // a missing image or saved history must not be cleared and replaced with
+  // an empty history during a failed grouped duplicate redo
+  sqlite3_stmt *check = NULL;
+  const int prepared = sqlite3_prepare_v2(dt_database_get(darktable.db),
+                                          "SELECT EXISTS(SELECT 1 FROM main.images WHERE id = ?1),"
+                                          "       EXISTS(SELECT 1 FROM memory.snapshot_history"
+                                          "              WHERE imgid = ?2 AND id = ?3 AND num IS NOT NULL)",
+                                          -1, &check, NULL);
+  gboolean ready = FALSE;
+  if(prepared == SQLITE_OK)
+  {
+    DT_DEBUG_SQLITE3_BIND_INT(check, 1, dest_imgid);
+    DT_DEBUG_SQLITE3_BIND_INT(check, 2, source_imgid);
+    DT_DEBUG_SQLITE3_BIND_INT(check, 3, snap_id);
+    if(sqlite3_step(check) == SQLITE_ROW)
+      ready = history_end >= 0 && sqlite3_column_int(check, 0)
+        && (history_end == 0 || sqlite3_column_int(check, 1));
+  }
+  sqlite3_finalize(check);
+  if(!ready)
+  {
+    dt_database_rollback_transaction(darktable.db);
+    dt_unlock_image(dest_imgid);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[_history_snapshot_restore] image or snapshot missing for %d",
+             dest_imgid);
+    return FALSE;
+  }
 
   dt_history_delete_on_image_ext(dest_imgid, FALSE, FALSE);
   DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
@@ -243,7 +272,9 @@ static void _history_snapshot_restore(const dt_imgid_t source_imgid,
   }
   dt_unlock_image(dest_imgid);
 
-  dt_history_hash_write_from_history(dest_imgid, DT_HISTORY_HASH_CURRENT);
+  if(all_ok)
+    dt_history_hash_write_from_history(dest_imgid, DT_HISTORY_HASH_CURRENT);
+  return all_ok;
 }
 
 void dt_history_snapshot_restore(const dt_imgid_t source_imgid,
@@ -312,16 +343,12 @@ void dt_history_snapshot_undo_pop(gpointer user_data,
   {
     dt_undo_lt_history_t *hist = (dt_undo_lt_history_t *)data;
 
-    if(action == DT_ACTION_UNDO)
-    {
-      _history_snapshot_restore(hist->imgid, hist->imgid, hist->before, hist->before_history_end);
-    }
-    else
-    {
-      _history_snapshot_restore(hist->imgid, hist->imgid, hist->after, hist->after_history_end);
-    }
+    const gboolean restored = action == DT_ACTION_UNDO
+      ? _history_snapshot_restore(hist->imgid, hist->imgid, hist->before, hist->before_history_end)
+      : _history_snapshot_restore(hist->imgid, hist->imgid, hist->after, hist->after_history_end);
 
-    *imgs = g_list_append(*imgs, GINT_TO_POINTER(hist->imgid));
+    if(restored)
+      *imgs = g_list_append(*imgs, GINT_TO_POINTER(hist->imgid));
   }
 }
 

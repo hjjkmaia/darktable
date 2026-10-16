@@ -107,6 +107,23 @@ typedef struct dt_iop_crop_gui_data_t
   gint64 focus_time;
   // crop rectangle at the moment the tool was opened, so Escape can put it back
   float saved_x, saved_y, saved_w, saved_h;
+  /* combined crop+rotation session: revert baseline taken on every real
+   * focus-in, also while disabled (the first canvas click can enable the
+   * module without a new focus-in), plus gesture and deferred-commit state */
+  void *session_crop_params, *session_ashift_params;
+  gboolean session_crop_enabled, session_ashift_enabled;
+  dt_imgid_t session_imgid;
+  /* set when a session begins while a deferred commit from the session
+   * that just ended is still pending: the crop baseline is whatever that
+   * commit lands, so the snapshot is re-anchored when the retry runs */
+  gboolean session_baseline_pending;
+  int rotating;              /* rotation drag in progress: the corner band pressed */
+  float rot_angle;           /* last pointer angle around the frame center, pixel units */
+  float rot_sign;            /* -1 when the pipe mirrors between ashift and screen */
+  gboolean straighten_armed, straightening;
+  float straighten_x, straighten_y;
+  gboolean commit_pending;   /* a commit found the preview pipe invalid and is retried */
+  dt_imgid_t commit_imgid;
   dt_gui_collapsible_section_t cs;
 } dt_iop_crop_gui_data_t;
 
@@ -437,10 +454,14 @@ static gboolean _set_max_clip(dt_iop_module_t *self)
   g->clip_max_h = MIN((points[3] - points[1]) / ht, 1.0f);
 
   // if clipping values are not null, this is undistorted values...
-  g->clip_x = MAX(points[4] / wd, g->clip_max_x);
-  g->clip_y = MAX(points[5] / ht, g->clip_max_y);
-  g->clip_w = MIN((points[6] - points[4]) / wd, g->clip_max_w);
-  g->clip_h = MIN((points[7] - points[5]) / ht, g->clip_max_h);
+  // (left alone while a deferred commit owns the gui box)
+  if(!g->commit_pending)
+  {
+    g->clip_x = MAX(points[4] / wd, g->clip_max_x);
+    g->clip_y = MAX(points[5] / ht, g->clip_max_y);
+    g->clip_w = MIN((points[6] - points[4]) / wd, g->clip_max_w);
+    g->clip_h = MIN((points[7] - points[5]) / ht, g->clip_max_h);
+  }
 
   g->clip_max_pipe_hash = self->dev->preview_pipe->backbuf_hash;
   return TRUE;
@@ -675,6 +696,217 @@ static void _event_preview_updated_callback(gpointer instance, dt_iop_module_t *
   g->clip_max_pipe_hash = DT_INVALID_HASH;
 }
 
+/* crop's canvas drives rotate-and-perspective's rotation through ashift's
+ * own slider widget, so the params write, auto-crop and history recording
+ * all take the normal widget path (imageop_gui.c:109 binds the field,
+ * bauhaus.c:3773 writes it, imageop.c:4417 records with enabled=TRUE).
+ * Returns NULL when ashift or its widget is unavailable. */
+static GtkWidget *_ashift_rotation_widget(void)
+{
+  dt_iop_module_t *ashift = dt_iop_get_module("ashift");
+  if(!ashift || !ashift->so) return NULL;
+  dt_action_t *ac = dt_action_locate(DT_ACTION(ashift->so),
+                                     (gchar **)(const gchar *[]){ "rotation", NULL },
+                                     FALSE);
+  // the lookup can fail; widget actions carry the GtkWidget as target
+  if(!ac || ac->type < DT_ACTION_TYPE_WIDGET || !GTK_IS_WIDGET(ac->target))
+    return NULL;
+  return GTK_WIDGET(ac->target);
+}
+
+/* apply a raw-degrees delta to ashift's rotation: a raw increase rotates
+ * the image counterclockwise on screen, the convention the straighten
+ * caller subtracts against (ashift.c:5113-5115), hence the minus */
+static void _ashift_rotate_delta(const float delta_deg)
+{
+  GtkWidget *w = _ashift_rotation_widget();
+  if(!w) return;
+  dt_bauhaus_slider_set(w, dt_bauhaus_slider_get(w) - delta_deg);
+}
+
+/* the straighten ruler replicates ashift's _calculate_straightening
+ * (ashift.c:4112-4152) step for step, but backtransforms relative to
+ * ASHIFT's pipe position so the flip module between ashift and crop is
+ * included */
+static float _straighten_angle(const dt_iop_module_t *self,
+                               const float pzx, const float pzy,
+                               const float bzx, const float bzy,
+                               const float wd, const float ht,
+                               const float zoom_scale)
+{
+  const dt_iop_module_t *ashift = dt_iop_get_module("ashift");
+  if(!ashift) return 0.0f;
+
+  float dx = (pzx - bzx) * wd, dy = (pzy - bzy) * ht;
+  if(sqrt(dx * dx + dy * dy) * zoom_scale < DT_PIXEL_APPLY_DPI(25))
+    return 0.0f;
+
+  // adjust the line with possible current angle and flip on ashift
+  float pts[4] = { 0, 0, dx, dy };
+  dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe,
+                                    ashift->iop_order,
+                                    DT_DEV_TRANSFORM_DIR_FORW_EXCL, pts, 2);
+  dx = pts[0] - pts[2];
+  dy = pts[1] - pts[3];
+
+  if(dx < 0)
+  {
+    dx = -dx;
+    dy = -dy;
+  }
+
+  const float angle = atan2f(dy, dx);
+  if(!(angle >= -M_PI_2f && angle <= M_PI_2f))
+    return 0.0f;
+  float close = angle;
+  if(close > M_PI_4f)
+    close = M_PI_2f - close;
+  else if(close < -M_PI_4f)
+    close = -M_PI_2f - close;
+  else
+    close = -close;
+
+  float a = rad2degf(close);
+  if(a < -180.f) a += 360.f;
+  if(a > 180.f) a -= 360.f;
+
+  return a;
+}
+
+/* rotation drag band: strictly outside the frame, within `border` of a
+ * corner; returns the corner bits or 0. Anything farther out stays
+ * unclaimed so darkroom panning keeps working there (darkroom.c:4959) */
+static int _rotation_grab(const float pzx, const float pzy,
+                          const dt_iop_crop_gui_data_t *g,
+                          const float border,
+                          const float wd, const float ht)
+{
+  const float x0 = g->clip_x, y0 = g->clip_y;
+  const float x1 = g->clip_x + g->clip_w, y1 = g->clip_y + g->clip_h;
+  if(!(pzx < x0 || pzx > x1 || pzy < y0 || pzy > y1))
+    return 0; // inside the frame: crop's own handles
+
+  const float hb = border / wd;
+  const float vb = border / ht;
+  int corner = 0;
+  if(pzx >= x0 - hb && pzx <= x0)      corner |= GRAB_LEFT;
+  else if(pzx >= x1 && pzx <= x1 + hb) corner |= GRAB_RIGHT;
+  if(pzy >= y0 - vb && pzy <= y0)      corner |= GRAB_TOP;
+  else if(pzy >= y1 && pzy <= y1 + vb) corner |= GRAB_BOTTOM;
+  // a corner is one horizontal and one vertical side at once
+  if((corner & GRAB_HORIZONTAL) && (corner & GRAB_VERTICAL))
+    return corner;
+  return 0;
+}
+
+/* flip sits between ashift and crop in the pipe; an odd number of axis
+ * reflections reverses angular direction on screen, so the drag delta
+ * must be negated for the image to follow the pointer. Measure the
+ * handedness of the transform at the frame center via the same
+ * backtransform the straighten ruler uses. +1 normal, -1 mirrored */
+static float _rotation_mirror_sign(const dt_iop_module_t *self,
+                                   const float cx, const float cy)
+{
+  const dt_iop_module_t *ashift = dt_iop_get_module("ashift");
+  if(!ashift) return 1.0f;
+  float pts[6] = { cx, cy, cx + 32.0f, cy, cx, cy + 32.0f };
+  if(!dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe,
+                                        ashift->iop_order,
+                                        DT_DEV_TRANSFORM_DIR_FORW_EXCL,
+                                        pts, 3))
+    return 1.0f;
+  const float cross = (pts[2] - pts[0]) * (pts[5] - pts[1])
+                    - (pts[4] - pts[0]) * (pts[3] - pts[1]);
+  return cross < 0.0f ? -1.0f : 1.0f;
+}
+
+/* revert baseline for the combined crop+rotation session */
+static void _session_snapshot(dt_iop_module_t *self,
+                              dt_iop_crop_gui_data_t *g,
+                              const dt_iop_crop_params_t *p)
+{
+  if(!g->session_crop_params)
+    g->session_crop_params = g_malloc(self->params_size);
+  memcpy(g->session_crop_params, p, self->params_size);
+  g->session_crop_enabled = self->enabled;
+
+  const dt_iop_module_t *ashift = dt_iop_get_module("ashift");
+  if(ashift)
+  {
+    if(!g->session_ashift_params)
+      g->session_ashift_params = g_malloc(ashift->params_size);
+    memcpy(g->session_ashift_params, ashift->params, ashift->params_size);
+    g->session_ashift_enabled = ashift->enabled;
+  }
+  g->session_imgid = self->dev->image_storage.id;
+}
+
+/* does a pointer drag own the gui rectangle right now? Grab bits left over
+ * from a dirty release, or an unclaimed pan (GRAB_NONE), are not a drag;
+ * the button test catches a drag cut off by the tool losing focus */
+static gboolean _crop_drag_active(const dt_iop_crop_gui_data_t *g)
+{
+  if(!darktable.control->button_down
+     || darktable.control->button_down_which != GDK_BUTTON_PRIMARY)
+    return FALSE;
+  return g->rotating || g->straightening
+    || (g->cropping != GRAB_CENTER && g->cropping != GRAB_NONE);
+}
+
+static void _event_commit_pending_callback(gpointer instance, dt_iop_module_t *self)
+{
+  dt_iop_crop_gui_data_t *g = self->gui_data;
+  // a request carried over from another image is stale; drop it
+  if(g && g->commit_pending
+     && self->dev->image_storage.id != g->commit_imgid)
+    g->commit_pending = FALSE;
+  if(!g || !g->commit_pending)
+  {
+    DT_CONTROL_SIGNAL_DISCONNECT(_event_commit_pending_callback, self);
+    return;
+  }
+  if(self->dev->preview_pipe->status != DT_DEV_PIXELPIPE_VALID)
+    return; // stay connected until the pipe is usable
+  /* a drag started after the commit was deferred owns the rectangle:
+   * committing now would record its intermediate state and _commit_box
+   * would reset its grab */
+  if(_crop_drag_active(g))
+    return;
+  g->commit_pending = FALSE;
+  /* _commit_box's distort values are accurate only with crop as gui_module;
+   * same temporary swap as gui_focus() on focus-out */
+  dt_iop_module_t *old_gui = self->dev->gui_module;
+  self->dev->gui_module = self;
+  _commit_box(self, g, self->params, FALSE);
+  self->dev->gui_module = old_gui;
+  /* a session that began during the deferral took its crop baseline before
+   * this commit landed; re-anchor it to the committed state (the commit
+   * writes only crop params, ashift's baseline stays valid) */
+  if(g->session_baseline_pending)
+  {
+    g->session_baseline_pending = FALSE;
+    memcpy(g->session_crop_params, self->params, self->params_size);
+    g->session_crop_enabled = self->enabled;
+  }
+  g->clip_max_pipe_hash = DT_INVALID_HASH;
+  DT_CONTROL_SIGNAL_DISCONNECT(_event_commit_pending_callback, self);
+  dt_control_queue_redraw_center();
+}
+
+/* arm the one-shot retry when _commit_box cannot run on an invalid pipe;
+ * the params->gui copy in _set_max_clip() is gated on the flag meanwhile */
+static void _commit_defer(dt_iop_module_t *self, dt_iop_crop_gui_data_t *g)
+{
+  // a request carried over from another image is stale; drop it
+  if(g->commit_pending && g->commit_imgid != self->dev->image_storage.id)
+    g->commit_pending = FALSE;
+  if(g->commit_pending) return; // already armed
+  g->commit_pending = TRUE;
+  g->commit_imgid = self->dev->image_storage.id;
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED,
+                           _event_commit_pending_callback);
+}
+
 void gui_focus(dt_iop_module_t *self, gboolean in)
 {
   darktable.develop->history_postpone_invalidate =
@@ -682,6 +914,23 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
 
   dt_iop_crop_gui_data_t *g = self->gui_data;
   dt_iop_crop_params_t *p = self->params;
+
+  /* refresh the combined revert baseline on every real focus acquisition,
+   * also while disabled: an edit can switch the module on mid-session
+   * (button_pressed) without a new focus-in */
+  if(in)
+  {
+    _session_snapshot(self, g, p);
+    // a deferred commit from another image is stale; drop it so the
+    // params->gui sync below is not skipped for the new image
+    if(g->commit_pending && g->commit_imgid != self->dev->image_storage.id)
+      g->commit_pending = FALSE;
+    /* a pending commit belongs to the session that just ended; this
+     * session's crop baseline is whatever it lands, so the snapshot is
+     * re-anchored when the retry runs */
+    g->session_baseline_pending = g->commit_pending;
+  }
+
   if(self->enabled)
   {
     // once the pipe is recomputed, we want to update final sizes
@@ -690,7 +939,10 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
     {
       // got focus, grab stuff to gui:
       // need to get gui stuff for the first time for this image,
-      _crop_reflect_params(self);
+      /* a deferred commit owns the gui box across the focus change;
+       * reflecting params over it would make its retry commit stale */
+      if(!g->commit_pending)
+        _crop_reflect_params(self);
       g->saved_x = g->clip_x;
       g->saved_y = g->clip_y;
       g->saved_w = g->clip_w;
@@ -707,12 +959,26 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
       _commit_box(self, g, p, FALSE);
       self->dev->gui_module = old_gui;
       g->clip_max_pipe_hash = DT_INVALID_HASH;
+      // the commit above is a silent no-op on an invalid pipe; retry then
+      if(self->dev->preview_pipe->status != DT_DEV_PIXELPIPE_VALID)
+        _commit_defer(self, g);
     }
-    if(!in)
+    // keep the pending rectangle for the deferred commit's retry
+    if(!in && !g->commit_pending)
       _crop_reflect_params(self);
   }
   else if(in)
     g->preview_ready = TRUE;
+
+  if(!in)
+  {
+    // leaving the tool drops any armed or in-progress gesture, including
+    // grab bits a held drag would otherwise leave blocking the retry
+    g->cropping = GRAB_CENTER;
+    g->rotating = 0;
+    g->straightening = FALSE;
+    g->straighten_armed = FALSE;
+  }
 
   g->focus_time = g_get_monotonic_time();
 }
@@ -1259,10 +1525,14 @@ void gui_update(dt_iop_module_t *self)
     dt_bauhaus_combobox_set(g->aspect_presets, act);
 
   // reset gui draw box to what we have in the parameters:
-  g->clip_x = p->cx;
-  g->clip_w = p->cw - p->cx;
-  g->clip_y = p->cy;
-  g->clip_h = p->ch - p->cy;
+  // (a deferred commit owns the box; its retry needs the pending rect)
+  if(!g->commit_pending)
+  {
+    g->clip_x = p->cx;
+    g->clip_w = p->cw - p->cx;
+    g->clip_y = p->cy;
+    g->clip_h = p->ch - p->cy;
+  }
 
   dt_gui_update_collapsible_section(&g->cs);
   gui_changed(self, NULL, NULL);
@@ -1287,6 +1557,16 @@ static void _event_aspect_flip(GtkWidget *button, dt_iop_module_t *self)
   dt_iop_crop_gui_data_t *g = self->gui_data;
   dt_iop_crop_params_t *p = self->params;
   _commit_box(self, g, p, TRUE);
+}
+
+/* arm the straighten ruler: the next primary drag on the canvas draws a
+ * line whose angle is applied to rotate-and-perspective on release */
+static void _event_straighten_clicked(GtkWidget *button, dt_iop_module_t *self)
+{
+  dt_iop_crop_gui_data_t *g = self->gui_data;
+  g->straighten_armed = TRUE;
+  dt_control_hinter_message(_("<b>straighten</b>: drag a line along an edge to level it"));
+  dt_control_queue_redraw_center();
 }
 
 static gint _aspect_ratio_cmp(const dt_iop_crop_aspect_t *a,
@@ -1324,6 +1604,13 @@ static gchar *_aspect_format(gchar *original,
 
 static void _crop_handle_flip(dt_iop_module_t *self, const dt_image_orientation_t mode)
 {
+  /* an image flip is a boundary for the combined framing session: release
+   * the tool so the current state commits through the normal defocus path
+   * and a later Escape cannot restore the pre-flip baseline over flipped
+   * geometry */
+  if(self && darktable.develop->gui_module == self)
+    dt_iop_request_focus(NULL);
+
   dt_iop_crop_params_t *p = self ? self->params : NULL;
   if(!p || (p->cx == 0.f && p->cy == 0.f && p->cw == 1.f && p->ch == 1.f))
     return;
@@ -1334,6 +1621,23 @@ static void _crop_handle_flip(dt_iop_module_t *self, const dt_image_orientation_
   else if(mode == ORIENTATION_FLIP_VERTICALLY)   {p->cy = 1.f-p->ch; p->ch = 1.f-ocy;}
   else if(mode == ORIENTATION_ROTATE_CW_90_DEG)  {p->cx = 1.f-p->ch; p->ch = p->cw;     p->cw = 1.f-p->cy; p->cy = ocx;}
   else if(mode == ORIENTATION_ROTATE_CCW_90_DEG) {p->cx = p->cy;     p->cy = 1.f-p->cw; p->cw = p->ch;     p->ch = 1.f-ocx;}
+
+  /* a deferred commit owns the gui rectangle (gui_update leaves it alone
+   * while commit_pending): remap it like the params, so its retry commits
+   * the pending edit, remapped */
+  dt_iop_crop_gui_data_t *g = self->gui_data;
+  if(g && g->commit_pending)
+  {
+    float bx0 = g->clip_x, by0 = g->clip_y;
+    float bx1 = bx0 + g->clip_w, by1 = by0 + g->clip_h;
+    const float obx0 = bx0, oby0 = by0;
+    if(mode == ORIENTATION_FLIP_HORIZONTALLY)      {bx0 = 1.f-bx1; bx1 = 1.f-obx0;}
+    else if(mode == ORIENTATION_FLIP_VERTICALLY)   {by0 = 1.f-by1; by1 = 1.f-oby0;}
+    else if(mode == ORIENTATION_ROTATE_CW_90_DEG)  {bx0 = 1.f-by1; by1 = bx1; bx1 = 1.f-oby0; by0 = obx0;}
+    else if(mode == ORIENTATION_ROTATE_CCW_90_DEG) {bx0 = by0; by0 = 1.f-bx1; bx1 = by1; by1 = 1.f-obx0;}
+    g->clip_x = bx0; g->clip_y = by0;
+    g->clip_w = bx1 - bx0; g->clip_h = by1 - by0;
+  }
 
   dt_iop_gui_update(self);
   dt_dev_add_history_item(darktable.develop, self, self->enabled);
@@ -1365,7 +1669,12 @@ static void _crop_confirm(dt_action_t *action)
 
 /* Escape reverts to the state the tool had when it was opened, then leaves.
  * ashift keeps its own snapshot and revert; its cancel action is invoked the
- * way the shortcut dispatcher invokes command actions (accelerators.c:4102). */
+ * way the shortcut dispatcher invokes command actions (accelerators.c:4102).
+ * With crop focused the revert is combined: ashift's rotation and crop's
+ * rectangle both return to the focus-in baseline, each restored state
+ * recorded in history explicitly so the defocus below cannot lose or
+ * overwrite it (a defocus commit early-returns on an invalid pipe and
+ * compares against already-restored params). */
 static void _crop_cancel(dt_action_t *action)
 {
   (void)action;
@@ -1383,12 +1692,101 @@ static void _crop_cancel(dt_action_t *action)
   }
 
   dt_iop_crop_gui_data_t *g = self->gui_data;
-  if(g)
+  dt_iop_crop_params_t *p = self->params;
+  dt_iop_module_t *ashift = dt_iop_get_module("ashift");
+
+  /* a session is pending when either module differs from the focus-in
+   * baseline or a canvas gesture still holds uncommitted state (mid-drag
+   * box edits live only in the gui box, params writes are suppressed) */
+  const gboolean have_snapshot = g && g->session_crop_params
+    && g->session_imgid == self->dev->image_storage.id;
+  const float eps = 1e-4f;
+  const gboolean box_dirty = g
+    && (!feqf(g->clip_x, p->cx, eps) || !feqf(g->clip_y, p->cy, eps)
+        || !feqf(g->clip_x + g->clip_w, p->cw, eps)
+        || !feqf(g->clip_y + g->clip_h, p->ch, eps));
+  const gboolean pending = have_snapshot
+    && (self->enabled != g->session_crop_enabled
+        || memcmp(p, g->session_crop_params, self->params_size)
+        || (ashift && g->session_ashift_params
+            && (ashift->enabled != g->session_ashift_enabled
+                || memcmp(ashift->params, g->session_ashift_params,
+                          ashift->params_size)))
+        || g->rotating || g->straightening
+        /* a baseline-pending commit is a confirmed edit of the session
+         * that just ended, not uncommitted work of this one */
+        || (g->commit_pending && !g->session_baseline_pending)
+        || box_dirty);
+
+  if(!pending)
   {
-    g->clip_x = g->saved_x;
-    g->clip_y = g->saved_y;
-    g->clip_w = g->saved_w;
-    g->clip_h = g->saved_h;
+    if(g)
+    {
+      g->clip_x = g->saved_x;
+      g->clip_y = g->saved_y;
+      g->clip_w = g->saved_w;
+      g->clip_h = g->saved_h;
+    }
+    dt_iop_request_focus(NULL);
+    return;
+  }
+
+  /* upstream first: drop ashift's deferred work so nothing rewrites the
+   * restored params afterwards (queued crop/fit jobs survive
+   * dt_iop_gui_update), then restore both modules from the snapshot blobs.
+   * The restored box is never routed through _commit_box here: the full
+   * pipe still carries pre-restore ashift geometry, so a same-turn
+   * backtransform would compute wrong margins */
+  if(ashift && ashift->so)
+  {
+    dt_action_t *ac = dt_action_locate(DT_ACTION(ashift->so),
+                                       (gchar **)(const gchar *[]){ "purge", NULL },
+                                       FALSE);
+    if(ac && ac->type == DT_ACTION_TYPE_COMMAND && ac->target)
+      ((dt_action_callback_t *)ac->target)(ac);
+  }
+
+  if(ashift && g->session_ashift_params
+     && (ashift->enabled != g->session_ashift_enabled
+         || memcmp(ashift->params, g->session_ashift_params, ashift->params_size)))
+  {
+    memcpy(ashift->params, g->session_ashift_params, ashift->params_size);
+    ashift->enabled = g->session_ashift_enabled;
+    DT_ENTER_GUI_UPDATE();
+    dt_iop_gui_set_enable_button(ashift);
+    DT_LEAVE_GUI_UPDATE();
+    dt_iop_gui_update(ashift);
+    // FALSE records the enabled flag as-is
+    dt_dev_add_history_item(darktable.develop, ashift, FALSE);
+  }
+
+  if(self->enabled != g->session_crop_enabled
+     || memcmp(p, g->session_crop_params, self->params_size))
+  {
+    memcpy(p, g->session_crop_params, self->params_size);
+    self->enabled = g->session_crop_enabled;
+    DT_ENTER_GUI_UPDATE();
+    dt_iop_gui_set_enable_button(self);
+    DT_LEAVE_GUI_UPDATE();
+    dt_dev_add_history_item(darktable.develop, self, FALSE);
+  }
+
+  g->clip_x = g->saved_x;
+  g->clip_y = g->saved_y;
+  g->clip_w = g->saved_w;
+  g->clip_h = g->saved_h;
+  g->cropping = GRAB_CENTER;
+  g->rotating = 0;
+  g->straightening = FALSE;
+  g->straighten_armed = FALSE;
+  /* a baseline-pending commit is confirmed work Escape must not undo:
+   * keep it armed, and keep the gui box (restored to the pending
+   * rectangle above) since reflecting pre-commit params over it would
+   * make the retry lose the edit */
+  if(!g->session_baseline_pending)
+  {
+    g->commit_pending = FALSE;
+    _crop_reflect_params(self);
   }
   dt_iop_request_focus(NULL);
 }
@@ -1556,6 +1954,11 @@ void gui_init(dt_iop_module_t *self)
   dt_shortcut_register(confirm, 0, 0, GDK_KEY_KP_Enter, 0);
   dt_action_register(DT_ACTION(self->so), N_("cancel"), _crop_cancel, GDK_KEY_Escape, 0);
 
+  /* Lightroom-style straighten ruler: arm here, then drag a line anywhere
+   * on the canvas; its angle is applied to rotate-and-perspective */
+  dt_iop_button_new(self, N_("straighten"), G_CALLBACK(_event_straighten_clicked),
+                    TRUE, 0, 0, NULL, 0, box_enabled);
+
   // we put margins values under an expander
   dt_gui_new_collapsible_section
     (&g->cs,
@@ -1615,6 +2018,8 @@ void gui_cleanup(dt_iop_module_t *self)
   dt_iop_crop_gui_data_t *g = self->gui_data;
   g_list_free_full(g->aspect_list, _aspect_free);
   g->aspect_list = NULL;
+  g_free(g->session_crop_params);
+  g_free(g->session_ashift_params);
 }
 
 static _grab_region_t _gui_get_grab(float pzx,
@@ -1675,6 +2080,31 @@ void gui_post_expose(dt_iop_module_t *self,
     return;
 
   _aspect_apply(self, GRAB_HORIZONTAL | GRAB_VERTICAL);
+
+  /* a commit deferred while the preview pipe was invalid is retried as
+   * soon as the pipe is usable again, unless a drag owns the rectangle
+   * (committing would record its intermediate state and reset its grab) */
+  if(g->commit_pending)
+  {
+    if(self->dev->image_storage.id != g->commit_imgid)
+      g->commit_pending = FALSE; // the request belonged to another image
+    else if(!_crop_drag_active(g)
+            && self->dev->preview_pipe->status == DT_DEV_PIXELPIPE_VALID)
+    {
+      g->commit_pending = FALSE;
+      dt_iop_module_t *old_gui = dev->gui_module;
+      dev->gui_module = self;
+      _commit_box(self, g, self->params, FALSE);
+      dev->gui_module = old_gui;
+      // re-anchor the crop baseline of a session that began mid-deferral
+      if(g->session_baseline_pending)
+      {
+        g->session_baseline_pending = FALSE;
+        memcpy(g->session_crop_params, self->params, self->params_size);
+        g->session_crop_enabled = self->enabled;
+      }
+    }
+  }
 
   // draw cropping window
   const double fillc = dimmed ? 0.9 : 0.2;
@@ -1819,6 +2249,16 @@ void gui_post_expose(dt_iop_module_t *self,
     cairo_rectangle(cr, g->clip_x * wd, (g->clip_y + g->clip_h) * ht - border,
                     border, border);
   cairo_stroke(cr);
+
+  // the armed straighten ruler line follows the pointer while dragging
+  if(g->straightening)
+  {
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(2.0) / zoom_scale);
+    dt_draw_set_color_overlay(cr, TRUE, 1.0);
+    cairo_move_to(cr, g->straighten_x * wd, g->straighten_y * ht);
+    cairo_line_to(cr, pzx * wd, pzy * ht);
+    cairo_stroke(cr);
+  }
 }
 
 int mouse_moved(dt_iop_module_t *self,
@@ -1840,6 +2280,38 @@ int mouse_moved(dt_iop_module_t *self,
     _gui_get_grab(pzx, pzy, g, DT_PIXEL_APPLY_DPI(30.0) / zoom_scale, wd, ht);
 
   _set_max_clip(self);
+
+  /* an in-progress rotation drag owns the pointer: measure the angle around
+   * the frame center in pixel units (nonsquare images would distort
+   * normalized coordinates) and unwrap across ±180° */
+  if(g->rotating
+     && !(darktable.control->button_down
+          && darktable.control->button_down_which == GDK_BUTTON_PRIMARY))
+    g->rotating = 0; // interrupted release: drop the gesture
+  if(g->rotating)
+  {
+    const float cx = (g->clip_x + 0.5f * g->clip_w) * wd;
+    const float cy = (g->clip_y + 0.5f * g->clip_h) * ht;
+    const float angle = atan2f(pzy * ht - cy, pzx * wd - cx);
+    float delta = angle - g->rot_angle;
+    if(delta > (float)M_PI)       delta -= 2.0f * (float)M_PI;
+    else if(delta < -(float)M_PI) delta += 2.0f * (float)M_PI;
+    g->rot_angle = angle;
+    _ashift_rotate_delta(g->rot_sign * rad2degf(delta));
+    dt_control_queue_redraw_center();
+    return 1;
+  }
+
+  // an armed ruler drag just follows the pointer; the line draws in expose
+  if(g->straightening
+     && !(darktable.control->button_down
+          && darktable.control->button_down_which == GDK_BUTTON_PRIMARY))
+    g->straightening = FALSE;
+  if(g->straightening)
+  {
+    dt_control_queue_redraw_center();
+    return 1;
+  }
 
   if(darktable.control->button_down && darktable.control->button_down_which == GDK_BUTTON_PRIMARY)
   {
@@ -2009,6 +2481,30 @@ int button_released(dt_iop_module_t *self,
   // we don't do anything if the image is not ready
   if(!g->preview_ready) return 0;
 
+  if(g->rotating)
+  {
+    // the rotation writes took the widget path and are already committed
+    g->rotating = 0;
+    dt_control_change_cursor("default");
+    return 1;
+  }
+
+  if(g->straightening)
+  {
+    g->straightening = FALSE;
+    g->straighten_armed = FALSE; // one-shot: the ruler disarms after a line
+    float wd, ht;
+    dt_dev_get_preview_size(self->dev, &wd, &ht);
+    const float angle = _straighten_angle(self, x, y,
+                                          g->straighten_x, g->straighten_y,
+                                          wd, ht, zoom_scale);
+    if(angle != 0.0f)
+      _ashift_rotate_delta(angle);
+    dt_control_change_cursor("default");
+    dt_control_queue_redraw_center();
+    return 1;
+  }
+
   /* reset internal ui states*/
   g->shift_hold = FALSE;
   g->ctrl_hold = FALSE;
@@ -2018,6 +2514,9 @@ int button_released(dt_iop_module_t *self,
 
   // we save the crop into the params now so params are kept in synch with gui settings
   _commit_box(self, g, p, FALSE);
+  // the commit is a silent no-op on an invalid pipe; retry when usable
+  if(self->dev->preview_pipe->status != DT_DEV_PIXELPIPE_VALID)
+    _commit_defer(self, g);
   return 1;
 }
 
@@ -2061,9 +2560,38 @@ int button_pressed(dt_iop_module_t *self,
     if(dt_modifiers_include(state, GDK_SHIFT_MASK)) g->shift_hold = TRUE;
     if(dt_modifiers_include(state, GDK_CONTROL_MASK)) g->ctrl_hold = TRUE;
 
+    /* the armed straighten ruler draws from anywhere on the canvas */
+    if(g->straighten_armed)
+    {
+      g->straightening = TRUE;
+      g->straighten_x = bzx;
+      g->straighten_y = bzy;
+      dt_control_change_cursor("crosshair");
+      return 1;
+    }
+
     /* store grabbed area */
 
     g->cropping = _gui_get_grab(bzx, bzy, g, DT_PIXEL_APPLY_DPI(30.0) / zoom_scale, wd, ht);
+
+    /* outside the frame: the corner band starts a rotation drag; anything
+     * farther out is left unhandled so darkroom panning keeps working */
+    if(g->cropping == GRAB_NONE)
+    {
+      const int corner = _rotation_grab(bzx, bzy, g, DT_PIXEL_APPLY_DPI(30.0) / zoom_scale, wd, ht);
+      /* declined: keep GRAB_NONE so the drag stays unhandled and darkroom
+       * pans; the retry guard treats GRAB_NONE as no-drag */
+      if(!corner) return 0;
+      g->rotating = corner;
+      const float rcx = (g->clip_x + 0.5f * g->clip_w) * wd;
+      const float rcy = (g->clip_y + 0.5f * g->clip_h) * ht;
+      g->rot_angle = atan2f(bzy * ht - rcy, bzx * wd - rcx);
+      // a mirrored pipe (flip sits between ashift and crop) reverses the
+      // angular direction on screen, so the drag delta is negated
+      g->rot_sign = _rotation_mirror_sign(self, rcx, rcy);
+      dt_control_change_cursor("crosshair");
+      return 1;
+    }
 
     if(g->cropping == GRAB_CENTER)
     {

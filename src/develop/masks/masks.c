@@ -345,12 +345,8 @@ gboolean dt_masks_iop_sync_localmask_mode(dt_iop_module_t *module)
   const uint32_t mode = grp->points
     ? DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
     : DEVELOP_MASK_ENABLED;
-  const uint32_t combine = module->blend_params->mask_combine
-                           & ~DEVELOP_COMBINE_MASKS_POS;
-  const gboolean changed = module->blend_params->mask_mode != mode
-                           || module->blend_params->mask_combine != combine;
+  const gboolean changed = module->blend_params->mask_mode != mode;
   module->blend_params->mask_mode = mode;
-  module->blend_params->mask_combine = combine;
   return changed;
 }
 
@@ -399,15 +395,106 @@ void dt_masks_register_forms(dt_develop_t *dev,
   dt_dev_add_masks_history_item(dev, NULL, TRUE);
 }
 
+static gboolean _unique_localmask_root(const dt_develop_t *dev,
+                                       const dt_iop_module_t *module,
+                                       const dt_mask_id_t rootid)
+{
+  if(!dev || !dt_is_valid_maskid(rootid) || !module || !module->blend_params
+     || !dt_iop_module_is(module, "localmask")
+     || module->blend_params->mask_id != rootid
+     || (module->blend_params->mask_combine & DEVELOP_COMBINE_MASKS_POS))
+    return FALSE;
+  const dt_masks_form_t *root = dt_masks_get_from_id(dev, rootid);
+  if(!root || root->type != DT_MASKS_GROUP || !root->points) return FALSE;
+  gboolean found = FALSE;
+  for(const GList *it = dev->iop; it; it = g_list_next(it))
+  {
+    const dt_iop_module_t *candidate = it->data;
+    if(!candidate->blend_params || candidate->blend_params->mask_id != rootid)
+      continue;
+    if(candidate != module || found) return FALSE;
+    found = TRUE;
+  }
+  return found;
+}
+
+static gboolean _unique_standard_root(const dt_develop_t *dev,
+                                      const dt_iop_module_t *module,
+                                      const dt_mask_id_t rootid)
+{
+  if(!dev || !dev->gui_attached || !module || !dt_is_valid_maskid(rootid)
+     || !module->blend_data || !module->blend_params
+     || dt_iop_module_is(module, "localmask")
+     || dt_iop_module_is(module, "magiceraser")
+     || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+     || (module->flags() & IOP_FLAGS_NO_MASKS) || !module->enabled
+     || !g_list_find(dev->iop, (gpointer)module)
+     || (module->blend_params->mask_mode & (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+                                           | DEVELOP_MASK_RASTER | DEVELOP_MASK_CONDITIONAL))
+          != (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK)
+     || (module->blend_params->mask_combine & DEVELOP_COMBINE_MASKS_POS)
+     || module->blend_params->mask_id != rootid)
+    return FALSE;
+
+  const dt_masks_form_t *root = dt_masks_get_from_id(dev, rootid);
+  if(!root || root->type != DT_MASKS_GROUP || !root->points) return FALSE;
+  for(const GList *it = root->points; it; it = g_list_next(it))
+  {
+    const dt_masks_point_group_t *member = it->data;
+    const dt_masks_form_t *child = member ? dt_masks_get_from_id(dev, member->formid) : NULL;
+    if(!child || (child->type & DT_MASKS_GROUP)) return FALSE;
+  }
+  for(const GList *it = dev->forms; it; it = g_list_next(it))
+  {
+    const dt_masks_form_t *parent = it->data;
+    if(parent == root || !(parent->type & DT_MASKS_GROUP)) continue;
+    for(const GList *points = parent->points; points; points = g_list_next(points))
+    {
+      const dt_masks_point_group_t *member = points->data;
+      if(member && member->formid == rootid) return FALSE;
+    }
+  }
+  for(const GList *it = dev->iop; it; it = g_list_next(it))
+  {
+    const dt_iop_module_t *candidate = it->data;
+    if(candidate != module && candidate->blend_params
+       && dt_masks_is_in_module(rootid, candidate))
+      return FALSE;
+  }
+  return TRUE;
+}
+
 void dt_masks_gui_form_save_creation(dt_develop_t *dev,
                                      dt_iop_module_t *module,
                                      dt_masks_form_t *form,
                                      dt_masks_form_gui_t *gui)
 {
+  const dt_mask_id_t subtract_parentid = gui ? gui->subtract_parentid : NO_MASKID;
+  const gboolean live_module = module && g_list_find(dev->iop, module);
+  if(dt_is_valid_maskid(subtract_parentid)
+     && (!live_module
+         || !(dt_iop_module_is(module, "localmask")
+                ? _unique_localmask_root(dev, module, subtract_parentid)
+                : _unique_standard_root(dev, module, subtract_parentid))))
+  {
+    // A failed Subtract must not silently become an additive shape.
+    dt_control_log(_("the target mask changed; subtraction was canceled"));
+    if(gui && !live_module) gui->creation_module = NULL;
+    dt_masks_cancel_creation();
+    if(dev->form_visible == form) dt_masks_change_form_gui(NULL);
+    if(gui) gui->formid = 0;
+    dt_masks_free_form(form);
+    return;
+  }
+
   // we check if the id is already registered
   _check_id(form);
 
-  if(gui) gui->creation = FALSE;
+  if(gui)
+  {
+    gui->creation = FALSE;
+    gui->subtract_parentid = NO_MASKID;
+  }
 
   // mask nb will be at least the length of the list
   guint nb = 0;
@@ -449,6 +536,14 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
   {
     // is there already a masks group for this module ?
     dt_masks_form_t *grp = _group_from_module(dev, module);
+    const gboolean subtract = dt_is_valid_maskid(subtract_parentid)
+      && grp && (grp->type & DT_MASKS_GROUP) && grp->points
+      && grp->formid == subtract_parentid
+      && (dt_iop_module_is(module, "localmask")
+            ? _unique_localmask_root(dev, module, subtract_parentid)
+            : _unique_standard_root(dev, module, subtract_parentid));
+    if(dt_is_valid_maskid(subtract_parentid) && !subtract)
+      dt_control_log(_("the target mask changed; the new shape was added normally"));
     if(!grp)
     {
       // we create a new group
@@ -464,7 +559,9 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
     grpt->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE;
     if(grp->points)
     {
-      if(form->type & DT_MASKS_BRUSH)
+      if(subtract)
+        grpt->state |= DT_MASKS_STATE_DIFFERENCE;
+      else if(form->type & DT_MASKS_BRUSH)
         grpt->state |= DT_MASKS_STATE_SUM;
       else
         grpt->state |= DT_MASKS_STATE_UNION;
@@ -474,7 +571,6 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
     if(dt_iop_module_is(module, "localmask"))
     {
       module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
-      module->blend_params->mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
     }
     // we save the completed shape and its owner group
     dt_dev_add_masks_history_item(dev, module, TRUE);
@@ -492,12 +588,10 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
   if(gui) dev->form_gui->formid = form->formid;
 }
 
-int dt_masks_form_duplicate(dt_develop_t *dev, const dt_mask_id_t formid)
+static void _duplicate_form_content(dt_develop_t *dev,
+                                    dt_masks_form_t *fbase,
+                                    dt_masks_form_t *fdest)
 {
-  // we create a new empty form
-  dt_masks_form_t *fbase = dt_masks_get_from_id(dev, formid);
-  if(!fbase) return -1;
-  dt_masks_form_t *fdest = dt_masks_create(fbase->type);
   _check_id(fdest);
 
   // we copy the base values
@@ -512,6 +606,25 @@ int dt_masks_form_duplicate(dt_develop_t *dev, const dt_mask_id_t formid)
   // we copy all the points
   if(fbase->functions && fbase->functions->duplicate_points)
     fbase->functions->duplicate_points(dev, fbase, fdest);
+}
+
+int dt_masks_form_duplicate(dt_develop_t *dev, const dt_mask_id_t formid)
+{
+  // we create a new empty form
+  dt_masks_form_t *fbase = dt_masks_get_from_id(dev, formid);
+  if(!fbase) return -1;
+  dt_masks_form_t *fdest = dt_masks_create(fbase->type);
+
+  // A group recursively duplicates children and records their history, so it
+  // cannot hold this lock across duplicate_points. Leaf list mutations can.
+  if(fbase->type & DT_MASKS_GROUP)
+    _duplicate_form_content(dev, fbase, fdest);
+  else
+  {
+    dt_pthread_mutex_lock(&dev->history_mutex);
+    _duplicate_form_content(dev, fbase, fdest);
+    dt_pthread_mutex_unlock(&dev->history_mutex);
+  }
 
   // we save the form
   dt_dev_add_masks_history_item(dev, NULL, TRUE);
@@ -1274,6 +1387,8 @@ gboolean dt_masks_events_mouse_leave(dt_iop_module_t *module)
     dt_masks_get_image_size(&wd, &ht, NULL, NULL);
     gui->posx = (.5f + zoom_x) * wd;
     gui->posy = (.5f + zoom_y) * ht;
+    if(gui->ellipse_rotation_selected) dt_control_change_cursor("default");
+    gui->ellipse_rotation_selected = FALSE;
 
     dt_control_hinter_message("");
   }
@@ -1293,6 +1408,7 @@ static gboolean _gui_hover_state_equal(const dt_masks_form_gui_t *a,
   return a->form_selected == b->form_selected
     && a->border_selected == b->border_selected
     && a->source_selected == b->source_selected
+    && a->ellipse_rotation_selected == b->ellipse_rotation_selected
     && a->pivot_selected == b->pivot_selected
     && a->select_only_border == b->select_only_border
     && a->point_selected == b->point_selected
@@ -1389,6 +1505,7 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
 
   dt_masks_form_gui_t before = { 0 };
   if(gui) before = *gui;
+  if(gui) gui->ellipse_rotation_selected = FALSE;
 
   int rep = 0;
   if(form && form->functions)
@@ -1397,6 +1514,9 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
   form = darktable.develop->form_visible;
   gui = darktable.develop->form_gui;
   _events_unlock(darktable.develop);
+
+  if(gui && before.ellipse_rotation_selected != gui->ellipse_rotation_selected)
+    dt_control_change_cursor(gui->ellipse_rotation_selected ? "exchange" : "default");
 
   // brushes, paths and groups don't redraw for plain hovering (a long
   // brush or path takes long enough to draw that redrawing on every
@@ -1429,6 +1549,7 @@ gboolean dt_masks_events_button_released(dt_iop_module_t *module,
   gboolean ret = FALSE;
   if(form && form->functions)
   {
+    const gboolean was_ellipse_rotation = gui && gui->ellipse_rotation_selected;
     // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
     // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
     _events_lock(dev);
@@ -1439,6 +1560,8 @@ gboolean dt_masks_events_button_released(dt_iop_module_t *module,
     if(form && gui && form->functions && form->functions->mouse_moved)
       form->functions->mouse_moved(module, pzx, pzy, 0, which, zoom_scale, form, 0, gui, 0);
     _events_unlock(dev);
+    if(gui && was_ellipse_rotation != gui->ellipse_rotation_selected)
+      dt_control_change_cursor(gui->ellipse_rotation_selected ? "exchange" : "default");
     // mouse_moved() no longer redraws for hovering, see dt_masks_events_mouse_moved()
     dt_control_queue_redraw_center();
   }
@@ -1599,6 +1722,7 @@ void dt_masks_events_post_expose(const dt_iop_module_t *module,
 void dt_masks_clear_form_gui(const dt_develop_t *dev)
 {
   if(!dev->form_gui) return;
+  if(dev->form_gui->ellipse_rotation_selected) dt_control_change_cursor("default");
   if(dev->form_gui->scratchpad_cleanup)
   {
     dev->form_gui->scratchpad_cleanup(dev->form_gui);
@@ -1618,6 +1742,7 @@ void dt_masks_clear_form_gui(const dt_develop_t *dev)
   dev->form_gui->form_selected = dev->form_gui->border_selected =
     dev->form_gui->form_dragging = dev->form_gui->form_rotating =
     dev->form_gui->border_toggling = dev->form_gui->gradient_toggling = FALSE;
+  dev->form_gui->ellipse_rotation_selected = FALSE;
   dev->form_gui->source_selected = dev->form_gui->source_dragging = FALSE;
   dev->form_gui->source_rotating = dev->form_gui->counter_rotate_source = FALSE;
   dev->form_gui->rotate_about_source = FALSE;
@@ -1629,6 +1754,7 @@ void dt_masks_clear_form_gui(const dt_develop_t *dev)
   dev->form_gui->creation_closing_form = dev->form_gui->creation = FALSE;
   dev->form_gui->pressure_sensitivity = DT_MASKS_PRESSURE_OFF;
   dev->form_gui->creation_module = NULL;
+  dev->form_gui->subtract_parentid = NO_MASKID;
   dev->form_gui->point_edited = -1;
 
   dev->form_gui->group_edited = -1;
@@ -1666,6 +1792,7 @@ gboolean dt_masks_cancel_creation(void)
   if(!gui || !gui->creation) return FALSE;
 
   dt_iop_module_t *module = gui->creation_module;
+  gui->subtract_parentid = NO_MASKID;
   dt_masks_brush_arm_new_component();
   gui->creation_continuous = FALSE;
   gui->creation_continuous_module = NULL;

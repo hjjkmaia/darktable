@@ -23,6 +23,7 @@
 #include "common/collection.h"
 #include "common/colorlabels.h"
 #include "common/debug.h"
+#include "common/dtdata.h"
 #include "common/history.h"
 #include "common/image_cache.h"
 #include "common/ratings.h"
@@ -3312,17 +3313,29 @@ static void _accel_hist_discard(dt_action_t *action)
 
 static void _accel_duplicate(dt_action_t *action)
 {
-  dt_undo_start_group(darktable.undo, DT_UNDO_DUPLICATE);
-
   const dt_imgid_t sourceid = dt_act_on_get_main_image();
+  const gboolean with_history = !strcmp(action->id, "duplicate image");
+  if(with_history && !dt_dtdata_history_copyable(sourceid))
+  {
+    dt_control_log(_("history-preserving copy is unavailable for raster sidecars or missing raster data"));
+    return;
+  }
+
+  dt_undo_start_group(darktable.undo, DT_UNDO_DUPLICATE);
   const dt_imgid_t newimgid = dt_image_duplicate(sourceid);
   if(!dt_is_valid_imgid(newimgid))
+  {
+    dt_undo_end_group(darktable.undo);
     return;
+  }
 
-  if(strcmp(action->id, "duplicate image"))
+  if(!with_history)
     dt_history_delete_on_image(newimgid);
-  else
-    dt_history_copy_and_paste_on_image(sourceid, newimgid, FALSE, NULL, TRUE, TRUE, TRUE);
+  else if(!dt_history_copy_and_paste_on_image(sourceid, newimgid, FALSE, NULL, TRUE, TRUE, TRUE))
+  {
+    dt_undo_end_group(darktable.undo);
+    return;
+  }
 
   // a duplicate should keep the change time stamp of the original
   dt_image_cache_set_change_timestamp_from_image(newimgid, sourceid);

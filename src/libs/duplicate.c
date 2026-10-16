@@ -20,12 +20,14 @@
 #include "common/collection.h"
 #include "common/darktable.h"
 #include "common/debug.h"
+#include "common/dtdata.h"
 #include "common/history.h"
 #include "common/image.h"
 #include "common/metadata.h"
 #include "common/mipmap_cache.h"
 #include "common/selection.h"
 #include "common/styles.h"
+#include "common/undo.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -114,13 +116,29 @@ static void _lib_duplicate_original(const dt_imgid_t imgid)
 // create a duplicate of imgid with the same history stack
 static void _lib_duplicate_duplicate(const dt_imgid_t imgid)
 {
+  if(!dt_dtdata_history_copyable(imgid))
+  {
+    dt_control_log(_("history-preserving copy is unavailable for raster sidecars or missing raster data"));
+    return;
+  }
+  // Keep the duplicate and its copied history in one Undo step. Redo must
+  // recreate the image row before the history snapshot is applied to it.
+  dt_undo_start_group(darktable.undo, DT_UNDO_DUPLICATE);
   const dt_imgid_t newid = dt_image_duplicate(imgid);
   if(!dt_is_valid_imgid(newid))
+  {
+    dt_undo_end_group(darktable.undo);
     return;
-  dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE);
+  }
+  if(!dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE))
+  {
+    dt_undo_end_group(darktable.undo);
+    return;
+  }
+  dt_undo_end_group(darktable.undo);
+  // keep the current image active; switching images clears the duplicate undo group
   dt_collection_update_query(darktable.collection,
                              DT_COLLECTION_CHANGE_RELOAD, DT_COLLECTION_PROP_UNDEF, NULL);
-  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE, newid);
 }
 
 // per-row buttons: act on the duplicate the button belongs to

@@ -248,6 +248,19 @@ typedef struct dt_develop_t
   // all forms to be linked here for cleanup:
   GList *allforms;
 
+  // Mask manager's display-only overlay state. It is never written to history
+  // or used by an export pixelpipe.
+  dt_mask_id_t mask_overlay_hover_id;
+  dt_mask_id_t mask_overlay_hover_group_id;
+  uint32_t mask_overlay_hover_state;
+  struct dt_iop_module_t *mask_overlay_hover_owner;
+  dt_mask_id_t mask_overlay_selected_id;
+  dt_mask_id_t mask_overlay_selected_group_id;
+  uint32_t mask_overlay_selected_state;
+  struct dt_iop_module_t *mask_overlay_selected_owner;
+  dt_imgid_t mask_overlay_imgid;
+  gboolean mask_overlay_show;
+
   //full preview stuff
   gboolean full_preview;
   dt_dev_zoom_t full_preview_last_zoom;
@@ -321,9 +334,17 @@ typedef struct dt_develop_t
       /* select the existing owner of a mask-manager row, or clear an ambiguous owner */
       void (*select_mask)(struct dt_lib_module_t *self,
                           struct dt_iop_module_t *owner);
+      /* duplicate a complete local adjustment with independent shapes and sinks */
+      struct dt_iop_module_t *(*duplicate_mask)(struct dt_lib_module_t *self,
+                                                struct dt_iop_module_t *owner,
+                                                gboolean invert);
       /* confirm if needed, then return the mask that owns the new shape.
        * NULL means the user cancelled and no shape should be created. */
       struct dt_iop_module_t *(*begin_shape)(struct dt_lib_module_t *self);
+      /* keep creation and its final module write in one Undo for Subtract */
+      gboolean (*hold_shape_undo)(struct dt_lib_module_t *self,
+                                  struct dt_iop_module_t *owner,
+                                  const dt_mask_id_t parentid);
       /* the shape was saved into the mask */
       void (*shape_committed)(struct dt_lib_module_t *self);
       /* shape creation was cancelled before a shape existed */

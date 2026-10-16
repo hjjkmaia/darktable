@@ -13,7 +13,19 @@ opening the page that documents it.
 The [Developer's guide](https://github.com/darktable-org/darktable/wiki/Developer's-guide)
 has the coding style, and [CONTRIBUTING.md](CONTRIBUTING.md) the social side.
 
-## The one rule that matters most
+## Project priority: check Lightroom before designing behavior
+
+Before planning, refining, or implementing any feature or workflow in this
+Lightroom-style fork, check how current Adobe Lightroom Classic handles the
+equivalent workflow. Start with current Adobe guidance; inspect the actual
+interaction or an authoritative demonstration when pointer, keyboard, or
+on-screen feedback details matter. Record the relevant behavior and source,
+then decide what to match or intentionally change in darktable. If Lightroom
+has no equivalent, say so before designing the new behavior. Keep this check
+focused and proportional; a small change does not need a prolonged audit.
+After implementation, verify the affected behavior in the scratch app.
+
+## Build integrity
 
 **Every commit must compile on its own.**
 

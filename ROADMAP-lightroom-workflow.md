@@ -383,7 +383,7 @@ bring work over with `git cherry-pick <commits>` onto
 | Stage M: Lightroom-style masks | **M1 and M2 landed.** Panel lists adjustments and sliders; drawing uses the existing mask manager after focus. On-screen check still needed | `92edbe0af`, `0e6e8e3e3` |
 | Stage 3: parametric switch, re-import, detail | landed. Parametric highlights 100 becomes `paramcurve` 1.0. Re-import replaces `lr-import` rows. Sharpness → `sharpen`, NR → `nlmeans` because `denoiseprofile` is not auto-applied and has no luma/chroma fields. D Auto tone still waiting on a screen check of C | `8130ff879`, `91b9ed6de`, `10deb2424` |
 | C before/after | landed. `\` shows the first-open prefix (exposure +0.7 and the tone mapper), not an empty history. On-screen toggle still needs a look | `82dd9a35f` |
-| Stage 2: B Lightroom XMP import | landed. D1–D9 and D14. D10 white balance not implemented. Headless `history` now opens the darkroom path. Negative Blacks can fall outside sigmoid's black-target range and are left at the default | `4840fc098`, `a42a9ca52`, `1022882cc` |
+| Stage 2: B Lightroom XMP import | landed. D1–D10 and D14. White balance adds (Temperature - 5500) K to the as-shot CCT, with a small tint, on color calibration. Headless `history` now opens the darkroom path. Negative Blacks can fall outside sigmoid's black-target range and are left at the default | `4840fc098`, `a42a9ca52`, `1022882cc`, `d72eb3ee8a` |
 | Stage 2: A parametric curve | landed. Peak is the largest monotonic value (~0.016); calibrate against Lightroom later | `312e3f229` |
 | Stage 4: integration, verification matrix, docs | waiting | - |
 | Remaining backlog (section 12) | not scheduled | - |

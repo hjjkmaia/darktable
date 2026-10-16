@@ -1265,7 +1265,8 @@ static dt_iop_module_t *_module_search_best(const gchar *query, int *out_score, 
       modules = g_list_next(modules))
   {
     dt_iop_module_t *module = modules->data;
-    if(!module || dt_iop_is_hidden(module) || !module->expander) continue;
+    if(!module || dt_iop_is_hidden(module) || !module->expander
+       || dt_iop_module_is(module, "localmask")) continue;
     if(module->iop_order == INT_MAX) continue;
     if(dt_iop_is_local_sink(module)) continue;
     if((module->flags() & IOP_FLAGS_DEPRECATED) && !module->enabled) continue;
@@ -1344,6 +1345,14 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
 
       /* skip modules without an gui */
       if(dt_iop_is_hidden(module)) continue;
+
+      /* Local Adjustments owns this mask source's visible controls. Keep its
+       * GUI and focus alive for mask editing, but omit the duplicate expander. */
+      if(dt_iop_module_is(module, "localmask"))
+      {
+        if(w) gtk_widget_hide(w);
+        continue;
+      }
 
       /* a local-mask sink stays in the pipe and in history, not in this list */
       if(dt_iop_is_local_sink(module))

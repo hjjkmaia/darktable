@@ -23,6 +23,8 @@
 #include "common/image.h"
 #include "common/image_cache.h"
 #include "common/math.h"
+#include "develop/develop.h"
+#include "views/view.h"
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -32,12 +34,15 @@
 #include <setjmp.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 // the format version written into every new file
 #define DTDATA_VERSION "1\n"
 #define DTDATA_VERSION_ENTRY "version"
 // well above any sensor; a mask larger than the image has no use
 #define DTDATA_MAX_PIXELS ((size_t)256 << 20)
+// color patches are cropped to the edit. Bound their decoded float buffer.
+#define DTDATA_MAX_RGBA_PIXELS ((size_t)16 << 20)
 
 // larger than any mask we would store; a bigger entry is damage, not data
 #define DTDATA_MAX_ENTRY_SIZE ((int64_t)256 << 20)
@@ -84,6 +89,75 @@ int dt_dtdata_entry_kind(const char *entry)
 gboolean dt_dtdata_enabled(void)
 {
   return dt_image_get_xmp_mode() != DT_WRITE_XMP_NEVER;
+}
+
+gboolean dt_dtdata_file_source_sha256(const char *path,
+                                      char out[DT_DTDATA_SOURCE_SHA256_LEN])
+{
+  if(!out) return FALSE;
+  out[0] = '\0';
+  if(!path || !path[0]) return FALSE;
+
+  FILE *f = g_fopen(path, "rb");
+  if(!f) return FALSE;
+  struct stat before = { 0 }, after = { 0 }, path_after = { 0 };
+  gboolean ok = fstat(fileno(f), &before) == 0 && S_ISREG(before.st_mode);
+  GChecksum *checksum = ok ? g_checksum_new(G_CHECKSUM_SHA256) : NULL;
+  ok = ok && checksum != NULL;
+  guchar buffer[64 * 1024];
+  while(ok)
+  {
+    const size_t n = fread(buffer, 1, sizeof(buffer), f);
+    if(n) g_checksum_update(checksum, buffer, n);
+    if(n < sizeof(buffer))
+    {
+      if(ferror(f)) ok = FALSE;
+      break;
+    }
+  }
+  if(ok)
+    ok = fstat(fileno(f), &after) == 0
+         && g_stat(path, &path_after) == 0
+         && before.st_dev == after.st_dev
+         && before.st_ino == after.st_ino
+         && before.st_size == after.st_size
+         && before.st_mtime == after.st_mtime
+         && before.st_ctime == after.st_ctime
+         && before.st_dev == path_after.st_dev
+         && before.st_ino == path_after.st_ino
+         && before.st_size == path_after.st_size
+         && before.st_mtime == path_after.st_mtime
+         && before.st_ctime == path_after.st_ctime;
+#if defined(__APPLE__)
+  if(ok)
+    ok = before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec
+         && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec
+         && before.st_mtimespec.tv_nsec == path_after.st_mtimespec.tv_nsec
+         && before.st_ctimespec.tv_nsec == path_after.st_ctimespec.tv_nsec;
+#elif defined(__linux__)
+  if(ok)
+    ok = before.st_mtim.tv_nsec == after.st_mtim.tv_nsec
+         && before.st_ctim.tv_nsec == after.st_ctim.tv_nsec
+         && before.st_mtim.tv_nsec == path_after.st_mtim.tv_nsec
+         && before.st_ctim.tv_nsec == path_after.st_ctim.tv_nsec;
+#endif
+  if(fclose(f) != 0) ok = FALSE;
+  if(ok)
+    g_strlcpy(out, g_checksum_get_string(checksum), DT_DTDATA_SOURCE_SHA256_LEN);
+  if(checksum) g_checksum_free(checksum);
+  return ok;
+}
+
+gboolean dt_dtdata_source_sha256(const dt_imgid_t imgid,
+                                 char out[DT_DTDATA_SOURCE_SHA256_LEN])
+{
+  if(!out) return FALSE;
+  out[0] = '\0';
+  if(!dt_is_valid_imgid(imgid)) return FALSE;
+  char path[PATH_MAX] = { 0 };
+  gboolean from_cache = TRUE;
+  dt_image_full_path(imgid, path, sizeof(path), &from_cache);
+  return dt_dtdata_file_source_sha256(path, out);
 }
 
 void dt_dtdata_path_for_image(const char *versioned_image_path,
@@ -168,6 +242,61 @@ static GBytes *_encode_gray_png(const float *mask,
     else
     {
       for(int x = 0; x < width; x++) row[x] = (uint8_t)(CLIP(in[x]) * 255.0f + 0.5f);
+    }
+    png_write_row(png, row);
+  }
+  png_write_end(png, NULL);
+  png_destroy_write_struct(&png, &info);
+  g_free(row);
+  return g_byte_array_free_to_bytes(out);
+}
+
+static GBytes *_encode_rgba_png(const float *rgba,
+                                const int width,
+                                const int height,
+                                const int bpc)
+{
+  png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if(!png) return NULL;
+  png_infop info = png_create_info_struct(png);
+  if(!info)
+  {
+    png_destroy_write_struct(&png, NULL);
+    return NULL;
+  }
+
+  GByteArray *out = g_byte_array_new();
+  uint8_t *row = g_malloc((size_t)width * 4 * (bpc / 8));
+  if(setjmp(png_jmpbuf(png)))
+  {
+    png_destroy_write_struct(&png, &info);
+    g_byte_array_unref(out);
+    g_free(row);
+    return NULL;
+  }
+
+  png_set_write_fn(png, out, _png_write_cb, _png_flush_cb);
+  png_set_IHDR(png, info, width, height, bpc, PNG_COLOR_TYPE_RGBA,
+               PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+               PNG_FILTER_TYPE_DEFAULT);
+  png_write_info(png, info);
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+  if(bpc == 16) png_set_swap(png);
+#endif
+
+  for(int y = 0; y < height; y++)
+  {
+    const float *in = rgba + (size_t)y * width * 4;
+    if(bpc == 16)
+    {
+      uint16_t *r = (uint16_t *)row;
+      for(size_t x = 0; x < (size_t)width * 4; x++)
+        r[x] = (uint16_t)(CLIP(in[x]) * 65535.0f + 0.5f);
+    }
+    else
+    {
+      for(size_t x = 0; x < (size_t)width * 4; x++)
+        row[x] = (uint8_t)(CLIP(in[x]) * 255.0f + 0.5f);
     }
     png_write_row(png, row);
   }
@@ -268,6 +397,81 @@ static float *_decode_gray_png(const uint8_t *data,
   return mask;
 }
 
+static float *_decode_rgba_png(const uint8_t *data,
+                               const size_t len,
+                               int *width,
+                               int *height,
+                               int *bpc)
+{
+  if(len < 8 || png_sig_cmp(data, 0, 8)) return NULL;
+
+  png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if(!png) return NULL;
+  png_infop info = png_create_info_struct(png);
+  if(!info)
+  {
+    png_destroy_read_struct(&png, NULL, NULL);
+    return NULL;
+  }
+
+  _png_mem_t mem = { data, len, 0 };
+  uint8_t *volatile row = NULL;
+  float *volatile rgba = NULL;
+  if(setjmp(png_jmpbuf(png)))
+  {
+    png_destroy_read_struct(&png, &info, NULL);
+    dt_free_align(row);
+    dt_free_align(rgba);
+    return NULL;
+  }
+
+  png_set_read_fn(png, &mem, _png_read_cb);
+  png_set_user_limits(png, 32768, 32768);
+  png_read_info(png, info);
+
+  png_uint_32 w = 0, h = 0;
+  int depth = 0, color = 0;
+  png_get_IHDR(png, info, &w, &h, &depth, &color, NULL, NULL, NULL);
+  if(color != PNG_COLOR_TYPE_RGBA || (depth != 8 && depth != 16)
+     || (size_t)w * h > DTDATA_MAX_RGBA_PIXELS)
+  {
+    png_destroy_read_struct(&png, &info, NULL);
+    return NULL;
+  }
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+  if(depth == 16) png_set_swap(png);
+#endif
+  png_read_update_info(png, info);
+  const size_t rowbytes = png_get_rowbytes(png, info);
+  if(rowbytes != (size_t)w * 4 * (depth / 8))
+  {
+    png_destroy_read_struct(&png, &info, NULL);
+    return NULL;
+  }
+
+  row = dt_alloc_aligned(rowbytes);
+  rgba = dt_alloc_align_float((size_t)w * h * 4);
+  if(!row || !rgba) png_error(png, "out of memory");
+
+  const float norm = depth == 16 ? 1.0f / 65535.0f : 1.0f / 255.0f;
+  for(png_uint_32 y = 0; y < h; y++)
+  {
+    png_read_row(png, row, NULL);
+    float *out = rgba + (size_t)y * w * 4;
+    if(depth == 16)
+      for(size_t x = 0; x < (size_t)w * 4; x++) out[x] = ((const uint16_t *)row)[x] * norm;
+    else
+      for(size_t x = 0; x < (size_t)w * 4; x++) out[x] = row[x] * norm;
+  }
+  png_read_end(png, NULL);
+  png_destroy_read_struct(&png, &info, NULL);
+  dt_free_align(row);
+  *width = (int)w;
+  *height = (int)h;
+  *bpc = depth;
+  return rgba;
+}
+
 // --- zip ---
 
 static gboolean _write_entry(struct archive *w,
@@ -337,8 +541,10 @@ static gboolean _read_entry_data(struct archive *r,
   size_t sz = 0;
   int64_t off = 0;
   int rc;
+  gboolean warned = FALSE;
   while((rc = archive_read_data_block(r, &blk, &sz, &off)) == ARCHIVE_OK || rc == ARCHIVE_WARN)
   {
+    if(rc == ARCHIVE_WARN) warned = TRUE;
     if((int64_t)buf->len + (int64_t)sz > DTDATA_MAX_ENTRY_SIZE)
     {
       dt_print(DT_DEBUG_ALWAYS, "[dtdata] entry '%s' is larger than 256 MB, refused", n);
@@ -348,7 +554,115 @@ static gboolean _read_entry_data(struct archive *r,
   }
   if(rc != ARCHIVE_EOF)
     dt_print(DT_DEBUG_ALWAYS, "[dtdata] cannot read entry '%s': %s", n, _archive_err(r));
-  return rc == ARCHIVE_EOF;
+  return rc == ARCHIVE_EOF && !warned;
+}
+
+static uint16_t _zip_u16(const unsigned char *p)
+{
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t _zip_u32(const unsigned char *p)
+{
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// libarchive streams local ZIP headers, and may report EOF after a damaged
+// local header even when the central directory survived. Verify that the
+// central directory is structurally complete and names exactly the entries
+// the streaming reader saw before replacing any sidecar.
+static gboolean _zip_central_matches(const char *path, GHashTable *streamed)
+{
+  FILE *f = g_fopen(path, "rb");
+  if(!f) return FALSE;
+  gboolean valid = FALSE;
+  if(fseek(f, 0, SEEK_END) == 0)
+  {
+    const long size = ftell(f);
+    if(size >= 22)
+    {
+      const size_t tail = MIN((size_t)size, (size_t)22 + 65535);
+      unsigned char *buf = g_malloc(tail);
+      if(fseek(f, size - (long)tail, SEEK_SET) == 0
+         && fread(buf, 1, tail, f) == tail)
+      {
+        for(size_t i = tail - 22; ; i--)
+        {
+          if(!memcmp(buf + i, "PK\005\006", 4))
+          {
+            const size_t comment = _zip_u16(buf + i + 20);
+            if(i + 22 + comment == tail)
+            {
+              const uint16_t count = _zip_u16(buf + i + 10);
+              const uint32_t cd_size = _zip_u32(buf + i + 12);
+              const uint32_t cd_offset = _zip_u32(buf + i + 16);
+              const size_t eocd_at = (size_t)size - tail + i;
+              // Sidecars are ordinary single-disk ZIPs. Reject ZIP64 rather
+              // than accepting a directory whose real extent is unknown.
+              if(_zip_u16(buf + i + 4) == 0 && _zip_u16(buf + i + 6) == 0
+                 && _zip_u16(buf + i + 8) == count
+                 && count != UINT16_MAX && cd_size != UINT32_MAX
+                 && cd_offset != UINT32_MAX
+                 && (uint64_t)cd_offset + cd_size == eocd_at
+                 && (!streamed || g_hash_table_size(streamed) == count)
+                 && fseek(f, cd_offset, SEEK_SET) == 0)
+              {
+                GHashTable *central = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+                valid = TRUE;
+                for(uint16_t j = 0; valid && j < count; j++)
+                {
+                  unsigned char header[46];
+                  valid = fread(header, 1, sizeof(header), f) == sizeof(header)
+                          && !memcmp(header, "PK\001\002", 4);
+                  if(!valid) break;
+                  const uint16_t nlen = _zip_u16(header + 28);
+                  const uint16_t extra = _zip_u16(header + 30);
+                  const uint16_t note = _zip_u16(header + 32);
+                  const uint32_t local = _zip_u32(header + 42);
+                  if(!nlen || local >= cd_offset) { valid = FALSE; break; }
+                  char *name = g_malloc((size_t)nlen + 1);
+                  valid = fread(name, 1, nlen, f) == nlen;
+                  name[nlen] = '\0';
+                  valid = valid && !memchr(name, '\0', nlen)
+                          && (!streamed || g_hash_table_contains(streamed, name))
+                          && !g_hash_table_contains(central, name)
+                          && fseek(f, (long)extra + note, SEEK_CUR) == 0;
+                  if(valid) g_hash_table_add(central, name);
+                  else g_free(name);
+                }
+                valid = valid && ftell(f) == (long)((uint64_t)cd_offset + cd_size);
+                g_hash_table_unref(central);
+                if(valid) break;
+              }
+            }
+          }
+          if(i == 0) break;
+        }
+      }
+      g_free(buf);
+    }
+  }
+  if(fclose(f) != 0) valid = FALSE;
+  return valid;
+}
+
+static gboolean _entry_matches_bytes(const char *name,
+                                     const void *bytes,
+                                     const size_t len)
+{
+  if(!name || !name[0] || strchr(name, '/') || strchr(name, '\\')) return FALSE;
+  if(!strcmp(name, DTDATA_VERSION_ENTRY))
+    return len == strlen(DTDATA_VERSION)
+           && !memcmp(bytes, DTDATA_VERSION, len);
+  const int kind = dt_dtdata_entry_kind(name);
+  if(kind < 0) return TRUE; // preserve entries from a newer producer
+  gchar *sha = g_compute_checksum_for_data(G_CHECKSUM_SHA1, bytes, len);
+  gchar *expected = g_strdup_printf("%s-%s.png", _kind_prefix(kind), sha);
+  const gboolean valid = !strcmp(name, expected);
+  g_free(expected);
+  g_free(sha);
+  return valid;
 }
 
 // copy the zip to a temp file without the entries in drop, adding name if
@@ -360,6 +674,8 @@ static gboolean _zip_rewrite(const char *path,
                              const size_t len)
 {
   gboolean ok = FALSE;
+  if(g_file_test(path, G_FILE_TEST_EXISTS) && !_zip_central_matches(path, NULL))
+    return FALSE;
   gchar *tmp = g_strdup_printf("%s.tmp", path);
 
   FILE *wf = g_fopen(tmp, "wb");
@@ -386,6 +702,7 @@ static gboolean _zip_rewrite(const char *path,
   gboolean have_version = FALSE, have_entry = FALSE, copy_ok = TRUE;
   if(g_file_test(path, G_FILE_TEST_EXISTS))
   {
+    GHashTable *seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     struct archive *r = archive_read_new();
     FILE *rf = _zip_open_read(r, path);
     if(rf)
@@ -395,17 +712,24 @@ static gboolean _zip_rewrite(const char *path,
       while(copy_ok && _next_header(r, &e, &rc))
       {
         const char *n = archive_entry_pathname(e);
-        if(!n) continue;
+        if(rc != ARCHIVE_OK || !n || g_hash_table_contains(seen, n))
+        {
+          copy_ok = FALSE;
+          break;
+        }
+        g_hash_table_add(seen, g_strdup(n));
         if(!strcmp(n, DTDATA_VERSION_ENTRY)) have_version = TRUE;
         if(name && !strcmp(n, name)) have_entry = TRUE;
         if(g_list_find_custom((GList *)drop, n, (GCompareFunc)g_strcmp0))
         {
-          archive_read_data_skip(r);
+          copy_ok = archive_read_data_skip(r) == ARCHIVE_OK;
           continue;
         }
 
         GByteArray *buf = g_byte_array_new();
-        copy_ok = _read_entry_data(r, e, buf) && _write_entry(w, n, buf->data, buf->len);
+        copy_ok = _read_entry_data(r, e, buf)
+                  && _entry_matches_bytes(n, buf->data, buf->len)
+                  && _write_entry(w, n, buf->data, buf->len);
         g_byte_array_unref(buf);
       }
       if(copy_ok && rc != ARCHIVE_EOF)
@@ -413,12 +737,14 @@ static gboolean _zip_rewrite(const char *path,
         dt_print(DT_DEBUG_ALWAYS, "[dtdata] cannot read '%s': %s", path, _archive_err(r));
         copy_ok = FALSE;
       }
-      archive_read_close(r);
+      if(archive_read_close(r) != ARCHIVE_OK) copy_ok = FALSE;
     }
     else
       copy_ok = FALSE;
     archive_read_free(r);
-    if(rf) fclose(rf);
+    if(rf && fclose(rf) != 0) copy_ok = FALSE;
+    if(copy_ok && !_zip_central_matches(path, seen)) copy_ok = FALSE;
+    g_hash_table_unref(seen);
   }
 
   if(copy_ok && !have_version)
@@ -622,13 +948,57 @@ gboolean dt_dtdata_file_write_gray(const char *path,
   return TRUE;
 }
 
-float *dt_dtdata_file_read_gray(const char *path,
-                                const dt_dtdata_ref_t *ref,
-                                int *width,
-                                int *height)
+gboolean dt_dtdata_file_write_rgba(const char *path,
+                                   const char *producer,
+                                   const float *rgba,
+                                   const int width,
+                                   const int height,
+                                   const int bpc,
+                                   dt_dtdata_ref_t *ref)
 {
-  *width = *height = 0;
-  if(!path || !ref || !ref->entry[0]) return NULL;
+  if(!path || !rgba || width <= 0 || height <= 0
+     || width > 32768 || height > 32768
+     || (size_t)width * height > DTDATA_MAX_RGBA_PIXELS
+     || (bpc != 8 && bpc != 16)) return FALSE;
+
+  GBytes *png = _encode_rgba_png(rgba, width, height, bpc);
+  if(!png) return FALSE;
+  char name[DT_DTDATA_ENTRY_LEN] = { 0 };
+  _entry_name(DT_DTDATA_KIND_PATCH, png, name, sizeof(name));
+
+  gsize len = 0;
+  const void *data = g_bytes_get_data(png, &len);
+  if(len > DTDATA_MAX_ENTRY_SIZE)
+  {
+    g_bytes_unref(png);
+    return FALSE;
+  }
+  g_rw_lock_writer_lock(&_lock);
+  const gboolean ok = _zip_rewrite(path, NULL, name, data, len);
+  g_rw_lock_writer_unlock(&_lock);
+  g_bytes_unref(png);
+  if(!ok) return FALSE;
+
+  if(ref)
+  {
+    memset(ref, 0, sizeof(*ref));
+    g_strlcpy(ref->entry, name, sizeof(ref->entry));
+    ref->kind = DT_DTDATA_KIND_PATCH;
+    ref->origin = DT_DTDATA_ORIGIN_AUTHORITATIVE;
+    ref->width = width;
+    ref->height = height;
+    ref->bpc = bpc;
+    if(producer) g_strlcpy(ref->producer, producer, sizeof(ref->producer));
+  }
+  dt_print(DT_DEBUG_MASKS, "[dtdata] wrote %s (%dx%d, %d bit) to '%s'",
+           name, width, height, bpc, path);
+  return TRUE;
+}
+
+static GBytes *_read_checked_png(const char *path, const dt_dtdata_ref_t *ref)
+{
+  if(!path || !ref || !ref->entry[0]
+     || !memchr(ref->entry, '\0', sizeof(ref->entry))) return NULL;
 
   GBytes *png = _zip_read(path, ref->entry);
   if(!png)
@@ -653,6 +1023,18 @@ float *dt_dtdata_file_read_gray(const char *path,
     return NULL;
   }
 
+  return png;
+}
+
+float *dt_dtdata_file_read_gray(const char *path,
+                                const dt_dtdata_ref_t *ref,
+                                int *width,
+                                int *height)
+{
+  *width = *height = 0;
+  GBytes *png = _read_checked_png(path, ref);
+  if(!png) return NULL;
+
   gsize len = 0;
   const void *data = g_bytes_get_data(png, &len);
   float *mask = _decode_gray_png(data, len, width, height);
@@ -663,45 +1045,120 @@ float *dt_dtdata_file_read_gray(const char *path,
   return mask;
 }
 
-gboolean dt_dtdata_file_merge(const char *src_path, const char *dst_path)
+float *dt_dtdata_file_read_rgba(const char *path,
+                                const dt_dtdata_ref_t *ref,
+                                int *width,
+                                int *height)
 {
-  if(!g_file_test(src_path, G_FILE_TEST_EXISTS)) return TRUE;
-  if(!g_file_test(dst_path, G_FILE_TEST_EXISTS))
-  {
-    GFile *src = g_file_new_for_path(src_path);
-    GFile *dst = g_file_new_for_path(dst_path);
-    const gboolean ok = g_file_copy(src, dst, G_FILE_COPY_NONE, NULL, NULL, NULL, NULL);
-    g_object_unref(src);
-    g_object_unref(dst);
-    return ok;
-  }
+  *width = *height = 0;
+  if(!ref || ref->kind != DT_DTDATA_KIND_PATCH
+     || ref->origin != DT_DTDATA_ORIGIN_AUTHORITATIVE
+     || !memchr(ref->entry, '\0', sizeof(ref->entry))
+     || dt_dtdata_entry_kind(ref->entry) != DT_DTDATA_KIND_PATCH) return NULL;
+  GBytes *png = _read_checked_png(path, ref);
+  if(!png) return NULL;
 
-  // both listed and read before the write lock: the lock is not recursive
-  gboolean src_ok = FALSE, dst_ok = FALSE;
-  GList *entries = _zip_list(src_path, &src_ok);
-  GList *have = _zip_list(dst_path, &dst_ok);
-  gboolean ok = src_ok && dst_ok;
-  for(GList *l = entries; l && ok; l = g_list_next(l))
+  gsize len = 0;
+  const void *data = g_bytes_get_data(png, &len);
+  int bpc = 0;
+  float *rgba = _decode_rgba_png(data, len, width, height, &bpc);
+  g_bytes_unref(png);
+  if(!rgba || *width != ref->width || *height != ref->height || bpc != ref->bpc)
   {
-    const char *name = l->data;
-    if(g_list_find_custom(have, name, (GCompareFunc)g_strcmp0)) continue;
-    GBytes *data = _zip_read(src_path, name);
-    // skipping it would report a merge that left the entry behind, and a
-    // caller may then drop the source
-    if(!data)
+    dt_free_align(rgba);
+    *width = *height = 0;
+    dt_print(DT_DEBUG_ALWAYS, "[dtdata] entry '%s' in '%s' is not a matching RGBA patch",
+             ref->entry, path);
+    return NULL;
+  }
+  return rgba;
+}
+
+static gboolean _zip_copy_validated_entries(const char *path,
+                                            struct archive *w,
+                                            GHashTable *written)
+{
+  struct archive *r = archive_read_new();
+  FILE *f = _zip_open_read(r, path);
+  if(!f)
+  {
+    archive_read_free(r);
+    return FALSE;
+  }
+  GHashTable *seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  gboolean ok = TRUE, have_version = FALSE;
+  struct archive_entry *e = NULL;
+  int rc = ARCHIVE_EOF;
+  while(ok && _next_header(r, &e, &rc))
+  {
+    const char *name = archive_entry_pathname(e);
+    if(rc != ARCHIVE_OK || !name || g_hash_table_contains(seen, name))
     {
       ok = FALSE;
       break;
     }
-    gsize len = 0;
-    const void *bytes = g_bytes_get_data(data, &len);
-    g_rw_lock_writer_lock(&_lock);
-    ok = _zip_rewrite(dst_path, NULL, name, bytes, len);
-    g_rw_lock_writer_unlock(&_lock);
-    g_bytes_unref(data);
+    g_hash_table_add(seen, g_strdup(name));
+    GByteArray *data = g_byte_array_new();
+    ok = _read_entry_data(r, e, data)
+         && _entry_matches_bytes(name, data->data, data->len);
+    if(ok && !strcmp(name, DTDATA_VERSION_ENTRY)) have_version = TRUE;
+    if(ok && w && !g_hash_table_contains(written, name))
+    {
+      ok = _write_entry(w, name, data->data, data->len);
+      if(ok) g_hash_table_add(written, g_strdup(name));
+    }
+    g_byte_array_unref(data);
   }
-  g_list_free_full(entries, g_free);
-  g_list_free_full(have, g_free);
+  if(rc != ARCHIVE_EOF || !have_version) ok = FALSE;
+  if(archive_read_close(r) != ARCHIVE_OK) ok = FALSE;
+  archive_read_free(r);
+  if(fclose(f) != 0) ok = FALSE;
+  if(ok && !_zip_central_matches(path, seen)) ok = FALSE;
+  g_hash_table_unref(seen);
+  return ok;
+}
+
+gboolean dt_dtdata_file_merge(const char *src_path, const char *dst_path)
+{
+  if(!src_path || !dst_path) return FALSE;
+  if(!g_file_test(src_path, G_FILE_TEST_EXISTS)) return TRUE;
+
+  // Build the complete, validated union beside the destination and rename
+  // once. A failed later entry must not leave an earlier one half-merged.
+  g_rw_lock_writer_lock(&_lock);
+  gchar *tmp = g_strdup_printf("%s.merge-XXXXXX", dst_path);
+  const int fd = g_mkstemp(tmp);
+  FILE *wf = fd >= 0 ? fdopen(fd, "wb") : NULL;
+  if(fd >= 0 && !wf) g_close(fd, NULL);
+  gboolean ok = wf != NULL;
+  struct archive *w = ok ? archive_write_new() : NULL;
+  if(ok)
+  {
+    archive_write_set_format_zip(w);
+    archive_write_set_bytes_in_last_block(w, 1);
+    ok = archive_write_open_FILE(w, wf) == ARCHIVE_OK;
+  }
+  GHashTable *written = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  if(ok && g_file_test(dst_path, G_FILE_TEST_EXISTS))
+    ok = _zip_copy_validated_entries(dst_path, w, written);
+  if(ok) ok = _zip_copy_validated_entries(src_path, w, written);
+  if(w)
+  {
+    if(archive_write_close(w) != ARCHIVE_OK) ok = FALSE;
+    archive_write_free(w);
+  }
+  if(wf && fclose(wf) != 0) ok = FALSE;
+  g_hash_table_unref(written);
+  // g_mkstemp creates mode 0600. Keep the destination's permissions (or
+  // the source's permissions for a new sidecar) across the atomic rename.
+  GStatBuf mode_source = { 0 };
+  const char *mode_path = g_file_test(dst_path, G_FILE_TEST_EXISTS) ? dst_path : src_path;
+  if(ok && (g_stat(mode_path, &mode_source) != 0
+            || g_chmod(tmp, mode_source.st_mode & 0777) != 0)) ok = FALSE;
+  if(ok && g_rename(tmp, dst_path) != 0) ok = FALSE;
+  if(!ok) g_unlink(tmp);
+  g_free(tmp);
+  g_rw_lock_writer_unlock(&_lock);
   return ok;
 }
 
@@ -838,6 +1295,21 @@ gboolean dt_dtdata_write_gray(const dt_imgid_t imgid,
   return dt_dtdata_file_write_gray(path, kind, origin, producer, mask, width, height, bpc, ref);
 }
 
+gboolean dt_dtdata_write_rgba(const dt_imgid_t imgid,
+                              const char *producer,
+                              const float *rgba,
+                              const int width,
+                              const int height,
+                              const int bpc,
+                              dt_dtdata_ref_t *ref)
+{
+  if(!dt_dtdata_enabled() || !dt_is_valid_imgid(imgid)) return FALSE;
+  char path[PATH_MAX] = { 0 };
+  dt_dtdata_path(imgid, path, sizeof(path));
+  if(!path[0]) return FALSE;
+  return dt_dtdata_file_write_rgba(path, producer, rgba, width, height, bpc, ref);
+}
+
 // the sidecar beside the local copy, empty when the image has none. a mask
 // imported while the original was offline lives there until
 // dt_image_local_copy_reset() merges it beside the original
@@ -878,6 +1350,28 @@ float *dt_dtdata_read_gray(const dt_imgid_t imgid,
   return dt_dtdata_file_read_gray(cache, ref, width, height);
 }
 
+float *dt_dtdata_read_rgba(const dt_imgid_t imgid,
+                           const dt_dtdata_ref_t *ref,
+                           int *width,
+                           int *height)
+{
+  *width = *height = 0;
+  if(!dt_is_valid_imgid(imgid)) return NULL;
+  char path[PATH_MAX] = { 0 };
+  dt_dtdata_path(imgid, path, sizeof(path));
+  if(!path[0]) return NULL;
+  float *rgba = dt_dtdata_file_read_rgba(path, ref, width, height);
+  if(rgba) return rgba;
+
+  char cache[PATH_MAX] = { 0 };
+  _cache_path(imgid, cache, sizeof(cache));
+  if(!cache[0] || !strcmp(cache, path) || !g_file_test(cache, G_FILE_TEST_EXISTS))
+    return NULL;
+  dt_print(DT_DEBUG_MASKS, "[dtdata] entry '%s' not beside the original, trying '%s'",
+           ref ? ref->entry : "", cache);
+  return dt_dtdata_file_read_rgba(cache, ref, width, height);
+}
+
 GList *dt_dtdata_list_entries(const dt_imgid_t imgid)
 {
   if(!dt_is_valid_imgid(imgid)) return NULL;
@@ -887,14 +1381,138 @@ GList *dt_dtdata_list_entries(const dt_imgid_t imgid)
   return dt_dtdata_file_list_entries(path);
 }
 
+static gboolean _source_copyable(const dt_imgid_t imgid,
+                                 const char *src,
+                                 const char *cache,
+                                 const gboolean validate_archives,
+                                 GList **needed_out)
+{
+  GList *needed = NULL;
+  gboolean ok = TRUE;
+  sqlite3_stmt *stmt = NULL;
+  // clang-format off
+  const int prepared = sqlite3_prepare_v2(dt_database_get(darktable.db),
+                              "SELECT operation, op_params, module"
+                              " FROM main.history WHERE imgid = ?1",
+                              -1, &stmt, NULL);
+  // clang-format on
+  if(prepared != SQLITE_OK) ok = FALSE;
+  if(ok) DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  int rc = SQLITE_DONE;
+  while(ok && (rc = sqlite3_step(stmt)) == SQLITE_ROW)
+  {
+    const char *op = (const char *)sqlite3_column_text(stmt, 0);
+    const _scanner_t *s = op ? _scanner_for(op) : NULL;
+    if(!s) continue;
+    char entry[DT_DTDATA_ENTRY_LEN] = { 0 };
+    const int result = s->fn(sqlite3_column_blob(stmt, 1),
+                             sqlite3_column_bytes(stmt, 1),
+                             sqlite3_column_int(stmt, 2),
+                             entry, sizeof(entry));
+    if(result < 0) ok = FALSE;
+    else if(result > 0) needed = g_list_prepend(needed, g_strdup(entry));
+  }
+  if(ok && rc != SQLITE_DONE) ok = FALSE;
+  if(stmt) sqlite3_finalize(stmt);
+
+  const gboolean cache_exists = cache[0] && strcmp(cache, src)
+                                && g_file_test(cache, G_FILE_TEST_EXISTS);
+  for(GList *l = needed; l && ok; l = g_list_next(l))
+  {
+    const char *entry = l->data;
+    GBytes *bytes = g_file_test(src, G_FILE_TEST_EXISTS) ? _zip_read(src, entry) : NULL;
+    if(!bytes && cache_exists) bytes = _zip_read(cache, entry);
+    if(!bytes)
+      ok = FALSE;
+    else
+    {
+      gsize len = 0;
+      const void *data = g_bytes_get_data(bytes, &len);
+      ok = _entry_matches_bytes(entry, data, len);
+      g_bytes_unref(bytes);
+    }
+  }
+  if(ok && validate_archives)
+  {
+    // Match the whole-file checks performed by the later merge. An
+    // unreferenced damaged entry would make that merge fail too.
+    g_rw_lock_reader_lock(&_lock);
+    if(g_file_test(src, G_FILE_TEST_EXISTS))
+      ok = _zip_copy_validated_entries(src, NULL, NULL);
+    if(ok && cache_exists)
+      ok = _zip_copy_validated_entries(cache, NULL, NULL);
+    g_rw_lock_reader_unlock(&_lock);
+  }
+  if(ok && needed_out)
+    *needed_out = needed;
+  else
+    g_list_free_full(needed, g_free);
+  return ok;
+}
+
+static gboolean _sidecar_path_absent(const char *path)
+{
+  if(!path[0]) return TRUE;
+  GStatBuf st;
+  if(g_lstat(path, &st) == 0) return FALSE;
+  // a broken link or an unreadable path must not turn into a safe copy
+  return errno == ENOENT;
+}
+
+gboolean dt_dtdata_history_copyable(const dt_imgid_t imgid)
+{
+  if(!dt_is_valid_imgid(imgid)) return FALSE;
+
+  // Darkroom edits can still be in memory. Check the same stored history
+  // that the subsequent copy-and-paste operation will use.
+  if(dt_view_get_current() == DT_VIEW_DARKROOM)
+    dt_dev_write_history(darktable.develop);
+
+  char src[PATH_MAX] = { 0 }, cache[PATH_MAX] = { 0 };
+  dt_dtdata_path(imgid, src, sizeof(src));
+  if(!src[0]) return FALSE;
+  _cache_path(imgid, cache, sizeof(cache));
+  // a later merge copies the whole archive, even unreferenced entries
+  // refuse before creating a row or photo file until sidecar copies can
+  // roll back transactionally
+  if(!_sidecar_path_absent(src)
+     || (cache[0] && strcmp(cache, src) && !_sidecar_path_absent(cache)))
+    return FALSE;
+  return _source_copyable(imgid, src, cache, TRUE, NULL);
+}
+
 gboolean dt_dtdata_merge(const dt_imgid_t src_imgid, const dt_imgid_t dst_imgid)
 {
   if(!dt_is_valid_imgid(src_imgid) || !dt_is_valid_imgid(dst_imgid)) return FALSE;
-  char src[PATH_MAX] = { 0 }, dst[PATH_MAX] = { 0 };
+  char src[PATH_MAX] = { 0 }, dst[PATH_MAX] = { 0 }, cache[PATH_MAX] = { 0 };
   dt_dtdata_path(src_imgid, src, sizeof(src));
   dt_dtdata_path(dst_imgid, dst, sizeof(dst));
   if(!src[0] || !dst[0]) return FALSE;
-  return dt_dtdata_file_merge(src, dst);
+  _cache_path(src_imgid, cache, sizeof(cache));
+
+  // Check every known reference before changing destination history. A
+  // missing sidecar is harmless only if no copied row needs it.
+  GList *needed = NULL;
+  if(!_source_copyable(src_imgid, src, cache, FALSE, &needed)) return FALSE;
+  gboolean ok = dt_dtdata_file_merge(src, dst);
+  const gboolean cache_exists = cache[0] && strcmp(cache, src)
+                                && g_file_test(cache, G_FILE_TEST_EXISTS);
+  if(ok && cache_exists) ok = dt_dtdata_file_merge(cache, dst);
+  for(GList *l = needed; l && ok; l = g_list_next(l))
+  {
+    GBytes *bytes = _zip_read(dst, l->data);
+    if(!bytes)
+      ok = FALSE;
+    else
+    {
+      gsize len = 0;
+      const void *data = g_bytes_get_data(bytes, &len);
+      ok = _entry_matches_bytes(l->data, data, len);
+      g_bytes_unref(bytes);
+    }
+  }
+  g_list_free_full(needed, g_free);
+  return ok;
 }
 
 // clang-format off

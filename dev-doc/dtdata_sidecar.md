@@ -14,7 +14,7 @@ version                 "1"
 mask-<sha1>.png         8-bit gray, an alpha mask
 depth-<sha1>.png        16-bit gray
 brush-<sha1>.png        8-bit gray
-patch-<sha1>.png        pixels
+patch-<sha1>.png        8- or 16-bit RGBA pixels for a cropped accepted fill
 ```
 
 An entry is named by the SHA-1 of its bytes and is never modified. A new
@@ -58,6 +58,25 @@ the entries:
   folder
 - `dt_dtdata_path()`, `dt_dtdata_path_for_image()`
 - `dt_dtdata_write_gray()`, `dt_dtdata_read_gray()`, `dt_dtdata_list_entries()`
+- `dt_dtdata_write_rgba()`, `dt_dtdata_read_rgba()`: cropped RGBA patch
+  pixels plus alpha in one content-addressed entry. Accepted fills use
+  authoritative references, so reopening never depends on the model.
+  Patch RGB is encoded sRGB, independent of the preview or export profile;
+  the Magic Eraser pixelpipe module converts it to the active output profile
+  before blending. Alpha is coverage and is not color-managed. An inpainting
+  proposal stores unblended replacement RGB and its fractional selection
+  coverage; preview and saved rendering each apply that alpha exactly once.
+  Decoding checks the checksum, PNG color/depth, and reference dimensions.
+  The per-entry limit is 16 megapixels; callers must reject or split larger
+  patches.
+  Writing is unavailable when sidecar writing is "never".
+- `dt_dtdata_source_sha256()`: fingerprint the bytes of the photo file that
+  the image loader uses, including a local copy when present. Magic Eraser
+  v3 history parameters store this digest alongside the geometry guard.
+  An accepted patch is refused on a different photo or after the source
+  bytes change; the path and catalog ID are deliberately not part of the
+  fingerprint. Older v1/v2 prototype patches have no source attestation
+  and fail closed while their sidecar entries remain recoverable.
 - `dt_dtdata_merge()`: copy one image's entries into another's; called
   from `dt_history_copy_and_paste_on_image()` because a pasted reference
   needs its entry on the destination
@@ -71,8 +90,15 @@ the entries:
 Writers rewrite the whole zip to a temp file and rename it, holding the
 write side of a read-write lock; readers open the file per call under
 the read side, since Windows refuses the rename while the file is open.
-A zip that cannot be read to its end is never rewritten, swept or merged
-from. The rasterfile module caches the decoded mask by its params hash,
+A zip with an incomplete central directory, a mismatch between its central
+directory and streamed entries, an unreadable entry, or a known entry whose
+bytes differ from the checksum in its name is never rewritten or merged.
+Merge validates both sidecars, builds their union in a temporary zip, and
+renames it once while retaining the destination file mode. A later damaged
+entry cannot leave earlier entries half-merged. History paste checks its
+known raster references and merges the entries before changing destination
+history; a missing referenced entry cancels the paste. The rasterfile
+module caches the decoded mask by its params hash,
 and the SHA-1 in the entry name is part of those params, so the cache is
 content-addressed for free.
 
@@ -108,8 +134,15 @@ only newer-version rows referenced.
 The sidecar follows the XMP in `dt_image_rename()` (move and rename; a
 sidecar that cannot be moved is copied, since its masks exist nowhere
 else), both branches of the delete job, and local-copy reset. It is refused as
-an importable file. Copies and duplicates get their entries through the
-history paste. Not handled yet: the "write sidecar files" action (the
-file is written at import time, not synced from the database), the
+an importable file. History-preserving duplication and image copy temporarily
+refuse a source with a `.dtdata` beside either the original or local copy,
+including an unreferenced or damaged archive. Virgin duplicates still work.
+Direct history paste into an existing image still merges sidecar entries
+before applying history. This restriction remains until a failed sidecar copy
+can roll back the new row and Undo record transactionally. The preflight does
+not close the race if a sidecar appears between checking and copying. Not
+handled yet: the
+"write sidecar files" action (the file is written at import time, not synced
+from the database), the
 crawler, XMP-only transfer, and styles carrying a reference to an entry
 the target image does not have.

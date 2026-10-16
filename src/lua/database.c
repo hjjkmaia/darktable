@@ -19,6 +19,7 @@
 #include "common/collection.h"
 #include "common/darktable.h"
 #include "common/debug.h"
+#include "common/dtdata.h"
 #include "common/film.h"
 #include "common/grealpath.h"
 #include "common/image.h"
@@ -47,6 +48,12 @@ int dt_lua_duplicate_image_with_history(lua_State *L)
   dt_imgid_t imgid;
   dt_imgid_t newid;
   luaA_to(L, dt_lua_image_t, &imgid, -1);
+  if(!dt_dtdata_history_copyable(imgid))
+  {
+    dt_control_log(_("history-preserving copy is unavailable for raster sidecars or missing raster data"));
+    luaA_push(L, dt_lua_image_t, &imgid);
+    return 1;
+  }
   newid = dt_image_duplicate(imgid);
   if(!dt_is_valid_imgid(newid))
   {
@@ -55,7 +62,8 @@ int dt_lua_duplicate_image_with_history(lua_State *L)
   }
   else
   {
-    dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE);
+    if(!dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE))
+      newid = imgid;
     luaA_push(L, dt_lua_image_t, &newid);
     return 1;
   }

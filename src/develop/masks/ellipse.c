@@ -107,6 +107,91 @@ static int _ellipse_point_in_polygon(const float x,
   return t;
 }
 
+static gboolean _ellipse_rotation_handle_hit(const float x,
+                                             const float y,
+                                             const float distance,
+                                             const dt_masks_form_gui_points_t *gpt)
+{
+  if(!gpt || gpt->points_count <= _nb_ctrl_point()) return FALSE;
+
+  int near = -1;
+  const gboolean inside = dt_masks_point_in_form_near(x, y, gpt->points,
+                                                       _nb_ctrl_point(), gpt->points_count,
+                                                       distance, &near);
+  return !inside && near >= 0;
+}
+
+static gboolean _ellipse_rotation_cue_points(const dt_masks_form_gui_points_t *gpt,
+                                             const float distance,
+                                             float cues[4])
+{
+  if(!gpt || gpt->points_count < _nb_ctrl_point() + 8) return FALSE;
+
+  const int outline_count = gpt->points_count - (_nb_ctrl_point() - 1);
+  const float cx = gpt->points[0], cy = gpt->points[1];
+
+  // opposing diagonal positions leave the four size and feather handles free
+  for(int i = 0; i < 2; i++)
+  {
+    const int point = (_nb_ctrl_point() - 1) + (1 + 4 * i) * outline_count / 8;
+    const float px = gpt->points[point * 2];
+    const float py = gpt->points[point * 2 + 1];
+    const float dx = px - cx, dy = py - cy;
+    const float radius = hypotf(dx, dy);
+    if(radius < 1.0f) return FALSE;
+
+    cues[i * 2] = px + 2.4f * distance * dx / radius;
+    cues[i * 2 + 1] = py + 2.4f * distance * dy / radius;
+  }
+  return TRUE;
+}
+
+static gboolean _ellipse_rotation_cue_hit(const float x,
+                                          const float y,
+                                          const float distance,
+                                          const dt_masks_form_gui_points_t *gpt)
+{
+  float cues[4];
+  if(!_ellipse_rotation_cue_points(gpt, distance, cues)) return FALSE;
+
+  const float grab2 = sqf(1.5f * distance);
+  for(int i = 0; i < 2; i++)
+    if(sqf(x - cues[i * 2]) + sqf(y - cues[i * 2 + 1]) <= grab2)
+      return TRUE;
+
+  return FALSE;
+}
+
+static void _ellipse_draw_rotation_cue(cairo_t *cr,
+                                       const float zoom_scale,
+                                       const float x,
+                                       const float y,
+                                       const gboolean selected)
+{
+  const float radius = 1.15f * dt_masks_sensitive_dist(zoom_scale);
+  const float end = 3.0f * M_PI_F / 4.0f;
+  const float ex = x + radius * cosf(end), ey = y + radius * sinf(end);
+  const float tx = -sinf(end), ty = cosf(end);
+  const float nx = -ty, ny = tx;
+
+  cairo_save(cr);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+  cairo_new_path(cr);
+  cairo_arc(cr, x, y, radius, -M_PI_2, end);
+  dt_masks_line_stroke(cr, FALSE, FALSE, selected, zoom_scale);
+
+  // A filled head stays legible at normal zoom where two thin chevron lines do not.
+  cairo_move_to(cr, ex + radius * 0.15f * tx, ey + radius * 0.15f * ty);
+  cairo_line_to(cr, ex - radius * 0.8f * tx,
+                    ey - radius * 0.8f * ty);
+  cairo_line_to(cr, ex - radius * 0.8f * tx + radius * 0.7f * nx,
+                    ey - radius * 0.8f * ty + radius * 0.7f * ny);
+  cairo_close_path(cr);
+  cairo_fill_preserve(cr);
+  dt_masks_line_stroke(cr, FALSE, FALSE, selected, zoom_scale);
+  cairo_restore(cr);
+}
+
 static void _ellipse_get_distance(const float x,
                                   const float y,
                                   const float as,
@@ -152,6 +237,14 @@ static void _ellipse_get_distance(const float x,
       }
       return;
     }
+  }
+
+  if(gui->edit_mode == DT_MASKS_EDIT_FULL && !gui->select_only_border
+     && _ellipse_rotation_cue_hit(x, y, as, gpt))
+  {
+    *inside = TRUE;
+    *dist = 0.0f;
+    return;
   }
 
   for(int k=0; k<_nb_ctrl_point() - 1; k++)
@@ -581,6 +674,50 @@ static int _ellipse_events_button_pressed(dt_iop_module_t *module,
     dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
     if(!gpt) return 0;
 
+    if(gui->edit_mode == DT_MASKS_EDIT_FULL
+       && which == GDK_BUTTON_PRIMARY
+       && !(state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK | GDK_MOD1_MASK)))
+    {
+      dt_dev_viewport_t *port = &darktable.develop->full;
+      const float zoom_scale = dt_dev_get_zoom_scale(port, port->zoom, 1 << port->closeup, TRUE);
+      const float x = pzx * wd, y = pzy * ht;
+      const float as = dt_masks_sensitive_dist(zoom_scale);
+      const gboolean cue_hit = _ellipse_rotation_cue_hit(x, y, as, gpt);
+      if(cue_hit || _ellipse_rotation_handle_hit(x, y, as, gpt))
+      {
+        gboolean inside = FALSE, inside_border = FALSE, inside_source = FALSE;
+        int near = -1;
+        float dist = FLT_MAX;
+        _ellipse_get_distance(x, y, as, gui, index, 0,
+                              &inside, &inside_border, &near, &inside_source, &dist);
+
+        const float grab2 = sqf(dt_masks_anchor_sensitive_dist(zoom_scale));
+        gboolean near_anchor = FALSE;
+        for(int i = 1; i < _nb_ctrl_point() - 1; i++)
+        {
+          const float dx = x - gpt->points[i * 2], dy = y - gpt->points[i * 2 + 1];
+          const float bx = x - gpt->border[i * 2], by = y - gpt->border[i * 2 + 1];
+          if(sqf(dx) + sqf(dy) < grab2 || sqf(bx) + sqf(by) < grab2)
+          {
+            near_anchor = TRUE;
+            break;
+          }
+        }
+
+        if(!inside_source && (cue_hit || !near_anchor))
+        {
+          // use the press position as well as the prior hover hit test
+          gui->ellipse_rotation_selected = TRUE;
+          gui->dx = gpt->points[0] - x;
+          gui->dy = gpt->points[1] - y;
+          gui->form_rotating = TRUE;
+          gui->counter_rotate_source = TRUE;
+          gui->rotate_about_source = FALSE;
+          return 1;
+        }
+      }
+    }
+
     if(gui->form_selected && dt_modifier_is(state, GDK_MOD1_MASK))
     {
       gui->border_toggling = TRUE;
@@ -700,6 +837,7 @@ static int _ellipse_events_button_pressed(dt_iop_module_t *module,
     dt_iop_module_t *crea_module = gui->creation_module;
 
     dt_masks_gui_form_save_creation(darktable.develop, crea_module, form, gui);
+    if(!gui->formid) return 1;
 
     if(crea_module)
     {
@@ -1074,6 +1212,7 @@ static int _ellipse_events_mouse_moved(dt_iop_module_t *module,
   }
   else if(gui->form_rotating)
   {
+    gui->ellipse_rotation_selected = TRUE;
     dt_masks_point_ellipse_t *ellipse = form->points->data;
 
     float wd, ht, iwidth, iheight;
@@ -1216,8 +1355,11 @@ static int _ellipse_events_mouse_moved(dt_iop_module_t *module,
     {
       const dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
       const float grab2 = sqf(dt_masks_anchor_sensitive_dist(zoom_scale));
+      const gboolean cue_hit = gui->edit_mode == DT_MASKS_EDIT_FULL
+        && !gui->select_only_border
+        && _ellipse_rotation_cue_hit(x, y, as, gpt);
 
-      for(int i = 1; i < _nb_ctrl_point() - 1; i++)
+      for(int i = 1; !cue_hit && i < _nb_ctrl_point() - 1; i++)
       {
         const float dist_b = sqf(x - gpt->border[i * 2]) + sqf(y - gpt->border[i * 2 +1]);
         const float dist_p = sqf(x - gpt->points[i * 2]) + sqf(y - gpt->points[i * 2 + 1]);
@@ -1233,6 +1375,11 @@ static int _ellipse_events_mouse_moved(dt_iop_module_t *module,
           break;
         }
       }
+
+      gui->ellipse_rotation_selected = gui->edit_mode == DT_MASKS_EDIT_FULL
+        && !gui->source_selected && !gui->select_only_border
+        && gui->point_selected < 0 && gui->point_border_selected < 0
+        && (cue_hit || _ellipse_rotation_handle_hit(x, y, as, gpt));
     }
 
     dt_control_queue_redraw_center();
@@ -1393,6 +1540,16 @@ static void _ellipse_events_post_expose(cairo_t *cr,
         (cr, i == gui->point_border_dragging || i == gui->point_border_selected,
          zoom_scale, x, y);
     }
+  }
+
+  if(gui->edit_mode == DT_MASKS_EDIT_FULL && gui->group_selected == index
+     && !gui->select_only_border)
+  {
+    float cues[4];
+    if(_ellipse_rotation_cue_points(gpt, dt_masks_sensitive_dist(zoom_scale), cues))
+      for(int i = 0; i < 2; i++)
+        _ellipse_draw_rotation_cue(cr, zoom_scale, cues[i * 2], cues[i * 2 + 1],
+                                   gui->ellipse_rotation_selected);
   }
 
   // draw the source if any
@@ -2003,6 +2160,10 @@ static GSList *_ellipse_setup_mouse_actions(const struct dt_masks_form_t *const 
                                      _("[ELLIPSE] switch feathering mode"));
   lm = dt_mouse_action_create_simple(lm,
                                      DT_MOUSE_ACTION_LEFT_DRAG,
+                                     0,
+                                     _("[ELLIPSE] rotate from a curved-arrow mark or just outside the outline"));
+  lm = dt_mouse_action_create_simple(lm,
+                                     DT_MOUSE_ACTION_LEFT_DRAG,
                                      GDK_CONTROL_MASK,
                                      _("[ELLIPSE] rotate shape (source only on a clone source)"));
   lm = dt_mouse_action_create_simple(lm,
@@ -2066,7 +2227,7 @@ static void _ellipse_set_hint_message(const dt_masks_form_gui_t *const gui,
   else if(gui->form_selected)
   {
     g_snprintf(msgbuf, msgbuf_len,
-               _("<b>feather mode</b>: alt+click, <b>rotate</b>: ctrl+drag,"
+               _("<b>feather mode</b>: alt+click, <b>rotate</b>: drag a curved-arrow mark or just outside outline,"
                  "<b>size</b>: scroll\n<b>feather size</b>: shift+scroll"
                  " <b>opacity</b>: ctrl+scroll (%d%%)"), opacity);
     // joint rotation of both shapes only makes sense when there is a source

@@ -48,6 +48,7 @@
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
+#include "develop/pixelpipe_hb.h"
 #include "dtgtk/button.h"
 #include "dtgtk/stylemenu.h"
 #include "dtgtk/thumbtable.h"
@@ -78,6 +79,256 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+typedef struct dt_darkroom_mask_overlay_t
+{
+  cairo_surface_t *surface;
+  dt_imgid_t imgid;
+  dt_mask_id_t formid;
+  dt_hash_t form_hash;
+  dt_hash_t pipe_hash;
+  int width, height;
+  float scale;
+} dt_darkroom_mask_overlay_t;
+
+typedef struct dt_darkroom_mask_overlay_target_t
+{
+  dt_mask_id_t formid;
+  dt_mask_id_t groupid;
+  uint32_t state;
+  dt_iop_module_t *owner;
+} dt_darkroom_mask_overlay_target_t;
+
+// The overlay belongs to the view, never to a pixelpipe or an image history item.
+static dt_darkroom_mask_overlay_t _mask_overlay = { 0 };
+
+static void _mask_overlay_clear(void)
+{
+  if(_mask_overlay.surface) cairo_surface_destroy(_mask_overlay.surface);
+  memset(&_mask_overlay, 0, sizeof(_mask_overlay));
+}
+
+static dt_darkroom_mask_overlay_target_t _mask_overlay_target(const dt_develop_t *dev)
+{
+  dt_darkroom_mask_overlay_target_t target = { .formid = NO_MASKID,
+                                                 .groupid = NO_MASKID,
+                                                 .state = DT_MASKS_STATE_NONE };
+  if(dev->mask_overlay_imgid == dev->image_storage.id
+     && dt_is_valid_maskid(dev->mask_overlay_hover_id))
+  {
+    target.formid = dev->mask_overlay_hover_id;
+    target.groupid = dev->mask_overlay_hover_group_id;
+    target.state = dev->mask_overlay_hover_state;
+    target.owner = dev->mask_overlay_hover_owner;
+    return target;
+  }
+
+  // Hovering a shape handle/pin on the photo previews that component.
+  if(dev->darkroom_mouse_in_center_area && dev->form_visible && dev->form_gui
+     && (dev->form_visible->type & DT_MASKS_GROUP)
+     && dev->form_gui->group_selected >= 0)
+  {
+    const dt_masks_point_group_t *point =
+      g_list_nth_data(dev->form_visible->points, dev->form_gui->group_selected);
+    if(point)
+    {
+      target.formid = point->formid;
+      target.groupid = point->parentid;
+      target.state = point->state;
+      return target;
+    }
+  }
+
+  if(dev->mask_overlay_show && dev->mask_overlay_imgid == dev->image_storage.id)
+  {
+    target.formid = dev->mask_overlay_selected_id;
+    target.groupid = dev->mask_overlay_selected_group_id;
+    target.state = dev->mask_overlay_selected_state;
+    target.owner = dev->mask_overlay_selected_owner;
+  }
+  return target;
+}
+
+static void _mask_overlay_draw(cairo_t *cr, dt_develop_t *dev,
+                               const dt_darkroom_mask_overlay_target_t target,
+                               const float display_width, const float display_height)
+{
+  const dt_mask_id_t formid = target.formid;
+  if(!dt_is_valid_maskid(formid) || !dev->preview_pipe) return;
+  dt_dev_pixelpipe_t *pipe = dev->preview_pipe;
+  if(dt_pthread_mutex_BAD_trylock(&pipe->mutex)) return;
+  gboolean current = FALSE;
+
+  dt_dev_pixelpipe_iop_t *gamma = NULL;
+  for(GList *node = pipe->nodes; node; node = g_list_next(node))
+  {
+    dt_dev_pixelpipe_iop_t *piece = node->data;
+    if(piece->enabled && dt_iop_module_is_gamma(piece->module))
+    {
+      gamma = piece;
+      break;
+    }
+  }
+
+  // The pixelpipe frees its private forms snapshot after processing. Take a
+  // fresh GUI-history snapshot only when the cached overlay must be rebuilt.
+  dt_masks_form_t *form = NULL;
+  if(pipe->status == DT_DEV_PIXELPIPE_VALID
+     && pipe->output_imgid == dev->image_storage.id && gamma)
+  {
+    const dt_iop_roi_t full_roi = gamma->processed_roi_out;
+    dt_iop_roi_t roi = full_roi;
+    const size_t preview_pixels = (size_t)roi.width * roi.height;
+    if(roi.x == 0 && roi.y == 0 && roi.width > 0 && roi.height > 0
+       && roi.width == pipe->processed_width && roi.height == pipe->processed_height)
+    {
+      // Keep the editing overlay available on 4K and larger previews without
+      // allocating a full-size float mask (and another for group components).
+      if(preview_pixels > 8000000)
+      {
+        int divisor = 2;
+        while((size_t)((full_roi.width - 1) / divisor + 1)
+                * ((full_roi.height - 1) / divisor + 1) > 4000000)
+          divisor++;
+        roi.width = (full_roi.width - 1) / divisor + 1;
+        roi.height = (full_roi.height - 1) / divisor + 1;
+        roi.scale = full_roi.scale / divisor;
+      }
+      const size_t pixels = (size_t)roi.width * roi.height;
+      dt_pthread_mutex_lock(&dev->history_mutex);
+      form = dt_masks_get_from_id_ext(dev->forms, formid);
+      float point_opacity = 1.0f;
+      gboolean inverted = FALSE;
+      if(form && dt_is_valid_maskid(target.groupid))
+      {
+        // A component row represents the group's use of a shape, including
+        // its inverse and opacity, rather than the shape alone. A shape may be
+        // reused in more than one group with different settings.
+        dt_masks_form_t *group = dt_masks_get_from_id_ext(dev->forms, target.groupid);
+        if(group && (group->type & DT_MASKS_GROUP))
+        {
+          const dt_masks_point_group_t *matching = NULL;
+          for(const GList *it = group->points; it; it = g_list_next(it))
+          {
+            const dt_masks_point_group_t *point = it->data;
+            if(point->formid != formid) continue;
+            if(!matching) matching = point;
+            if(point->state == target.state)
+            {
+              matching = point;
+              break;
+            }
+          }
+          if(matching)
+          {
+            point_opacity = matching->opacity;
+            inverted = matching->state & DT_MASKS_STATE_INVERSE;
+          }
+        }
+      }
+      else if(form)
+      {
+        // A shared root can have different polarity in each module. The mask
+        // manager row does not identify which module's result to preview.
+        dt_iop_module_t *owner = NULL;
+        for(const GList *it = dev->iop; it; it = g_list_next(it))
+        {
+          dt_iop_module_t *module = it->data;
+          if(module->blend_params && module->blend_params->mask_id == formid)
+          {
+            if(owner)
+            {
+              form = NULL;
+              break;
+            }
+            owner = module;
+          }
+        }
+        if(form && owner)
+          inverted = owner->blend_params->mask_combine & DEVELOP_COMBINE_MASKS_POS;
+      }
+      dt_hash_t form_hash = form
+        ? dt_masks_group_hash_ext(DT_INITHASH, form, dev->forms) : DT_INVALID_HASH;
+      if(form)
+      {
+        form_hash = dt_hash(form_hash, &target.groupid, sizeof(target.groupid));
+        form_hash = dt_hash(form_hash, &point_opacity, sizeof(point_opacity));
+        form_hash = dt_hash(form_hash, &inverted, sizeof(inverted));
+      }
+      const gboolean rebuild = form && (!_mask_overlay.surface
+         || _mask_overlay.imgid != dev->image_storage.id
+         || _mask_overlay.formid != formid || _mask_overlay.form_hash != form_hash
+         || _mask_overlay.pipe_hash != pipe->backbuf_hash
+         || _mask_overlay.width != roi.width || _mask_overlay.height != roi.height
+         || _mask_overlay.scale != roi.scale);
+      GList *forms = rebuild ? dt_masks_dup_forms_deep(dev->forms, NULL) : NULL;
+      dt_pthread_mutex_unlock(&dev->history_mutex);
+      if(rebuild)
+      {
+        _mask_overlay_clear();
+        form = dt_masks_get_from_id_ext(forms, formid);
+        float *coverage = dt_alloc_align_float(pixels);
+        if(coverage && form)
+        {
+          memset(coverage, 0, pixels * sizeof(float));
+          // Group ROI rendering resolves children through piece->pipe->forms.
+          // Keep that temporary list private to this locked preview draw.
+          GList *old_forms = pipe->forms;
+          pipe->forms = forms;
+          const int rendered = dt_masks_get_mask_roi(gamma->module, gamma, form, &roi, coverage);
+          pipe->forms = old_forms;
+          if(rendered)
+          {
+            cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_A8,
+                                                                   roi.width, roi.height);
+            if(cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS)
+            {
+              unsigned char *data = cairo_image_surface_get_data(surface);
+              const int stride = cairo_image_surface_get_stride(surface);
+              for(int y = 0; y < roi.height; y++)
+                for(int x = 0; x < roi.width; x++)
+                {
+                  const float coverage_value = coverage[(size_t)y * roi.width + x];
+                  const float value = point_opacity * (inverted ? 1.0f - coverage_value
+                                                              : coverage_value);
+                  data[(size_t)y * stride + x] = isfinite(value)
+                    ? (unsigned char)lrintf(255.0f * CLIP(value)) : 0;
+                }
+              cairo_surface_mark_dirty(surface);
+              _mask_overlay.surface = surface;
+              _mask_overlay.imgid = dev->image_storage.id;
+              _mask_overlay.formid = formid;
+              _mask_overlay.form_hash = form_hash;
+              _mask_overlay.pipe_hash = pipe->backbuf_hash;
+              _mask_overlay.width = roi.width;
+              _mask_overlay.height = roi.height;
+              _mask_overlay.scale = roi.scale;
+            }
+            else cairo_surface_destroy(surface);
+          }
+        }
+        dt_free_align(coverage);
+        g_list_free_full(forms, (GDestroyNotify)dt_masks_free_form);
+      }
+      current = _mask_overlay.surface
+                && _mask_overlay.imgid == dev->image_storage.id
+                && _mask_overlay.formid == formid
+                && _mask_overlay.form_hash == form_hash
+                && _mask_overlay.pipe_hash == pipe->backbuf_hash;
+    }
+  }
+  dt_pthread_mutex_BAD_unlock(&pipe->mutex);
+
+  if(current)
+  {
+    cairo_save(cr);
+    cairo_scale(cr, display_width / _mask_overlay.width,
+                    display_height / _mask_overlay.height);
+    cairo_set_source_rgba(cr, 0.96, 0.43, 0.60, 0.38);
+    cairo_mask_surface(cr, _mask_overlay.surface, 0.0, 0.0);
+    cairo_restore(cr);
+  }
+}
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -299,6 +550,7 @@ void cleanup(dt_view_t *self)
 {
   dt_develop_t *dev = self->data;
   _darkroom_before_after_stop();
+  _mask_overlay_clear();
 
   // unref the grid lines popover if needed
   if(darktable.view_manager->guides_popover) g_object_unref(darktable.view_manager->guides_popover);
@@ -1460,7 +1712,8 @@ void expose(dt_view_t *self,
     (dmod && dmod->enabled && dt_dev_modulegroups_test_activated(darktable.develop))
     || dt_lib_gui_get_expanded(dt_lib_get_module("masks"));
 
-  if(dev->form_visible && display_masks)
+  const dt_darkroom_mask_overlay_target_t overlay_target = _mask_overlay_target(dev);
+  if(display_masks && (dev->form_visible || dt_is_valid_maskid(overlay_target.formid)))
   {
     dt_print_pipe(DT_DEBUG_EXPOSE,
         "expose masks",
@@ -1492,7 +1745,9 @@ void expose(dt_view_t *self,
     const float corr_x = CLAMP((zoom_x - zoom_x_vp) * wd, -max_corr, max_corr);
     const float corr_y = CLAMP((zoom_y - zoom_y_vp) * ht, -max_corr, max_corr);
     cairo_translate(cri, corr_x, corr_y);
-    dt_masks_events_post_expose(dmod, cri, width, height, 0.0f, 0.0f, zoom_scale);
+    _mask_overlay_draw(cri, dev, overlay_target, wd, ht);
+    if(dev->form_visible)
+      dt_masks_events_post_expose(dmod, cri, width, height, 0.0f, 0.0f, zoom_scale);
     cairo_restore(cri);
   }
 
@@ -4857,6 +5112,7 @@ void mouse_leave(dt_view_t *self)
   dt_control_set_mouse_over_id(dev->image_storage.id);
 
   dev->darkroom_mouse_in_center_area = FALSE;
+  dt_control_queue_redraw_center();
   // masks
   int handled = dt_masks_events_mouse_leave(dev->gui_module);
   if(handled) return;
@@ -4873,6 +5129,7 @@ void mouse_enter(dt_view_t *self)
   dt_develop_t *dev = self->data;
   // masks
   dev->darkroom_mouse_in_center_area = TRUE;
+  dt_control_queue_redraw_center();
   dt_masks_events_mouse_enter(dev->gui_module);
 }
 

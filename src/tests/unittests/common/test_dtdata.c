@@ -70,6 +70,31 @@ static int _teardown(void **state)
   return 0;
 }
 
+static void test_source_digest_tracks_bytes_not_path(void **state)
+{
+  _fixture_t *f = *state;
+  gchar *photo = g_build_filename(f->dir, "source.raw", NULL);
+  gchar *moved = g_build_filename(f->dir, "moved.raw", NULL);
+  char first[DT_DTDATA_SOURCE_SHA256_LEN] = { 0 };
+  char same[DT_DTDATA_SOURCE_SHA256_LEN] = { 0 };
+  char changed[DT_DTDATA_SOURCE_SHA256_LEN] = { 0 };
+  assert_true(g_file_set_contents(photo, "abcdef", 6, NULL));
+  assert_true(dt_dtdata_file_source_sha256(photo, first));
+  gchar *expected = g_compute_checksum_for_string(G_CHECKSUM_SHA256, "abcdef", 6);
+  assert_string_equal(first, expected);
+  assert_int_equal(g_rename(photo, moved), 0);
+  assert_true(dt_dtdata_file_source_sha256(moved, same));
+  assert_string_equal(first, same);
+  assert_true(g_file_set_contents(moved, "abcdeg", 6, NULL));
+  assert_true(dt_dtdata_file_source_sha256(moved, changed));
+  assert_string_not_equal(first, changed);
+  assert_false(dt_dtdata_file_source_sha256(photo, same));
+  assert_int_equal(same[0], '\0');
+  g_free(expected);
+  g_free(photo);
+  g_free(moved);
+}
+
 // a gradient with a hard edge, so bit depth and orientation both show
 static float *_make_mask(const int w, const int h)
 {
@@ -142,6 +167,66 @@ static void test_roundtrip_16bit(void **state)
 
   dt_free_align(back);
   dt_free_align(mask);
+}
+
+static void test_rgba_patch_roundtrip(void **state)
+{
+  _fixture_t *f = *state;
+  const int w = 37, h = 23;
+  float *rgba = dt_alloc_align_float((size_t)w * h * 4);
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = ((size_t)y * w + x) * 4;
+      rgba[i + 0] = (float)x / (w - 1);
+      rgba[i + 1] = (float)y / (h - 1);
+      rgba[i + 2] = (float)(x + y) / (w + h - 2);
+      rgba[i + 3] = x < w / 2 ? 0.0f : 1.0f;
+    }
+
+  for(int bpc = 8; bpc <= 16; bpc += 8)
+  {
+    dt_dtdata_ref_t ref, same;
+    assert_true(dt_dtdata_file_write_rgba(f->path, "inpaint-test", rgba, w, h, bpc, &ref));
+    assert_true(dt_dtdata_file_write_rgba(f->path, "inpaint-test", rgba, w, h, bpc, &same));
+    assert_string_equal(ref.entry, same.entry);
+    assert_int_equal(ref.kind, DT_DTDATA_KIND_PATCH);
+    assert_int_equal(ref.origin, DT_DTDATA_ORIGIN_AUTHORITATIVE);
+    assert_int_equal(ref.bpc, bpc);
+    assert_string_equal(ref.producer, "inpaint-test");
+
+    int rw = 0, rh = 0;
+    float *back = dt_dtdata_file_read_rgba(f->path, &ref, &rw, &rh);
+    assert_non_null(back);
+    assert_int_equal(rw, w);
+    assert_int_equal(rh, h);
+    assert_true(_max_abs_diff(rgba, back, (size_t)w * h * 4)
+                <= 0.5f / (bpc == 8 ? 255.0f : 65535.0f) + 1e-6f);
+    dt_free_align(back);
+
+    dt_dtdata_ref_t wrong = ref;
+    wrong.width++;
+    assert_null(dt_dtdata_file_read_rgba(f->path, &wrong, &rw, &rh));
+    assert_int_equal(rw, 0);
+    wrong = ref;
+    wrong.bpc = bpc == 8 ? 16 : 8;
+    assert_null(dt_dtdata_file_read_rgba(f->path, &wrong, &rw, &rh));
+    wrong = ref;
+    wrong.kind = DT_DTDATA_KIND_MASK;
+    assert_null(dt_dtdata_file_read_rgba(f->path, &wrong, &rw, &rh));
+    wrong = ref;
+    wrong.origin = DT_DTDATA_ORIGIN_REGENERABLE;
+    assert_null(dt_dtdata_file_read_rgba(f->path, &wrong, &rw, &rh));
+    wrong = ref;
+    memset(wrong.entry, 'x', sizeof(wrong.entry));
+    assert_null(dt_dtdata_file_read_rgba(f->path, &wrong, &rw, &rh));
+  }
+
+  GList *entries = dt_dtdata_file_list_entries(f->path);
+  assert_int_equal(g_list_length(entries), 2);
+  g_list_free_full(entries, g_free);
+  assert_false(dt_dtdata_file_write_rgba(f->path, NULL, rgba, 32769, 1, 8, NULL));
+  dt_free_align(rgba);
 }
 
 // a second write keeps the first entry, and identical content is not
@@ -443,9 +528,9 @@ static void test_merge_unreadable_entry(void **state)
   dt_free_align(b);
 }
 
-// merging a damaged source into a missing destination copies it verbatim:
-// whatever was readable in the source is readable in the copy, so dropping
-// the source afterwards loses nothing
+// A truncated zip may still yield an early entry through libarchive's
+// streaming reader. Its absent central directory must prevent a merge and
+// leave the source available for repair instead of copying a partial file.
 static void test_merge_truncated_source_into_missing(void **state)
 {
   _fixture_t *f = *state;
@@ -473,29 +558,57 @@ static void test_merge_truncated_source_into_missing(void **state)
   assert_null(src_c);
 
   assert_false(g_file_test(other, G_FILE_TEST_EXISTS));
-  assert_true(dt_dtdata_file_merge(f->path, other));
-
-  gchar *copy = NULL;
-  gsize copy_len = 0;
-  assert_true(g_file_get_contents(other, &copy, &copy_len, NULL));
-  assert_int_equal(copy_len, len * 6 / 10);
-  assert_memory_equal(copy, bytes, copy_len);
-
-  // the source is gone, as after a local-copy reset; the copy serves the same
-  g_unlink(f->path);
-  float *dst_a = dt_dtdata_file_read_gray(other, &ra, &rw, &rh);
-  assert_non_null(dst_a);
-  assert_true(_max_abs_diff(src_a, dst_a, (size_t)w * h) == 0.0f);
-  assert_null(dt_dtdata_file_read_gray(other, &rc, &rw, &rh));
+  assert_false(dt_dtdata_file_merge(f->path, other));
+  assert_false(g_file_test(other, G_FILE_TEST_EXISTS));
+  assert_true(g_file_test(f->path, G_FILE_TEST_EXISTS));
 
   dt_free_align(src_a);
-  dt_free_align(dst_a);
-  g_free(copy);
   g_free(bytes);
   g_free(other);
   dt_free_align(a);
   dt_free_align(b);
   dt_free_align(c);
+}
+
+// A ZIP may retain a valid central directory after a later local header is
+// damaged. A streaming reader can then stop after earlier entries as if it
+// had reached EOF; do not turn that prefix into a successful merge.
+static void test_merge_late_header_with_central(void **state)
+{
+  _fixture_t *f = *state;
+  gchar *other = g_build_filename(f->dir, "IMG_0001_01.RAF.dtdata", NULL);
+  const int w = 32, h = 32;
+  float *a = _make_noise(w, h, 11);
+  float *b = _make_noise(w, h, 12);
+  dt_dtdata_ref_t ra, rb;
+  assert_true(dt_dtdata_file_write_gray(f->path, DT_DTDATA_KIND_MASK,
+                                        0, NULL, a, w, h, 8, &ra));
+  assert_true(dt_dtdata_file_write_gray(f->path, DT_DTDATA_KIND_MASK,
+                                        0, NULL, b, w, h, 8, &rb));
+
+  gchar *bytes = NULL;
+  gsize len = 0;
+  assert_true(g_file_get_contents(f->path, &bytes, &len, NULL));
+  gboolean damaged = FALSE;
+  for(gsize i = 0; i + 30 + strlen(rb.entry) < len; i++)
+  {
+    if(!memcmp(bytes + i, "PK\003\004", 4)
+       && !memcmp(bytes + i + 30, rb.entry, strlen(rb.entry)))
+    {
+      memcpy(bytes + i, "XX\003\004", 4);
+      damaged = TRUE;
+      break;
+    }
+  }
+  assert_true(damaged);
+  assert_true(g_file_set_contents(f->path, bytes, len, NULL));
+  assert_false(g_file_test(other, G_FILE_TEST_EXISTS));
+  assert_false(dt_dtdata_file_merge(f->path, other));
+  assert_false(g_file_test(other, G_FILE_TEST_EXISTS));
+  g_free(bytes);
+  g_free(other);
+  dt_free_align(a);
+  dt_free_align(b);
 }
 
 // the finder matches the image's own sidecar and its numbered duplicates,
@@ -541,8 +654,10 @@ static void test_path_for_image(void **state)
 int main(void)
 {
   const struct CMUnitTest tests[] = {
+    cmocka_unit_test_setup_teardown(test_source_digest_tracks_bytes_not_path, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_roundtrip_8bit, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_roundtrip_16bit, _setup, _teardown),
+    cmocka_unit_test_setup_teardown(test_rgba_patch_roundtrip, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_multiple_entries_and_dedup, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_missing_and_corrupt, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_merge, _setup, _teardown),
@@ -551,6 +666,7 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_sweep_keep_absent, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_merge_unreadable_entry, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_merge_truncated_source_into_missing, _setup, _teardown),
+    cmocka_unit_test_setup_teardown(test_merge_late_header_with_central, _setup, _teardown),
     cmocka_unit_test_setup_teardown(test_find_all, _setup, _teardown),
     cmocka_unit_test(test_path_for_image),
   };

@@ -1921,7 +1921,6 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
   GtkSettings *settings = gtk_settings_get_default();
   g_object_set(G_OBJECT(settings), "gtk-application-prefer-dark-theme", TRUE, (gchar *)0);
   g_object_set(G_OBJECT(settings), "gtk-theme-name", "Adwaita", (gchar *)0);
-  g_object_unref(settings);
 
   // smooth scrolling must be enabled to handle trackpad/touch events
   gui->scroll_mask = GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK;
@@ -5925,6 +5924,7 @@ GdkCursor *dt_gui_cursor_new_for_name(GdkDisplay *display, const char *cursor_na
     else if(!strcmp(cursor_name, "grab"))      type = GDK_HAND1;
     else if(!strcmp(cursor_name, "cell"))      type = GDK_PLUS;
     else if(!strcmp(cursor_name, "help"))      type = GDK_QUESTION_ARROW;
+    else if(!strcmp(cursor_name, "exchange"))  type = GDK_EXCHANGE;
     else if(!strcmp(cursor_name, "ns-resize")) type = GDK_DOUBLE_ARROW;
     cursor = gdk_cursor_new_for_display(display, type);
   }

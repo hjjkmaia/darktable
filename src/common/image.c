@@ -86,6 +86,11 @@ typedef struct dt_undo_duplicate_t
   dt_imgid_t orig_imgid;
   int32_t version;
   dt_imgid_t new_imgid;
+  gboolean present;
+  char source_path[PATH_MAX];
+  char sidecar_path[PATH_MAX];
+  char sidecar_sha256[DT_DTDATA_SOURCE_SHA256_LEN];
+  gboolean sidecar_required;
 } dt_undo_duplicate_t;
 
 static void _pop_undo_execute(const dt_imgid_t imgid,
@@ -94,7 +99,8 @@ static void _pop_undo_execute(const dt_imgid_t imgid,
 
 static int32_t _image_duplicate_with_version(const dt_imgid_t imgid,
                                              const int32_t newversion,
-                                             const gboolean undo);
+                                             const gboolean undo,
+                                             const dt_imgid_t restore_imgid);
 
 static void _pop_undo(gpointer user_data,
                       const dt_undo_type_t type,
@@ -731,15 +737,78 @@ static void _pop_undo(gpointer user_data,
 
     if(action == DT_ACTION_UNDO)
     {
-      // remove image
-      dt_image_remove(undo->new_imgid);
+      if(undo->present)
+      {
+        char source_path[PATH_MAX] = { 0 };
+        char sidecar_path[PATH_MAX] = { 0 };
+        dt_image_full_path(undo->orig_imgid, source_path, sizeof(source_path), NULL);
+        dt_dtdata_path(undo->new_imgid, sidecar_path, sizeof(sidecar_path));
+        const gboolean had_sidecar = sidecar_path[0]
+          && g_file_test(sidecar_path, G_FILE_TEST_EXISTS);
+        dt_image_remove(undo->new_imgid);
+        sqlite3_stmt *stmt = NULL;
+        DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                                    "SELECT 1 FROM main.images WHERE id = ?1",
+                                    -1, &stmt, NULL);
+        DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, undo->new_imgid);
+        undo->present = sqlite3_step(stmt) == SQLITE_ROW;
+        sqlite3_finalize(stmt);
+        if(undo->present)
+          dt_control_log(_("the duplicate could not be removed for undo"));
+        else
+        {
+          // A source rename while this row is absent will not move its
+          // orphaned raster sidecar. Bind Redo to the original photo path.
+          g_strlcpy(undo->source_path, source_path, sizeof(undo->source_path));
+          char canonical_image[PATH_MAX] = { 0 };
+          char canonical_sidecar[PATH_MAX] = { 0 };
+          g_strlcpy(canonical_image, source_path, sizeof(canonical_image));
+          dt_image_path_append_version_no_db(undo->version, canonical_image,
+                                             sizeof(canonical_image));
+          dt_dtdata_path_for_image(canonical_image, canonical_sidecar,
+                                   sizeof(canonical_sidecar));
+          const gboolean canonical_exists = source_path[0]
+            && g_file_test(canonical_sidecar, G_FILE_TEST_EXISTS);
+          g_strlcpy(undo->sidecar_path,
+                    canonical_exists ? canonical_sidecar : sidecar_path,
+                    sizeof(undo->sidecar_path));
+          undo->sidecar_required = had_sidecar || canonical_exists;
+          undo->sidecar_sha256[0] = '\0';
+          if(undo->sidecar_required
+             && !dt_dtdata_file_source_sha256(undo->sidecar_path,
+                                              undo->sidecar_sha256))
+            dt_control_log(_("the duplicate raster sidecar could not be verified for redo"));
+          *imgs = g_list_remove_all(*imgs, GINT_TO_POINTER(undo->new_imgid));
+        }
+      }
     }
-    else
+    else if(!undo->present)
     {
-      // restore image, note that we record the new imgid created while
-      // restoring the duplicate.
-      undo->new_imgid = _image_duplicate_with_version(undo->orig_imgid, undo->version, FALSE);
-      *imgs = g_list_prepend(*imgs, GINT_TO_POINTER(undo->new_imgid));
+      char source_path[PATH_MAX] = { 0 };
+      char sidecar_sha256[DT_DTDATA_SOURCE_SHA256_LEN] = { 0 };
+      dt_image_full_path(undo->orig_imgid, source_path, sizeof(source_path), NULL);
+      if(!source_path[0] || strcmp(source_path, undo->source_path)
+         || (undo->sidecar_required
+             && (!undo->sidecar_sha256[0]
+                 || !dt_dtdata_file_source_sha256(undo->sidecar_path, sidecar_sha256)
+                 || strcmp(sidecar_sha256, undo->sidecar_sha256))))
+      {
+        dt_control_log(_("the duplicate source or raster sidecar changed; redo was not applied"));
+        return;
+      }
+      // History undo snapshots and versioned raster sidecars refer to this
+      // exact image ID and version. Recreating a different duplicate loses
+      // both on redo.
+      const dt_imgid_t restored = _image_duplicate_with_version(undo->orig_imgid,
+                                                                 undo->version, FALSE,
+                                                                 undo->new_imgid);
+      if(restored == undo->new_imgid)
+      {
+        undo->present = TRUE;
+        *imgs = g_list_prepend(*imgs, GINT_TO_POINTER(restored));
+      }
+      else
+        dt_control_log(_("the duplicate could not be restored for redo"));
     }
   }
   else if(type == DT_UNDO_FLAGS)
@@ -1312,40 +1381,52 @@ int32_t dt_image_duplicate(const dt_imgid_t imgid)
   return dt_image_duplicate_with_version(imgid, -1);
 }
 
-static int32_t _image_get_possible_version(const dt_imgid_t imgid,
-                                           const int32_t max_version)
+static int32_t _image_get_possible_version(const dt_imgid_t imgid)
 {
-  int32_t safe_max_version = 0;
+  sqlite3_stmt *stmt = NULL;
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT COALESCE(MAX(a.version), 0),"
+                              "       COALESCE(MAX(a.max_version), 0)"
+                              "  FROM main.images AS b JOIN main.images AS a"
+                              "    ON a.film_id = b.film_id AND a.filename = b.filename"
+                              " WHERE b.id = ?1 GROUP BY b.id",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  const gboolean found = sqlite3_step(stmt) == SQLITE_ROW;
+  const int32_t max_version = found
+    ? MAX(sqlite3_column_int(stmt, 0), sqlite3_column_int(stmt, 1)) : -1;
+  sqlite3_finalize(stmt);
+  if(!found || max_version >= 999) return -1;
+
   char imgpath[PATH_MAX] = { 0 };
   char versionpath[PATH_MAX] = { 0 };
 
   dt_image_full_path(imgid, imgpath, sizeof(imgpath), NULL);
+  if(!imgpath[0]) return -1;
 
-  for(int32_t version = MAX(1, max_version); version < 1000; version++)
+  for(int32_t version = MAX(1, max_version + 1); version < 1000; version++)
   {
     g_strlcpy(versionpath, imgpath, sizeof(versionpath));
     dt_image_path_append_version_no_db(version, versionpath, sizeof(versionpath));
+    char datapath[PATH_MAX] = { 0 };
+    dt_dtdata_path_for_image(versionpath, datapath, sizeof(datapath));
     const size_t len = strlen(versionpath);
     g_snprintf(versionpath + len, sizeof(versionpath) - len, "%s", ".xmp");
-    if(!(g_file_test(versionpath, G_FILE_TEST_EXISTS) && g_file_test(versionpath, G_FILE_TEST_IS_REGULAR)))
+    if(!g_file_test(versionpath, G_FILE_TEST_EXISTS)
+       && !g_file_test(datapath, G_FILE_TEST_EXISTS))
     {
-      safe_max_version = version;
-      // fprintf(stderr, "%s\n", versionpath);
-      break;
+      return version;
     }
   }
-  if(safe_max_version == 0)
-  {
-    dt_print(DT_DEBUG_ALWAYS, "image_get_possible_version couldn't find a safe new version above %d",
-      max_version);
-    safe_max_version = max_version;
-  }
-
-  return safe_max_version;
+  dt_print(DT_DEBUG_ALWAYS,
+           "image_get_possible_version couldn't find a safe new version above %d",
+           max_version);
+  return -1;
 }
 
 static dt_imgid_t _image_duplicate_with_version_ext(const dt_imgid_t imgid,
-                                                    const int32_t newversion)
+                                                    const int32_t newversion,
+                                                    const dt_imgid_t restore_imgid)
 {
   if(dt_gimpmode())
   {
@@ -1356,6 +1437,41 @@ static dt_imgid_t _image_duplicate_with_version_ext(const dt_imgid_t imgid,
 
   sqlite3_stmt *stmt;
   dt_imgid_t newid = NO_IMGID;
+  const gboolean restoring = dt_is_valid_imgid(restore_imgid);
+  if(restoring)
+  {
+    if(newversion < 0) return NO_IMGID;
+    dt_database_start_transaction(darktable.db);
+    // A redo must never adopt another image or shift positions when either
+    // the original or the versioned slot has changed since Undo.
+    DT_DEBUG_SQLITE3_PREPARE_V2
+      (dt_database_get(darktable.db),
+       "SELECT (SELECT COUNT(*) FROM main.images WHERE id = ?2),"
+       "       (SELECT COUNT(*) FROM main.images WHERE id = ?1),"
+       "       (SELECT COUNT(*) FROM main.images AS a JOIN main.images AS b"
+       "          ON a.film_id = b.film_id AND a.filename = b.filename"
+       "          WHERE b.id = ?2 AND a.version = ?3)",
+       -1, &stmt, NULL);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, restore_imgid);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, imgid);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 3, newversion);
+    const gboolean available = sqlite3_step(stmt) == SQLITE_ROW
+      && sqlite3_column_int(stmt, 0) == 1
+      && sqlite3_column_int(stmt, 1) == 0
+      && sqlite3_column_int(stmt, 2) == 0;
+    sqlite3_finalize(stmt);
+    if(!available)
+    {
+      dt_database_rollback_transaction(darktable.db);
+      return NO_IMGID;
+    }
+  }
+  // preflight the catalog and sidecars before shifting positions or inserting
+  // a row, since cached max_version can lag behind an existing duplicate
+  const int32_t safe_new_version = (newversion == -1)
+    ? _image_get_possible_version(imgid) : -1;
+  if(newversion == -1 && safe_new_version < 0) return NO_IMGID;
+
   const int64_t image_position = dt_collection_get_image_position(imgid, 0);
   const int64_t new_image_position =
     (image_position < 0) ? _max_image_position() : image_position + 1;
@@ -1380,7 +1496,15 @@ static dt_imgid_t _image_duplicate_with_version_ext(const dt_imgid_t imgid,
   sqlite3_finalize(stmt);
 
   // requested version is already present in DB, so we just return it
-  if(dt_is_valid_imgid(newid)) return newid;
+  if(dt_is_valid_imgid(newid))
+  {
+    if(restoring)
+    {
+      dt_database_rollback_transaction(darktable.db);
+      return NO_IMGID;
+    }
+    return newid;
+  }
 
   // clang-format off
   DT_DEBUG_SQLITE3_PREPARE_V2
@@ -1394,29 +1518,40 @@ static dt_imgid_t _image_duplicate_with_version_ext(const dt_imgid_t imgid,
      "   colorspace, version, max_version,"
      "   history_end, position, aspect_ratio, exposure_bias, import_timestamp,"
      "   whitebalance_id, flash_id, exposure_program_id, metering_mode_id, flash_tagvalue)"
-     " SELECT NULL, group_id, film_id, width, height, filename,"
+     " SELECT ?1, group_id, film_id, width, height, filename,"
      "        maker_id, model_id, camera_id, lens_id,"
      "        exposure, aperture, iso, focal_length, focus_distance, datetime_taken,"
      "        flags, output_width, output_height, crop, raw_parameters,"
      "        raw_black, raw_maximum, orientation,"
-     "        longitude, latitude, altitude, color_matrix, colorspace, NULL, NULL, 0, ?1,"
+     "        longitude, latitude, altitude, color_matrix, colorspace, NULL, NULL, 0, ?2,"
      "        aspect_ratio, exposure_bias, import_timestamp,"
      "        whitebalance_id, flash_id, exposure_program_id, metering_mode_id, flash_tagvalue"
-     " FROM main.images WHERE id = ?2",
+     " FROM main.images WHERE id = ?3",
      -1, &stmt, NULL);
   // clang-format on
-  DT_DEBUG_SQLITE3_BIND_INT64(stmt, 1, new_image_position);
-  DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, imgid);
-  sqlite3_step(stmt);
+  if(restoring)
+  {
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, restore_imgid);
+  }
+  else
+  {
+    sqlite3_bind_null(stmt, 1);
+  }
+  DT_DEBUG_SQLITE3_BIND_INT64(stmt, 2, new_image_position);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 3, imgid);
+  const gboolean inserted = sqlite3_step(stmt) == SQLITE_DONE
+    && sqlite3_changes(dt_database_get(darktable.db)) == 1;
   sqlite3_finalize(stmt);
+  if(!inserted)
+  {
+    if(restoring) dt_database_rollback_transaction(darktable.db);
+    return NO_IMGID;
+  }
+  newid = restoring ? restore_imgid : sqlite3_last_insert_rowid(dt_database_get(darktable.db));
   // clang-format off
   DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT a.id, a.film_id, a.filename, b.max_version"
-                              "  FROM main.images AS a JOIN main.images AS b"
-                              "  WHERE a.film_id = b.film_id"
-                              "    AND a.filename = b.filename"
-                              "    AND b.id = ?1"
-                              "  ORDER BY a.id DESC",
+                              "SELECT film_id, filename, max_version"
+                              "  FROM main.images WHERE id = ?1",
     -1, &stmt, NULL);
   // clang-format on
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
@@ -1426,12 +1561,16 @@ static dt_imgid_t _image_duplicate_with_version_ext(const dt_imgid_t imgid,
   gchar *filename = NULL;
   if(sqlite3_step(stmt) == SQLITE_ROW)
   {
-    newid = sqlite3_column_int(stmt, 0);
-    film_id = sqlite3_column_int(stmt, 1);
-    filename = g_strdup((gchar *)sqlite3_column_text(stmt, 2));
-    max_version = sqlite3_column_int(stmt, 3);
+    film_id = sqlite3_column_int(stmt, 0);
+    filename = g_strdup((gchar *)sqlite3_column_text(stmt, 1));
+    max_version = sqlite3_column_int(stmt, 2);
   }
   sqlite3_finalize(stmt);
+  if(!filename)
+  {
+    if(restoring) dt_database_rollback_transaction(darktable.db);
+    return NO_IMGID;
+  }
 
   if(dt_is_valid_imgid(newid))
   {
@@ -1499,24 +1638,16 @@ static dt_imgid_t _image_duplicate_with_version_ext(const dt_imgid_t imgid,
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 
-    int32_t safe_new_version = max_version + 1;
-    if(newversion == -1)
-    {
-      // we can't take for granted that we have an unused version by taking `max_version+1` as
-      // a) other database might also use this image file or
-      // b) duplicates had been removed from and later added to database.
-      safe_new_version = _image_get_possible_version(imgid, safe_new_version);
-      if(safe_new_version != max_version + 1)
-        dt_print(DT_DEBUG_ALWAYS, "dt_image_duplicate version forced %d -> %d",
-          max_version + 1, safe_new_version);
-    }
+    if(newversion == -1 && safe_new_version != max_version + 1)
+      dt_print(DT_DEBUG_ALWAYS, "dt_image_duplicate version forced %d -> %d",
+        max_version + 1, safe_new_version);
 
     // set version of new entry and max_version of all involved
     // duplicates (with same film_id and filename) this needs to
     // happen before we do anything with the image cache, as version
     // isn't updated through the cache
     const int32_t version = (newversion != -1) ? newversion : safe_new_version;
-    max_version = (newversion != -1) ? MAX(max_version, newversion) : safe_new_version;
+    max_version = MAX(max_version, version);
 
     DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
                                 "UPDATE main.images SET version=?1 WHERE id = ?2",
@@ -1540,24 +1671,36 @@ static dt_imgid_t _image_duplicate_with_version_ext(const dt_imgid_t imgid,
 
     g_free(filename);
   }
+  if(restoring) dt_database_release_transaction(darktable.db);
   return newid;
 }
 
 static dt_imgid_t _image_duplicate_with_version(const dt_imgid_t imgid,
                                                 const int32_t newversion,
-                                                const gboolean undo)
+                                                const gboolean undo,
+                                                const dt_imgid_t restore_imgid)
 {
-  const dt_imgid_t newid = _image_duplicate_with_version_ext(imgid, newversion);
+  const dt_imgid_t newid = _image_duplicate_with_version_ext(imgid, newversion,
+                                                              restore_imgid);
 
   if(dt_is_valid_imgid(newid))
   {
     if(undo)
     {
-      dt_undo_duplicate_t *dupundo = malloc(sizeof(dt_undo_duplicate_t));
+      dt_undo_duplicate_t *dupundo = calloc(1, sizeof(dt_undo_duplicate_t));
       dupundo->orig_imgid = imgid;
-      dupundo->version = newversion;
       dupundo->new_imgid = newid;
-      dt_undo_record(darktable.undo, NULL, DT_UNDO_DUPLICATE, dupundo, _pop_undo, NULL);
+      dupundo->present = TRUE;
+      dupundo->version = newversion;
+      sqlite3_stmt *stmt = NULL;
+      DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                                  "SELECT version FROM main.images WHERE id = ?1",
+                                  -1, &stmt, NULL);
+      DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, newid);
+      if(sqlite3_step(stmt) == SQLITE_ROW)
+        dupundo->version = sqlite3_column_int(stmt, 0);
+      sqlite3_finalize(stmt);
+      dt_undo_record(darktable.undo, NULL, DT_UNDO_DUPLICATE, dupundo, _pop_undo, free);
     }
 
     // make sure that the duplicate doesn't have some magic darktable| tags
@@ -1586,7 +1729,7 @@ static dt_imgid_t _image_duplicate_with_version(const dt_imgid_t imgid,
 dt_imgid_t dt_image_duplicate_with_version(const dt_imgid_t imgid,
                                            const int32_t newversion)
 {
-  return _image_duplicate_with_version(imgid, newversion, TRUE);
+  return _image_duplicate_with_version(imgid, newversion, TRUE, NO_IMGID);
 }
 
 void dt_image_remove(const dt_imgid_t imgid)
@@ -1788,7 +1931,7 @@ static int _image_read_duplicates(const uint32_t id,
       // dt_image_duplicate_with_version() as this version also set the group which
       // is using DT_IMAGE_CACHE_SAFE and so will write the .XMP. But we must avoid
       // this has the xmp for the duplicate is read just below.
-      newid = _image_duplicate_with_version_ext(id, version);
+      newid = _image_duplicate_with_version_ext(id, version, NO_IMGID);
       const dt_image_t *img = dt_image_cache_get(id, 'r');
       grpid = img ? img->group_id : NO_IMGID;
       dt_image_cache_read_release(img);
@@ -2591,6 +2734,11 @@ dt_imgid_t dt_image_copy_rename(const dt_imgid_t imgid,
                                 const dt_filmid_t filmid,
                                 const gchar *newname)
 {
+  if(!dt_dtdata_history_copyable(imgid))
+  {
+    dt_control_log(_("history-preserving copy is unavailable for raster sidecars or missing raster data"));
+    return NO_IMGID;
+  }
   dt_imgid_t newid = NO_IMGID;
   sqlite3_stmt *stmt;
   gchar srcpath[PATH_MAX] = { 0 };
@@ -2833,7 +2981,12 @@ dt_imgid_t dt_image_copy_rename(const dt_imgid_t imgid,
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
 
-        dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE);
+        if(!dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE))
+        {
+          g_free(filename);
+          newid = NO_IMGID;
+          goto copy_done;
+        }
 
         dt_image_synch_xmp(newid);
 
@@ -2850,6 +3003,7 @@ dt_imgid_t dt_image_copy_rename(const dt_imgid_t imgid,
                "[dt_image_copy_rename] Failed to copy image %s: %s",
                srcpath, gerror->message);
     }
+copy_done:
     g_object_unref(dest);
     g_object_unref(src);
     g_clear_error(&gerror);

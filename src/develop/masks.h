@@ -420,6 +420,7 @@ typedef struct dt_masks_form_gui_t
   gboolean form_selected;
   gboolean border_selected;
   gboolean source_selected;
+  gboolean ellipse_rotation_selected;
   gboolean source_rotating;
   gboolean counter_rotate_source;
   // joint rotation grabbed from the source shape: the mouse circles the source,
@@ -463,6 +464,8 @@ typedef struct dt_masks_form_gui_t
   gboolean creation_closing_form;
   dt_iop_module_t *creation_module;
   dt_iop_module_t *creation_continuous_module;
+  // pending Subtract tool choice for an existing mask, never persisted
+  dt_mask_id_t subtract_parentid;
 
   dt_masks_pressure_sensitivity_t pressure_sensitivity;
 

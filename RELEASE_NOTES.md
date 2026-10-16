@@ -101,6 +101,31 @@ changes (where available).
 
 ## UI/UX Improvements
 
+- Ellipse masks now show two curved-arrow rotation marks outside the selected
+  outline. Drag either mark or the nearby outline to rotate while all four
+  resize handles remain available.
+
+- The mask manager can show a light rose overlay for the selected mask while
+  editing; the overlay is not included in exports. Right-click menus now offer
+  Add and Subtract shapes and, for supported local vector masks, Invert,
+  Duplicate Mask, and Duplicate and Invert Mask.
+  Eligible drawn masks on standard modules, including exposure, also support
+  Subtract and Invert; shared, parametric, and raster masks are excluded.
+
+- Option-dragging a vector shape in the mask manager copies it within or
+  between supported local masks, preserving its shape and combine setting.
+
+- Local Adjustments now lists each mask with its component shapes underneath.
+  One shared set of sliders edits the selected adjustment, while its technical
+  mask-source modules stay out of the right panel. The Mask Manager is labeled
+  advanced and normally omits duplicate top-level shape entries; **All shapes**
+  restores the full inventory for reuse.
+
+- An experimental magic eraser can replace a small painted area with nearby
+  background pixels. It shows a before/after preview, saves only after explicit
+  acceptance, and keeps the edit reversible. Large or unsuitable areas are
+  refused instead of producing an unchecked fill.
+
 - The code has received a large set of changes in preparation of the
   Gtk4 migration.
   - The code for handling popover menus has been changed.
@@ -155,6 +180,21 @@ changes (where available).
   rotate and perspective this also restores the module's on/off
   state; for crop the previous rectangle is restored.
 
+- The crop tool now also rotates and straightens the image: dragging
+  just outside a corner of the crop frame rotates through the rotate
+  and perspective module, which is switched on automatically by the
+  first rotation gesture if it was off, and a new "straighten" button
+  in the crop panel arms a ruler: drag a line along an edge that
+  should be level and the rotation is set from it on release.
+  Rotation works up to 180 degrees in either direction. While the
+  crop tool is open, Enter commits the crop rectangle and the
+  rotation together and closes the tool, and Escape reverts both to
+  the state they had when the tool was opened (the rotation and the
+  module's on/off state first, then the crop rectangle). The combined
+  revert is available only while the crop tool is open: switching to
+  the rotate and perspective module mid-session commits the crop
+  rectangle and starts a fresh revert baseline there.
+
 - On the color equalizer module a new collapside section with the
   color sliders has been added.
 
@@ -202,6 +242,17 @@ changes (where available).
   move and long outlines are drawn with far fewer points.
 
 ## Other Changes
+
+- The photo import dialog now offers a direct source-folder chooser. Choosing
+  a folder previews its photos immediately; canceling the chooser keeps the
+  current source and recursive selection. The add-in-place and copy modes
+  have clearer descriptions. It also shows the source, selected-photo count,
+  and Copy naming pattern before import, and refuses a missing source or an
+  existing unwritable Copy destination.
+
+- The export panel now summarizes the current destination template, file
+  format, and size limit above Start Export. The summary updates as those
+  settings change and describes limits per image for mixed-size batches.
 
 - PNG exports using a PQ output color profile now include content light
   level metadata (MaxCLL and MaxFALL) for HDR tone mapping.
@@ -312,6 +363,9 @@ changes (where available).
   ready to splice into another invocation.
 
 ## Bug Fixes
+
+- Fixed an intermittent startup crash while loading the interface theme
+  on macOS.
 
 - Fixed overly dark PQ and HLG image imports and overly bright exports,
   including HDR PNG and JPEG XL profile detection.

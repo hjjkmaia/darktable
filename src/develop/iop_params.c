@@ -268,6 +268,30 @@ dt_iop_params_err_t dt_iop_params_builder_get_float(const dt_iop_params_builder_
   return DT_IOP_PARAMS_OK;
 }
 
+dt_iop_params_err_t dt_iop_params_builder_get_int(const dt_iop_params_builder_t *b,
+                                                  const char *field, int *v)
+{
+  if(!b || !v) return DT_IOP_PARAMS_NO_MODULE;
+  dt_iop_params_err_t err = DT_IOP_PARAMS_OK;
+  void *p = NULL;
+  dt_introspection_field_t *f = _field(b, field, &p, &err);
+  if(!f) return err;
+  switch(f->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_INT:
+    case DT_INTROSPECTION_TYPE_ENUM:
+      if(f->header.size != sizeof(int)) return DT_IOP_PARAMS_TYPE;
+      *v = *(const int *)p;
+      break;
+    case DT_INTROSPECTION_TYPE_BOOL:
+      *v = *(const gboolean *)p ? 1 : 0;
+      break;
+    default:
+      return DT_IOP_PARAMS_TYPE;
+  }
+  return DT_IOP_PARAMS_OK;
+}
+
 const void *dt_iop_params_builder_blob(const dt_iop_params_builder_t *b,
                                        size_t *size, int *version)
 {

@@ -5966,6 +5966,21 @@ static void _ashift_cancel(dt_action_t *action)
   dt_iop_request_focus(NULL);
 }
 
+/* crop's combined session cancel drops deferred work here so nothing
+ * rewrites the params after a restore (src/iop/crop.c:_crop_cancel).
+ * Unlike _ashift_cancel this needs no focus and leaves the session
+ * snapshot untouched; invoked via dt_action_locate, so no default key */
+static void _ashift_purge_jobs(dt_action_t *action)
+{
+  (void)action;
+  dt_iop_module_t *self = dt_iop_get_module("ashift");
+  if(!self || !self->gui_data) return;
+  dt_iop_ashift_gui_data_t *g = self->gui_data;
+  g->jobcode = ASHIFT_JOBCODE_NONE;
+  g->jobparams = 0;
+  g->straightening = FALSE;
+}
+
 static float log2_curve(const float inval, const dt_bauhaus_curve_t dir)
 {
   float outval;
@@ -6284,6 +6299,10 @@ void gui_init(dt_iop_module_t *self)
   /* no default key: crop owns Enter/Escape and routes Escape here while
    * rotate-and-perspective has focus (src/iop/crop.c:_crop_cancel) */
   dt_action_register(DT_ACTION(self->so), N_("cancel"), _ashift_cancel, 0, 0);
+
+  /* no default key either: crop's session cancel invokes this via
+   * dt_action_locate before restoring its snapshot */
+  dt_action_register(DT_ACTION(self->so), N_("purge"), _ashift_purge_jobs, 0, 0);
 
   /* add signal handler for preview pipe finish to redraw the overlay */
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _event_process_after_preview_callback);

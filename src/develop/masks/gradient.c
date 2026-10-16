@@ -450,6 +450,7 @@ static int _gradient_events_button_released(dt_iop_module_t *module,
 
     dt_iop_module_t *crea_module = gui->creation_module;
     dt_masks_gui_form_save_creation(darktable.develop, crea_module, form, gui);
+    if(!gui->formid) return 1;
 
     if(crea_module)
     {

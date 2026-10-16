@@ -60,6 +60,7 @@ FILE(GLOB SOURCE_FILES
   "common/histogram.c"
   "common/history.c"
   "common/history_snapshot.c"
+  "common/ai/inpaint.c"
   "common/dtdata.c"
   "common/image.c"
   "common/image_cache.c"

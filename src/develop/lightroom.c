@@ -23,6 +23,7 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/history.h"
+#include "common/illuminants.h"
 #include "common/math.h"
 #include "common/metadata.h"
 #include "common/ratings.h"
@@ -408,6 +409,15 @@ typedef struct lr_data_t
   int luminance_smoothing;
   int color_noise_reduction;
 
+  // Photo-flavor white balance. Temperature is kelvin around 5500,
+  // not an absolute Adobe reading. Tint is green (-) to magenta (+).
+  char wb_mode[64];
+  gboolean has_wb_mode;
+  float wb_temp;
+  gboolean has_wb_temp;
+  float wb_tint;
+  gboolean has_wb_tint;
+
   dt_iop_splittoning_params_t pst;
   gboolean has_splittoning;
 
@@ -619,6 +629,28 @@ static void _lrop(const dt_develop_t *dev, const xmlDocPtr doc, const dt_imgid_t
     else if(!xmlStrcmp(name, (const xmlChar *)"ColorNoiseReduction"))
     {
       data->color_noise_reduction = atoi((char *)value);
+    }
+    else if(!xmlStrcmp(name, (const xmlChar *)"WhiteBalance"))
+    {
+      // crs:WhiteBalance is a name ("Custom", "As Shot", a preset).
+      // exif:WhiteBalance is 0 or 1 and is parsed later; leave the name.
+      const char *v = (const char *)value;
+      if(v[0] < '0' || v[0] > '9')
+      {
+        g_strlcpy(data->wb_mode, v, sizeof(data->wb_mode));
+        g_strstrip(data->wb_mode);
+        data->has_wb_mode = data->wb_mode[0] != '\0';
+      }
+    }
+    else if(!xmlStrcmp(name, (const xmlChar *)"Temperature"))
+    {
+      data->wb_temp = (float)g_ascii_strtod((char *)value, NULL);
+      data->has_wb_temp = TRUE;
+    }
+    else if(!xmlStrcmp(name, (const xmlChar *)"Tint"))
+    {
+      data->wb_tint = (float)g_ascii_strtod((char *)value, NULL);
+      data->has_wb_tint = TRUE;
     }
     else if(!xmlStrcmp(name, (const xmlChar *)"ToneCurveName2012"))
     {
@@ -1231,6 +1263,178 @@ static gboolean _lr_builder_set(dt_iop_params_builder_t *builder,
   return TRUE;
 }
 
+static gboolean _lr_builder_set_int(dt_iop_params_builder_t *builder,
+                                    const char *op,
+                                    const char *field,
+                                    const int v)
+{
+  const dt_iop_params_err_t err = dt_iop_params_builder_set_int(builder, field, v);
+  if(err != DT_IOP_PARAMS_OK)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[lightroom] %s.%s = %d: %s",
+             op, field, v, dt_iop_params_err_str(err));
+    return FALSE;
+  }
+  return TRUE;
+}
+
+// Daylight locus from 4000 K, blackbody below that. Same split as
+// illuminant_to_xy().
+static gboolean _lr_locus_xy(const float t, float *x, float *y)
+{
+  if(t >= 4000.f)
+    CCT_to_xy_daylight(t, x, y);
+  else
+    CCT_to_xy_blackbody(t, x, y);
+  if(*x == 0.f || *y == 0.f)
+    CCT_to_xy_blackbody(t, x, y);
+  return *x == *x && *y == *y && *x > 0.f && *y > 0.f;
+}
+
+// Photo-flavor Temperature is 5500 at no shift. Add (Temperature - 5500)
+// to the as-shot CCT that channelmixerrgb reload_defaults recovered.
+// As Shot, a named preset, Auto, and 5500 K with Tint 0 write no row.
+// JPEG's relative -100..100 temperature is not this scale.
+// Tint 0 on a daylight or blackbody as-shot keeps that illuminant, so the
+// temperature slider shows the result. A green-magenta tint, or an as-shot
+// that is not on that slider, is a custom illuminant: the kelvin slider
+// cannot store a tint, and commit would otherwise rebuild xy from kelvin.
+// The temperature module is left as the camera reference (no second CAT).
+#define DT_LR_WB_NEUTRAL_K 5500.f
+#define DT_LR_WB_TEMP_MIN 1667.f
+#define DT_LR_WB_TEMP_MAX 25000.f
+/* Lightroom tint is about +/-150. blackbody_xy_to_tinted_xy takes an xy
+ * offset. 150 units is a strong cast, about 0.03 in xy. */
+#define DT_LR_TINT_TO_XY (0.03f / 150.f)
+
+static void _lr_import_whitebalance(dt_develop_t *dev,
+                                    const dt_imgid_t imgid,
+                                    const lr_data_t *data,
+                                    char *imported,
+                                    const size_t imported_len,
+                                    int *n_import,
+                                    gboolean *refresh_needed)
+{
+  if(!dev || !dev->iop || !data) return;
+  if(!dt_image_is_rawprepare_supported(&dev->image_storage)) return;
+  if(dt_image_is_monochrome(&dev->image_storage)) return;
+  if(!data->has_wb_temp && !data->has_wb_tint) return;
+  if(data->has_wb_mode && g_ascii_strcasecmp(data->wb_mode, "Custom") != 0)
+    return;
+
+  const float lr_temp = data->has_wb_temp ? data->wb_temp : DT_LR_WB_NEUTRAL_K;
+  const float lr_tint = data->has_wb_tint ? data->wb_tint : 0.f;
+  // Relative JPEG slider, not a kelvin reading around 5500.
+  if(lr_temp > -200.f && lr_temp < 200.f) return;
+  if(_lr_near(lr_temp, DT_LR_WB_NEUTRAL_K) && _lr_near(lr_tint, 0.f)) return;
+
+  dt_iop_module_t *module = dt_iop_get_module_by_op_priority(dev->iop, "channelmixerrgb", 0);
+  if(!module || !module->default_params || !module->default_blendop_params)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[lightroom] no priority-0 instance of 'channelmixerrgb'; skipped");
+    return;
+  }
+
+  dt_iop_params_err_t err = DT_IOP_PARAMS_OK;
+  dt_iop_params_builder_t *builder = dt_iop_params_builder_new(
+    "channelmixerrgb", module->default_params, (size_t)module->params_size, &err);
+  if(!builder)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[lightroom] cannot seed 'channelmixerrgb': %s",
+             dt_iop_params_err_str(err));
+    return;
+  }
+
+  int base_illum = DT_ILLUMINANT_D;
+  int adaptation = DT_ADAPTATION_CAT16;
+  float base_t = 0.f;
+  float base_x = 0.f, base_y = 0.f;
+  if(dt_iop_params_builder_get_int(builder, "illuminant", &base_illum) != DT_IOP_PARAMS_OK
+     || dt_iop_params_builder_get_int(builder, "adaptation", &adaptation) != DT_IOP_PARAMS_OK
+     || dt_iop_params_builder_get_float(builder, "temperature", &base_t) != DT_IOP_PARAMS_OK
+     || dt_iop_params_builder_get_float(builder, "x", &base_x) != DT_IOP_PARAMS_OK
+     || dt_iop_params_builder_get_float(builder, "y", &base_y) != DT_IOP_PARAMS_OK)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[lightroom] channelmixerrgb as-shot fields unreadable");
+    dt_iop_params_builder_free(builder);
+    return;
+  }
+  if(base_illum == DT_ILLUMINANT_PIPE || adaptation == DT_ADAPTATION_RGB)
+  {
+    dt_iop_params_builder_free(builder);
+    return;
+  }
+  if(base_t < DT_LR_WB_TEMP_MIN || base_t > DT_LR_WB_TEMP_MAX)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[lightroom] as-shot temperature %.0f K is outside %g..%g; white balance skipped",
+             base_t, DT_LR_WB_TEMP_MIN, DT_LR_WB_TEMP_MAX);
+    dt_iop_params_builder_free(builder);
+    return;
+  }
+
+  const float target = _lr_clampf(base_t + (lr_temp - DT_LR_WB_NEUTRAL_K),
+                                  DT_LR_WB_TEMP_MIN, DT_LR_WB_TEMP_MAX);
+  const gboolean tint0 = _lr_near(lr_tint, 0.f);
+  // A shift that clamps back onto the as-shot kelvin, with no tint, is no change.
+  if(tint0 && _lr_near(target, base_t))
+  {
+    dt_iop_params_builder_free(builder);
+    return;
+  }
+  float locus_x = 0.f, locus_y = 0.f;
+  float base_locus_x = 0.f, base_locus_y = 0.f;
+  if(!_lr_locus_xy(target, &locus_x, &locus_y)
+     || !_lr_locus_xy(base_t, &base_locus_x, &base_locus_y))
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[lightroom] no chromaticity for %.0f K", target);
+    dt_iop_params_builder_free(builder);
+    return;
+  }
+
+  const gboolean on_slider = base_illum == DT_ILLUMINANT_D || base_illum == DT_ILLUMINANT_BB;
+  gboolean ok = TRUE;
+  if(tint0 && on_slider)
+  {
+    const int illum = (target >= 4000.f) ? DT_ILLUMINANT_D : DT_ILLUMINANT_BB;
+    ok = _lr_builder_set_int(builder, "channelmixerrgb", "illuminant", illum)
+         && _lr_builder_set(builder, "channelmixerrgb", "temperature", target)
+         && _lr_builder_set(builder, "channelmixerrgb", "x", locus_x)
+         && _lr_builder_set(builder, "channelmixerrgb", "y", locus_y);
+  }
+  else
+  {
+    float x = base_x + (locus_x - base_locus_x);
+    float y = base_y + (locus_y - base_locus_y);
+    if(!tint0)
+    {
+      float xt = x, yt = y;
+      blackbody_xy_to_tinted_xy(locus_x, locus_y, target, lr_tint * DT_LR_TINT_TO_XY, &xt, &yt);
+      // Keep the as-shot's distance from the locus, then add the tint
+      // measured from the shifted daylight point.
+      x += xt - locus_x;
+      y += yt - locus_y;
+    }
+    ok = x == x && y == y && x > 0.f && y > 0.f
+         && _lr_builder_set_int(builder, "channelmixerrgb", "illuminant", DT_ILLUMINANT_CUSTOM)
+         && _lr_builder_set(builder, "channelmixerrgb", "temperature", target)
+         && _lr_builder_set(builder, "channelmixerrgb", "x", x)
+         && _lr_builder_set(builder, "channelmixerrgb", "y", y);
+  }
+
+  if(ok)
+  {
+    size_t size = 0;
+    int version = 0;
+    const void *blob = dt_iop_params_builder_blob(builder, &size, &version);
+    _lr_add_hist_current(imgid, module, blob, size, version,
+                         imported, imported_len, n_import, 1);
+    *refresh_needed = TRUE;
+  }
+  dt_iop_params_builder_free(builder);
+}
+
 // Parametric* is paramcurve, not a tonecurve node. The point curve
 // (ToneCurveName2012 other than Linear) still goes to tonecurve.
 // All-zero region sliders and the default splits (25/50/75) write no row.
@@ -1563,6 +1767,12 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
   data.has_splittoning = FALSE;
   data.has_bilat = FALSE;
   data.has_colorgrade = FALSE;
+  data.has_wb_mode = FALSE;
+  data.wb_mode[0] = '\0';
+  data.has_wb_temp = FALSE;
+  data.wb_temp = DT_LR_WB_NEUTRAL_K;
+  data.has_wb_tint = FALSE;
+  data.wb_tint = 0.f;
   data.mapped = NULL;
   if(dev != NULL)
     data.mapped = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
@@ -1637,6 +1847,10 @@ gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto
   if(dev != NULL && data.mapped)
     _lr_import_mapped(dev, imgid, data.mapped, imported, sizeof(imported),
                       &n_import, &refresh_needed);
+
+  if(dev != NULL)
+    _lr_import_whitebalance(dev, imgid, &data, imported, sizeof(imported),
+                            &n_import, &refresh_needed);
 
   if(dev != NULL && is_lr && dt_image_is_raw(&dev->image_storage))
   {

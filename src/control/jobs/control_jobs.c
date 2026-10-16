@@ -946,23 +946,38 @@ static int32_t _control_duplicate_images_job_run(dt_job_t *job)
   const guint total = g_list_length(t);
   double fraction = 0.0f;
 
-  dt_undo_start_group(darktable.undo, DT_UNDO_DUPLICATE);
-
   dt_control_job_set_progress_message(job, ngettext("duplicating %d image",
                                                     "duplicating %d images", total), total);
   double prev_time = 0;
   double last_coll_update = dt_get_wtime() - (INIT_UPDATE_INTERVAL/2.0);
   double update_interval = INIT_UPDATE_INTERVAL;
+  gboolean undo_group_started = FALSE;
   for( ; t && !_job_cancelled(job); t = g_list_next(t))
   {
     const dt_imgid_t imgid = GPOINTER_TO_INT(t->data);
+    if(!GPOINTER_TO_INT(params->data) && !dt_dtdata_history_copyable(imgid))
+    {
+      dt_control_log(_("history-preserving copy is unavailable for raster sidecars or missing raster data"));
+      fraction += 1.0 / total;
+      _update_progress(job, fraction, &prev_time);
+      continue;
+    }
+    if(!undo_group_started)
+    {
+      dt_undo_start_group(darktable.undo, DT_UNDO_DUPLICATE);
+      undo_group_started = TRUE;
+    }
     const int newimgid = dt_image_duplicate(imgid);
     if(dt_is_valid_imgid(newimgid))
     {
       if(GPOINTER_TO_INT(params->data))
         dt_history_delete_on_image(newimgid);
-      else
-        dt_history_copy_and_paste_on_image(imgid, newimgid, FALSE, NULL, TRUE, TRUE, TRUE);
+      else if(!dt_history_copy_and_paste_on_image(imgid, newimgid, FALSE, NULL, TRUE, TRUE, TRUE))
+      {
+        fraction += 1.0 / total;
+        _update_progress(job, fraction, &prev_time);
+        continue;
+      }
 
       // a duplicate should keep the change time stamp of the original
       dt_image_cache_set_change_timestamp_from_image(newimgid, imgid);
@@ -973,7 +988,7 @@ static int32_t _control_duplicate_images_job_run(dt_job_t *job)
     _update_progress(job, fraction, &prev_time);
   }
 
-  dt_undo_end_group(darktable.undo);
+  if(undo_group_started) dt_undo_end_group(darktable.undo);
 
   DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
   dt_control_queue_redraw_center();

@@ -63,6 +63,7 @@ typedef struct dt_lib_export_t
   GtkWidget *width, *height;
   GtkWidget *px_size, *print_size, *scale, *size_in_px;
   GtkWidget *storage, *format;
+  GtkWidget *summary_destination, *summary_format, *summary_size;
   int format_lut[128];
   uint32_t max_allowed_width , max_allowed_height;
   GtkWidget *upscale, *profile, *intent, *style, *style_mode;
@@ -111,8 +112,8 @@ typedef struct dt_export_quick_preset_t
 static const dt_export_quick_preset_t _quick_presets[] = {
   { N_("Web 1080"),    1920, 1080, "jpeg", N_("1920 \303\227 1080 JPEG (Full HD web)") },
   { N_("Web 4K"),      3840, 2160, "jpeg", N_("3840 \303\227 2160 JPEG (4K web)") },
-  { N_("IG square"),   1080, 1080, "jpeg", N_("1080 \303\227 1080 JPEG (Instagram square)") },
-  { N_("IG portrait"), 1080, 1350, "jpeg", N_("1080 \303\227 1350 JPEG (Instagram portrait 4:5)") },
+  { N_("ig square fit"),   1080, 1080, "jpeg", N_("fit within 1080 \303\227 1080 JPEG; preserve the image ratio without cropping") },
+  { N_("ig portrait fit"), 1080, 1350, "jpeg", N_("fit within 1080 \303\227 1350 JPEG; preserve the image ratio without cropping") },
   { N_("Print A4"),    2480, 3508, "jpeg", N_("2480 \303\227 3508 JPEG (A4 at 300 dpi)") },
   { N_("Email"),       1024, 1024, "jpeg", N_("1024 \303\227 1024 JPEG (small email-friendly)") },
 };
@@ -133,6 +134,7 @@ static void _get_max_output_dimension(dt_lib_export_t *d,
                                       uint32_t *height);
 static void _resync_print_dimensions(dt_lib_export_t *self);
 static void _resync_pixel_dimensions(dt_lib_export_t *self);
+static void _update_export_summary(dt_lib_export_t *d);
 
 static inline gboolean _is_style_set(const char *name)
 {
@@ -238,7 +240,7 @@ uint32_t container(dt_lib_module_t *self)
 
 void gui_update(dt_lib_module_t *self)
 {
-  const dt_lib_export_t *d = self->data;
+  dt_lib_export_t *d = self->data;
 
   const gboolean has_act_on = (dt_act_on_get_images_nb(TRUE, FALSE) > 0);
 
@@ -260,6 +262,133 @@ void gui_update(dt_lib_module_t *self)
                            && format_index != -1
                            && storage_index != -1
                            && export_enabled);
+  _update_export_summary(d);
+}
+
+static void _set_summary_label(GtkWidget *label, const gchar *text)
+{
+  gtk_label_set_text(GTK_LABEL(label), text);
+  gtk_widget_set_tooltip_text(label, text);
+}
+
+// disk, gallery and latex keep the directory and filename pattern in one
+// string. piwigo keeps the filename pattern apart from the server
+static const char *_filename_template_key(const char *plugin_name)
+{
+  if(!g_strcmp0(plugin_name, "disk"))
+    return "plugins/imageio/storage/disk/file_directory";
+  if(!g_strcmp0(plugin_name, "gallery"))
+    return "plugins/imageio/storage/gallery/file_directory";
+  if(!g_strcmp0(plugin_name, "latex"))
+    return "plugins/imageio/storage/latex/file_directory";
+  if(!g_strcmp0(plugin_name, "piwigo"))
+    return "plugins/imageio/storage/export/piwigo/filename_pattern";
+  return NULL;
+}
+
+static void _update_export_summary(dt_lib_export_t *d)
+{
+  if(!d->summary_destination) return;
+
+  const char *storage_name = dt_conf_get_string_const(CONFIG_PREFIX "storage_name");
+  dt_imageio_module_storage_t *storage = dt_imageio_get_storage_by_name(storage_name);
+  const char *plugin = storage ? storage->plugin_name : NULL;
+  const char *template_key = _filename_template_key(plugin);
+  gchar *destination;
+
+  if(storage && template_key && g_strcmp0(plugin, "piwigo"))
+  {
+    const char *pattern = dt_conf_get_string_const(template_key);
+    destination = pattern && pattern[0]
+      ? g_strdup_printf(_("destination and filename template: %s"), pattern)
+      : g_strdup(_("destination and filename template: set a path in storage options"));
+  }
+  else if(storage && !g_strcmp0(plugin, "piwigo"))
+  {
+    // the server entry is copied into conf only after a successful login
+    // (piwigo.c:609), so the storage name stays the destination here
+    const char *pattern = dt_conf_get_string_const(template_key);
+    const char *filename = pattern && pattern[0] ? pattern : _("image filename");
+    destination = g_strdup_printf(_("destination: %s; filename template: %s"),
+                                  storage->name(storage), filename);
+  }
+  else
+  {
+    destination = g_strdup_printf(_("destination: %s"),
+                                  storage ? storage->name(storage) : _("choose storage"));
+  }
+  _set_summary_label(d->summary_destination, destination);
+  g_free(destination);
+
+  const char *format_name = dt_conf_get_string_const(CONFIG_PREFIX "format_name");
+  dt_imageio_module_format_t *format = dt_imageio_get_format_by_name(format_name);
+  gchar *format_text = g_strdup_printf(_("format: %s"),
+                                       format ? format->name() : _("choose a file format"));
+  _set_summary_label(d->summary_format, format_text);
+  g_free(format_text);
+
+  // start export uses these conf values. the disabled size entry is only the
+  // active image's preview, so a mixed-orientation batch must not be quoted
+  // from it
+  const gboolean scaling = dt_conf_is_equal(CONFIG_PREFIX "resizing", "scaling");
+  const uint32_t width = dt_conf_get_int(CONFIG_PREFIX "width");
+  const uint32_t height = dt_conf_get_int(CONFIG_PREFIX "height");
+  const dt_export_limit_by_t limit_by =
+    (dt_export_limit_by_t)dt_conf_get_int(CONFIG_PREFIX "limit_by");
+  gchar *size;
+  if(scaling)
+  {
+    const char *factor = dt_conf_get_string_const(CONFIG_PREFIX "resizing_factor");
+    const char *shown = factor && factor[0] ? factor : "1";
+    // imageio.c:1318 forces max_scale to 1 when allow upscaling is off
+    if(dt_conf_get_bool(CONFIG_PREFIX "upscale"))
+      size = g_strdup_printf(_("size: scale %s of each image"), shown);
+    else
+      size = g_strdup_printf(_("size: scale %s of each image, capped at original size"),
+                             shown);
+  }
+  else if(width == 0 && height == 0)
+    size = g_strdup(_("size: original size of each image"));
+  else if(limit_by == DT_EXPORT_LIMIT_LONG_EDGE && width > 0 && width == height)
+    size = g_strdup_printf(
+      _("size: long edge at most %u px; the other side follows each image"), width);
+  else if(width > 0 && height == 0)
+    size = g_strdup_printf(_("size: width at most %u px; height follows each image"),
+                           width);
+  else if(height > 0 && width == 0)
+    size = g_strdup_printf(_("size: height at most %u px; width follows each image"),
+                           height);
+  else
+    size = g_strdup_printf(_("size: each image fits inside %u x %u px"), width, height);
+
+  _set_summary_label(d->summary_size, size);
+  g_free(size);
+}
+
+static void _export_summary_changed(GtkWidget *widget, dt_lib_export_t *d)
+{
+  _update_export_summary(d);
+}
+
+// storage widgets outlive this module, so the handlers are removed in gui_cleanup
+static void _connect_storage_summary(GtkWidget *widget, gpointer user_data)
+{
+  dt_lib_export_t *d = user_data;
+  // "changed" lives on the GtkEditable interface, so a class lookup misses it
+  if(GTK_IS_ENTRY(widget))
+    g_signal_connect_after(widget, "changed", G_CALLBACK(_export_summary_changed), d);
+  if(g_signal_lookup("value-changed", G_OBJECT_TYPE(widget)))
+    g_signal_connect_after(widget, "value-changed", G_CALLBACK(_export_summary_changed), d);
+  if(GTK_IS_CONTAINER(widget))
+    gtk_container_foreach(GTK_CONTAINER(widget), _connect_storage_summary, d);
+}
+
+static void _disconnect_storage_summary(GtkWidget *widget, gpointer user_data)
+{
+  dt_lib_export_t *d = user_data;
+  g_signal_handlers_disconnect_by_func(widget, _export_summary_changed, d);
+  if(GTK_IS_CONTAINER(widget))
+    gtk_container_foreach(GTK_CONTAINER(widget), _disconnect_storage_summary, d);
 }
 
 static void _apply_limit_by_mode(dt_lib_export_t *d); // fwd
@@ -477,6 +606,7 @@ static void _export_with_current_settings(dt_lib_module_t *self)
 static void _export_with_preset(const gchar *preset_name, dt_lib_module_t *self)
 {
   dt_lib_export_t *d = self->data;
+  const int previous_limit_by = dt_bauhaus_combobox_get(d->limit_by);
 
   // get current settings from the GUI
   int params_size;
@@ -511,6 +641,11 @@ static void _export_with_preset(const gchar *preset_name, dt_lib_module_t *self)
 
   // restore previous settings
   set_params(self, params, params_size);
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_combobox_set(d->limit_by, previous_limit_by);
+  DT_LEAVE_GUI_UPDATE();
+  dt_conf_set_int(CONFIG_PREFIX "limit_by", previous_limit_by);
+  _apply_limit_by_mode(d);
 }
 
 static void _export_button_clicked(GtkWidget *widget, dt_lib_module_t *self)
@@ -637,6 +772,7 @@ static void _widht_mdlclick_cb(GtkGestureSingle *gesture, int n_press,
     g_signal_handlers_block_by_func(spin, _width_changed, d);
     gtk_entry_set_text(GTK_ENTRY(spin), "0");
     g_signal_handlers_unblock_by_func(spin, _width_changed, d);
+    if(spin == d->width) _apply_limit_by_mode(d);
   }
   else
   {
@@ -655,6 +791,7 @@ static void _height_mdlclick_cb(GtkGestureSingle *gesture, int n_press,
     g_signal_handlers_block_by_func(spin, _height_changed, d);
     gtk_entry_set_text(GTK_ENTRY(spin), "0");
     g_signal_handlers_unblock_by_func(spin, _height_changed, d);
+    if(spin == d->height) _apply_limit_by_mode(d);
   }
   else
   {
@@ -710,6 +847,7 @@ void _set_dimensions(dt_lib_export_t *d,
   g_free(max_height_char);
   g_free(max_dpi_char);
   _resync_print_dimensions(d);
+  _update_export_summary(d);
 }
 
 
@@ -739,6 +877,11 @@ void gui_reset(dt_lib_module_t *self)
   dt_bauhaus_combobox_set(d->dimensions_type,
                           dt_confgen_get_int(CONFIG_PREFIX "dimensions_type", DT_DEFAULT));
   _size_update_display(d);
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_combobox_set(d->limit_by, DT_EXPORT_LIMIT_BOX);
+  DT_LEAVE_GUI_UPDATE();
+  dt_conf_set_int(CONFIG_PREFIX "limit_by", DT_EXPORT_LIMIT_BOX);
+  _apply_limit_by_mode(d);
 
   // first reset the selected storage and format modules
   dt_imageio_module_format_t *mformat = dt_imageio_get_format();
@@ -1163,9 +1306,10 @@ static void _height_changed(GtkEditable *entry, gpointer user_data)
   const uint32_t height = atoi(gtk_entry_get_text(GTK_ENTRY(d->height)));
   dt_conf_set_int(CONFIG_PREFIX "height", height);
 
-  // Phase 1: when limit_by mode is height, refresh the calculated width preview.
+  // refresh the calculated side when height is the editable limit
   if(d->limit_by &&
-     dt_bauhaus_combobox_get(d->limit_by) == DT_EXPORT_LIMIT_HEIGHT)
+     (dt_bauhaus_combobox_get(d->limit_by) == DT_EXPORT_LIMIT_HEIGHT ||
+      dt_bauhaus_combobox_get(d->limit_by) == DT_EXPORT_LIMIT_LONG_EDGE))
     _apply_limit_by_mode(d);
 }
 
@@ -1493,15 +1637,22 @@ static float _get_active_image_aspect(void)
   const dt_imgid_t imgid = dt_act_on_get_main_image();
   if(!dt_is_valid_imgid(imgid)) return 1.5f;
   int iw = 0, ih = 0;
-  if(!dt_image_get_final_size(imgid, &iw, &ih) || iw <= 0 || ih <= 0)
-    return 1.5f;
+  // FALSE also means the correct dimensions were already cached.
+  dt_image_get_final_size(imgid, &iw, &ih);
+  if(iw <= 0 || ih <= 0) return 1.5f;
   return (float)iw / (float)ih;
 }
 
-// Phase 1: apply the current limit_by mode. For width/height/long-edge modes,
-// the unconstrained dimension is shown as a CALCULATED PREVIEW based on the
-// active image's aspect ratio (Lightroom-style). The conf value for the
-// derived side stays at 0 so the export pipeline computes it per-image.
+// the disabled entry previews the active image's dimensions; width and height
+// modes store 0 for the derived side, while long edge stores equal bounds
+static void _set_dimension_entry(GtkWidget *entry, const uint32_t value)
+{
+  char text[16];
+  g_snprintf(text, sizeof(text), "%u", value);
+  if(strcmp(gtk_entry_get_text(GTK_ENTRY(entry)), text))
+    gtk_entry_set_text(GTK_ENTRY(entry), text);
+}
+
 static void _apply_limit_by_mode(dt_lib_export_t *d)
 {
   const dt_export_limit_by_t mode =
@@ -1511,12 +1662,15 @@ static void _apply_limit_by_mode(dt_lib_export_t *d)
   const uint32_t h = dt_conf_get_int(CONFIG_PREFIX "height");
   const float aspect = _get_active_image_aspect();
 
+  DT_ENTER_GUI_UPDATE();
   switch(mode)
   {
     case DT_EXPORT_LIMIT_BOX:
       // both dimensions act as a bounding box (default existing behavior)
       gtk_widget_set_sensitive(d->width, TRUE);
       gtk_widget_set_sensitive(d->height, TRUE);
+      _set_dimension_entry(d->width, w);
+      _set_dimension_entry(d->height, h);
       break;
 
     case DT_EXPORT_LIMIT_WIDTH:
@@ -1529,11 +1683,8 @@ static void _apply_limit_by_mode(dt_lib_export_t *d)
       const uint32_t preview_h = (w > 0 && aspect > 0.0f)
                                  ? (uint32_t)((float)w / aspect + 0.5f)
                                  : 0;
-      DT_ENTER_GUI_UPDATE();
-      gchar *txt = g_strdup_printf("%u", preview_h);
-      gtk_entry_set_text(GTK_ENTRY(d->height), txt);
-      g_free(txt);
-      DT_LEAVE_GUI_UPDATE();
+      _set_dimension_entry(d->width, w);
+      _set_dimension_entry(d->height, preview_h);
       break;
     }
 
@@ -1545,46 +1696,65 @@ static void _apply_limit_by_mode(dt_lib_export_t *d)
       const uint32_t preview_w = (h > 0 && aspect > 0.0f)
                                  ? (uint32_t)((float)h * aspect + 0.5f)
                                  : 0;
-      DT_ENTER_GUI_UPDATE();
-      gchar *txt = g_strdup_printf("%u", preview_w);
-      gtk_entry_set_text(GTK_ENTRY(d->width), txt);
-      g_free(txt);
-      DT_LEAVE_GUI_UPDATE();
+      _set_dimension_entry(d->width, preview_w);
+      _set_dimension_entry(d->height, h);
       break;
     }
 
     case DT_EXPORT_LIMIT_LONG_EDGE:
     {
-      // long-edge: width entry holds the long-edge target N.
-      // internally we set both conf width=N and height=N so the existing
-      // bounding-box logic gives long-edge = N for any orientation.
-      // displayed height = the actual short-edge for the active image.
-      gtk_widget_set_sensitive(d->width, TRUE);
-      gtk_widget_set_sensitive(d->height, FALSE);
-      if(w > 0)
-      {
-        dt_conf_set_int(CONFIG_PREFIX "height", w);
-        // preview the short edge for the active image
-        uint32_t preview_short;
-        if(aspect >= 1.0f) // landscape: short = w / aspect
-          preview_short = (uint32_t)((float)w / aspect + 0.5f);
-        else               // portrait: short = w * aspect
-          preview_short = (uint32_t)((float)w * aspect + 0.5f);
-        DT_ENTER_GUI_UPDATE();
-        gchar *txt = g_strdup_printf("%u", preview_short);
-        gtk_entry_set_text(GTK_ENTRY(d->height), txt);
-        g_free(txt);
-        DT_LEAVE_GUI_UPDATE();
-      }
+      // both stored limits must equal the long edge for batch exports
+      const gboolean portrait = aspect < 1.0f;
+      const uint32_t long_edge = portrait ? h : w;
+      const uint32_t short_edge = long_edge > 0
+        ? (uint32_t)((float)long_edge * (portrait ? aspect : 1.0f / aspect) + 0.5f)
+        : 0;
+      dt_conf_set_int(CONFIG_PREFIX "width", long_edge);
+      dt_conf_set_int(CONFIG_PREFIX "height", long_edge);
+      gtk_widget_set_sensitive(d->width, !portrait);
+      gtk_widget_set_sensitive(d->height, portrait);
+      _set_dimension_entry(d->width, portrait ? short_edge : long_edge);
+      _set_dimension_entry(d->height, portrait ? long_edge : short_edge);
       break;
     }
   }
+  DT_LEAVE_GUI_UPDATE();
+  _update_export_summary(d);
 }
 
 static void _limit_by_changed(GtkWidget *widget, dt_lib_export_t *d)
 {
   DT_GUARD_GUI_UPDATE();
-  const int mode = dt_bauhaus_combobox_get(widget);
+  const dt_export_limit_by_t mode =
+    (dt_export_limit_by_t)dt_bauhaus_combobox_get(widget);
+  const dt_export_limit_by_t previous =
+    (dt_export_limit_by_t)dt_conf_get_int(CONFIG_PREFIX "limit_by");
+  const uint32_t w = dt_conf_get_int(CONFIG_PREFIX "width");
+  const uint32_t h = dt_conf_get_int(CONFIG_PREFIX "height");
+  const float aspect = _get_active_image_aspect();
+
+  if(mode == DT_EXPORT_LIMIT_WIDTH && w == 0 && h > 0)
+    dt_conf_set_int(CONFIG_PREFIX "width", (uint32_t)((float)h * aspect + 0.5f));
+  else if(mode == DT_EXPORT_LIMIT_WIDTH && previous == DT_EXPORT_LIMIT_LONG_EDGE && aspect < 1.0f)
+    dt_conf_set_int(CONFIG_PREFIX "width", (uint32_t)((float)w * aspect + 0.5f));
+  else if(mode == DT_EXPORT_LIMIT_HEIGHT && h == 0 && w > 0)
+    dt_conf_set_int(CONFIG_PREFIX "height", (uint32_t)((float)w / aspect + 0.5f));
+  else if(mode == DT_EXPORT_LIMIT_HEIGHT && previous == DT_EXPORT_LIMIT_LONG_EDGE && aspect >= 1.0f)
+    dt_conf_set_int(CONFIG_PREFIX "height", (uint32_t)((float)h / aspect + 0.5f));
+  else if(mode == DT_EXPORT_LIMIT_LONG_EDGE && previous != DT_EXPORT_LIMIT_LONG_EDGE)
+  {
+    // choose the current image's effective bound before making both limits equal
+    const float width_bound = w > 0 && h > 0
+      ? ((float)w < (float)h * aspect ? (float)w : (float)h * aspect)
+      : (w > 0 ? (float)w : (float)h * aspect);
+    const float height_bound = width_bound / aspect;
+    const float longer = width_bound > height_bound ? width_bound : height_bound;
+    const uint32_t long_edge = longer > EXPORT_MAX_IMAGE_SIZE
+      ? EXPORT_MAX_IMAGE_SIZE : (uint32_t)(longer + 0.5f);
+    dt_conf_set_int(CONFIG_PREFIX "width", long_edge);
+    dt_conf_set_int(CONFIG_PREFIX "height", long_edge);
+  }
+
   dt_conf_set_int(CONFIG_PREFIX "limit_by", mode);
   _apply_limit_by_mode(d);
 }
@@ -1639,6 +1809,9 @@ void gui_init(dt_lib_module_t *self)
 {
   dt_lib_export_t *d = malloc(sizeof(dt_lib_export_t));
   self->data = (void *)d;
+  d->summary_destination = NULL;
+  d->summary_format = NULL;
+  d->summary_size = NULL;
 
   dt_action_insert_sorted(DT_ACTION(self), &darktable.control->actions_format);
   dt_action_insert_sorted(DT_ACTION(self), &darktable.control->actions_storage);
@@ -1921,6 +2094,20 @@ void gui_init(dt_lib_module_t *self)
                                  NULL,
                                  GDK_KEY_e, GDK_CONTROL_MASK));
 
+  d->summary_destination = gtk_label_new("");
+  d->summary_format = gtk_label_new("");
+  d->summary_size = gtk_label_new("");
+  GtkWidget *summary_labels[] = { d->summary_destination, d->summary_format, d->summary_size };
+  for(size_t i = 0; i < G_N_ELEMENTS(summary_labels); i++)
+  {
+    gtk_label_set_xalign(GTK_LABEL(summary_labels[i]), 0.0f);
+    gtk_label_set_max_width_chars(GTK_LABEL(summary_labels[i]), 38);
+    gtk_label_set_ellipsize(GTK_LABEL(summary_labels[i]), PANGO_ELLIPSIZE_END);
+  }
+  GtkWidget *summary_title = dt_ui_section_label_new(C_("section", "current export settings"));
+  gtk_widget_set_tooltip_text(summary_title,
+                              _("start export uses these settings; multi-preset export uses each preset"));
+
   self->widget = dt_gui_vbox
     (dt_ui_section_label_new(C_("section", "storage options")),
      d->storage, d->storage_extra_container,
@@ -1932,6 +2119,8 @@ void gui_init(dt_lib_module_t *self)
      d->upscale, d->high_quality, d->export_masks,
      d->profile, d->intent,
      style_box, d->style_mode,
+     summary_title,
+     d->summary_destination, d->summary_format, d->summary_size,
      d->export_button);
 
   // Phase 1: wrap quick presets in a collapsible section so it adds zero height
@@ -2059,6 +2248,23 @@ void gui_init(dt_lib_module_t *self)
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_COLLECTION_CHANGED, _collection_updated_callback);
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_IMAGEIO_STORAGE_EXPORT_ENABLE, _export_enable_callback);
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_PRESETS_CHANGED, _export_presets_changed_callback);
+
+  g_signal_connect_after(d->storage, "value-changed", G_CALLBACK(_export_summary_changed), d);
+  g_signal_connect_after(d->format, "value-changed", G_CALLBACK(_export_summary_changed), d);
+  g_signal_connect_after(d->dimensions_type, "value-changed", G_CALLBACK(_export_summary_changed), d);
+  g_signal_connect_after(d->limit_by, "value-changed", G_CALLBACK(_export_summary_changed), d);
+  g_signal_connect_after(d->upscale, "value-changed", G_CALLBACK(_export_summary_changed), d);
+  GtkWidget *size_entries[] = { d->width, d->height, d->print_width,
+                                d->print_height, d->print_dpi, d->scale };
+  for(size_t i = 0; i < G_N_ELEMENTS(size_entries); i++)
+    g_signal_connect_after(size_entries[i], "changed", G_CALLBACK(_export_summary_changed), d);
+  for(const GList *it = darktable.imageio->plugins_storage; it; it = g_list_next(it))
+  {
+    dt_imageio_module_storage_t *module = it->data;
+    if(module->widget)
+      _connect_storage_summary(module->widget, d);
+  }
+  _update_export_summary(d);
 }
 
 void gui_cleanup(dt_lib_module_t *self)
@@ -2069,7 +2275,10 @@ void gui_cleanup(dt_lib_module_t *self)
   {
     dt_imageio_module_storage_t *module = it->data;
     if(module->widget)
+    {
+      _disconnect_storage_summary(module->widget, d);
       gtk_container_remove(GTK_CONTAINER(d->storage_extra_container), module->widget);
+    }
   }
 
   for(const GList *it = darktable.imageio->plugins_format; it; it = g_list_next(it))
@@ -2802,6 +3011,15 @@ int set_params(dt_lib_module_t *self,
 
   // set dimensions after switching, to have new range ready.
   _set_dimensions(d, max_width, max_height, print_dpi, scale);
+  // older preset blobs store limits but not the UI mode; infer equivalent behavior
+  const dt_export_limit_by_t mode = max_width > 0 && max_height == 0
+    ? DT_EXPORT_LIMIT_WIDTH
+    : (max_width == 0 && max_height > 0 ? DT_EXPORT_LIMIT_HEIGHT : DT_EXPORT_LIMIT_BOX);
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_combobox_set(d->limit_by, mode);
+  DT_LEAVE_GUI_UPDATE();
+  dt_conf_set_int(CONFIG_PREFIX "limit_by", mode);
+  _apply_limit_by_mode(d);
   dt_bauhaus_combobox_set(d->upscale, upscale ? 1 : 0);
   dt_bauhaus_combobox_set(d->high_quality, high_quality ? 1 : 0);
   dt_bauhaus_combobox_set(d->export_masks, export_masks ? 1 : 0);
@@ -2814,6 +3032,7 @@ int set_params(dt_lib_module_t *self,
     res += smod->set_params(smod, sdata, ssize);
   if(fsize)
     res += fmod->set_params(fmod, fdata, fsize);
+  _update_export_summary(d);
   return res;
 }
 

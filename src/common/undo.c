@@ -54,6 +54,7 @@ dt_undo_t *dt_undo_init(void)
 
   udata->group = DT_UNDO_NONE;
   udata->group_indent = 0;
+  udata->group_has_items = FALSE;
   dt_print(DT_DEBUG_UNDO, "[undo] init");
   return udata;
 }
@@ -104,6 +105,15 @@ static void _undo_record(dt_undo_t *self,
   }
   else
   {
+    // Do not add a group marker until there is an actual undo item. A group
+    // can be cancelled before its first edit; in that case it must neither
+    // add an empty undo step nor discard the existing redo list.
+    if(!is_group && self->group != DT_UNDO_NONE && !self->group_has_items)
+    {
+      self->group_has_items = TRUE;
+      _undo_record(self, NULL, self->group, NULL, TRUE, NULL, NULL);
+    }
+
     dt_undo_item_t *item = malloc(sizeof(dt_undo_item_t));
 
     item->user_data = user_data;
@@ -139,7 +149,7 @@ void dt_undo_start_group(dt_undo_t *self,
     dt_print(DT_DEBUG_UNDO, "[undo] start group for type %d", type);
     self->group = type;
     self->group_indent = 1;
-    _undo_record(self, NULL, type, NULL, TRUE, NULL, NULL);
+    self->group_has_items = FALSE;
   }
   else
     self->group_indent++;
@@ -154,9 +164,11 @@ void dt_undo_end_group(dt_undo_t *self)
   self->group_indent--;
   if(self->group_indent == 0)
   {
-    _undo_record(self, NULL, self->group, NULL, TRUE, NULL, NULL);
+    if(self->group_has_items)
+      _undo_record(self, NULL, self->group, NULL, TRUE, NULL, NULL);
     dt_print(DT_DEBUG_UNDO, "[undo] end group for type %d", self->group);
     self->group = DT_UNDO_NONE;
+    self->group_has_items = FALSE;
   }
   UNLOCK;
 }
@@ -334,6 +346,7 @@ void dt_undo_clear(dt_undo_t *self, uint32_t filter)
   self->undo_list = NULL;
   self->redo_list = NULL;
   self->disable_next = FALSE;
+  self->group_has_items = FALSE;
   UNLOCK;
 }
 

@@ -20,6 +20,7 @@
 #include "common/collection.h"
 #include "common/darktable.h"
 #include "common/debug.h"
+#include "common/dtdata.h"
 #include "common/exif.h"
 #include "common/file_location.h"
 #include "common/history.h"
@@ -823,14 +824,17 @@ void _styles_apply_to_image_ext(const char *name,
     /* check if we should make a duplicate before applying style */
     if(duplicate)
     {
-      newimgid = dt_image_duplicate(imgid);
-      if(dt_is_valid_imgid(newimgid))
+      if(!overwrite && !dt_dtdata_history_copyable(imgid))
       {
-        if(overwrite)
-          dt_history_delete_on_image_ext(newimgid, FALSE, TRUE);
-        else
-          dt_history_copy_and_paste_on_image(imgid, newimgid, FALSE, NULL, TRUE, TRUE, TRUE);
+        dt_control_log(_("history-preserving copy is unavailable for raster sidecars or missing raster data"));
+        return;
       }
+      newimgid = dt_image_duplicate(imgid);
+      if(!dt_is_valid_imgid(newimgid)) return;
+      if(overwrite)
+        dt_history_delete_on_image_ext(newimgid, FALSE, TRUE);
+      else if(!dt_history_copy_and_paste_on_image(imgid, newimgid, FALSE, NULL, TRUE, TRUE, TRUE))
+        return;
     }
     else
       newimgid = imgid;

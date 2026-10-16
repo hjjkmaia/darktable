@@ -936,6 +936,18 @@ gboolean dt_history_copy_and_paste_on_image(const dt_imgid_t imgid,
   if(dt_view_get_current() == DT_VIEW_DARKROOM)
     dt_dev_write_history(darktable.develop);
 
+  // Parameters carry references to authoritative raster entries. Verify
+  // and copy those bytes before any destination history or IOP-order change;
+  // a failed merge must not leave a silent, empty accepted edit behind.
+  if(!dt_dtdata_merge(imgid, dest_imgid))
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[dt_history_copy_and_paste_on_image] raster entries of image %d"
+             " could not be copied to image %d", imgid, dest_imgid);
+    dt_control_log(_("raster masks could not be copied to the pasted history"));
+    dt_unlock_image_pair(imgid, dest_imgid);
+    return FALSE;
+  }
+
   dt_undo_lt_history_t *hist = dt_history_snapshot_item_init();
   hist->imgid = dest_imgid;
   dt_history_snapshot_undo_create(hist->imgid, &hist->before, &hist->before_history_end);
@@ -964,15 +976,6 @@ gboolean dt_history_copy_and_paste_on_image(const dt_imgid_t imgid,
   const gboolean ret_val = merge
     ? _history_copy_and_paste_on_image_merge(imgid, dest_imgid, ops, copy_iop_order, copy_full)
     : _history_copy_and_paste_on_image_overwrite(imgid, dest_imgid, ops, copy_iop_order, copy_full);
-
-  // params travel verbatim, so raster entries they reference must too;
-  // a failure is reported, not unwound: the masks just render empty
-  if(!dt_dtdata_merge(imgid, dest_imgid))
-  {
-    dt_print(DT_DEBUG_ALWAYS, "[dt_history_copy_and_paste_on_image] raster masks of image %d"
-             " could not be copied to image %d", imgid, dest_imgid);
-    dt_control_log(_("raster masks could not be copied to the pasted history"));
-  }
 
   if(iop_list)
   {
