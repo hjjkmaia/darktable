@@ -1296,10 +1296,24 @@
     <longdescription/>
   </dtconfig>
   <dtconfig>
+    <name>ui_last/export_last_directory</name>
+    <type>string</type>
+    <default/>
+    <shortdescription>last selected export destination folder</shortdescription>
+    <longdescription/>
+  </dtconfig>
+  <dtconfig>
     <name>ui_last/import_last_directory</name>
     <type>dir</type>
     <default>$(home)</default>
     <shortdescription>last opened directory.</shortdescription>
+    <longdescription/>
+  </dtconfig>
+  <dtconfig>
+    <name>ui_last/import_picker_directory</name>
+    <type>string</type>
+    <default/>
+    <shortdescription>last chosen import source folder</shortdescription>
     <longdescription/>
   </dtconfig>
   <dtconfig>
@@ -2894,7 +2908,7 @@
   <dtconfig>
     <name>plugins/imageio/storage/disk/file_directory</name>
     <type>string</type>
-    <default>$(HOME)/Desktop/$(EXIF.YEAR)$(EXIF.MONTH)$(EXIF.DAY)_$(FILE_NAME)</default>
+    <default>$(HOME)/Desktop/$(FILE_NAME)_$(YEAR)$(MONTH)$(DAY)_$(HOUR)$(MINUTE)$(SECOND)</default>
     <shortdescription/>
     <longdescription/>
   </dtconfig>

@@ -206,10 +206,9 @@ static void button_clicked(GtkWidget *widget,
   gchar *filename;
   if(g_file_test(old, G_FILE_TEST_IS_DIR))
   {
-    // only a directory was specified, no filename
-    // so we use the default $(FILE.NAME) for filename.
+    // Preserve the configured default filename when the entry is just a directory.
     dirname = g_strdup(old);
-    filename = g_strdup("$(FILE.NAME)");
+    filename = g_path_get_basename(dt_confgen_get("plugins/imageio/storage/disk/file_directory", DT_DEFAULT));
   }
   else
   {
@@ -217,13 +216,28 @@ static void button_clicked(GtkWidget *widget,
     filename = g_path_get_basename(old);
   }
 
-  gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(filechooser), dirname);
+  GtkFileChooser *chooser = GTK_FILE_CHOOSER(filechooser);
+  const char *last_directory = dt_conf_get_string_const("ui_last/export_last_directory");
+  if(!g_file_test(dirname, G_FILE_TEST_IS_DIR)
+     || !gtk_file_chooser_set_current_folder(chooser, dirname))
+  {
+    if(!last_directory[0]
+       || !g_file_test(last_directory, G_FILE_TEST_IS_DIR)
+       || !gtk_file_chooser_set_current_folder(chooser, last_directory))
+      gtk_file_chooser_set_current_folder(chooser, g_get_home_dir());
+  }
   g_free(old);
   g_free(dirname);
 
   if(gtk_native_dialog_run(GTK_NATIVE_DIALOG(filechooser)) == GTK_RESPONSE_ACCEPT)
   {
     gchar *dir = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(filechooser));
+    if(!dir)
+    {
+      g_free(filename);
+      g_object_unref(filechooser);
+      return;
+    }
     char *composed = g_build_filename(dir, filename, NULL);
 
 #ifdef _WIN32
@@ -245,9 +259,10 @@ static void button_clicked(GtkWidget *widget,
     gtk_entry_set_text(GTK_ENTRY(d->entry), escaped);
     // the signal handler will write this to conf
     gtk_editable_set_position(GTK_EDITABLE(d->entry), strlen(escaped));
-    g_free(dir);
+    dt_conf_set_string("ui_last/export_last_directory", dir);
     g_free(composed);
     g_free(escaped);
+    g_free(dir);
   }
   g_free(filename);
   g_object_unref(filechooser);
@@ -271,6 +286,12 @@ void gui_init(dt_imageio_module_storage_t *self)
 {
   disk_t *d = malloc(sizeof(disk_t));
   self->gui_data = (void *)d;
+
+  // migrate only the previous default; keep user-defined export paths intact
+  if(dt_conf_is_equal("plugins/imageio/storage/disk/file_directory",
+                      "$(HOME)/Desktop/$(EXIF.YEAR)$(EXIF.MONTH)$(EXIF.DAY)_$(FILE_NAME)"))
+    dt_conf_set_string("plugins/imageio/storage/disk/file_directory",
+                       dt_confgen_get("plugins/imageio/storage/disk/file_directory", DT_DEFAULT));
 
   d->entry =
     GTK_ENTRY(dt_action_entry_new

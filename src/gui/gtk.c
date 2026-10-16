@@ -1775,6 +1775,56 @@ static void _osx_add_view_menu_item(GtkWidget* menu,
                    G_CALLBACK(_osx_ctl_switch_mode_to), mode);
 }
 
+static void _osx_activate_action_menu_item(GtkWidget *item G_GNUC_UNUSED,
+                                           gpointer action_path)
+{
+  dt_action_process((const gchar *)action_path, 0, NULL, NULL, 1.0f);
+}
+
+static GtkWidget *_osx_add_action_menu_item(GtkWidget *menu,
+                                            const char *label,
+                                            const char *action_path)
+{
+  GtkWidget *item = gtk_menu_item_new_with_label(label);
+  gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+  gtk_widget_show(item);
+  g_signal_connect(G_OBJECT(item), "activate",
+                   G_CALLBACK(_osx_activate_action_menu_item), (gpointer)action_path);
+  return item;
+}
+
+static void _osx_file_menu_mapped(GtkWidget *menu,
+                                  gpointer user_data G_GNUC_UNUSED)
+{
+  const dt_view_type_flags_t view = dt_view_get_current();
+  dt_lib_module_t *import = dt_lib_get_module("import");
+  dt_lib_module_t *export = dt_lib_get_module("export");
+  const gboolean can_import = import && (import->views(import) & view);
+  const gboolean can_export = export && (export->views(export) & view);
+  GtkWidget *export_button = NULL;
+  if(can_export)
+  {
+    dt_lib_gui_update(export);
+    dt_action_t *action = dt_action_locate(DT_ACTION(export),
+                                          (gchar *[]){ N_("start export"), NULL }, FALSE);
+    if(action)
+      export_button = GTK_WIDGET(action->target);
+  }
+
+  gtk_widget_set_sensitive(g_object_get_data(G_OBJECT(menu), "add-photos"), can_import);
+  gtk_widget_set_sensitive(g_object_get_data(G_OBJECT(menu), "copy-photos"), can_import);
+  gtk_widget_set_sensitive(g_object_get_data(G_OBJECT(menu), "export-photos"),
+                           export_button && gtk_widget_get_sensitive(export_button));
+}
+
+static void _osx_file_menu_view_changed(gpointer instance G_GNUC_UNUSED,
+                                        dt_view_t *old_view G_GNUC_UNUSED,
+                                        dt_view_t *new_view G_GNUC_UNUSED,
+                                        GtkWidget *file_menu)
+{
+  _osx_file_menu_mapped(file_menu, NULL);
+}
+
 static void _open_url(GtkWidget *widget, gpointer url)
 {
   dt_open_url((const char *) url);
@@ -1956,6 +2006,30 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
 #ifdef MAC_INTEGRATION
   GtkosxApplication *OSXApp = g_object_new(GTKOSX_TYPE_APPLICATION, NULL);
 
+  // File menu: use the same actions as the import and export panel buttons.
+  GtkWidget *file_root_menu = gtk_menu_item_new_with_label(C_("menu", "File"));
+  gtk_widget_show(file_root_menu);
+  GtkWidget *file_menu = gtk_menu_new();
+  GtkWidget *add_photos = _osx_add_action_menu_item
+    (file_menu, C_("menu", "Add Photos to Library..."),
+     "lib/import/add to library...");
+  GtkWidget *copy_photos = _osx_add_action_menu_item
+    (file_menu, C_("menu", "Copy and Import Photos..."),
+     "lib/import/copy & import...");
+  GtkWidget *file_sep = gtk_separator_menu_item_new();
+  gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), file_sep);
+  gtk_widget_show(file_sep);
+  GtkWidget *export_photos = _osx_add_action_menu_item
+    (file_menu, C_("menu", "Export Selected Photos..."),
+     "lib/export/start export");
+  g_object_set_data(G_OBJECT(file_menu), "add-photos", add_photos);
+  g_object_set_data(G_OBJECT(file_menu), "copy-photos", copy_photos);
+  g_object_set_data(G_OBJECT(file_menu), "export-photos", export_photos);
+  g_signal_connect(G_OBJECT(file_menu), "map", G_CALLBACK(_osx_file_menu_mapped), NULL);
+  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_VIEWMANAGER_VIEW_CHANGED,
+                            _osx_file_menu_view_changed, file_menu);
+  gtk_menu_item_set_submenu(GTK_MENU_ITEM(file_root_menu), file_menu);
+
   // View menu
   GtkWidget *view_root_menu = gtk_menu_item_new_with_label(C_("menu", "Views"));
   gtk_widget_show(view_root_menu);
@@ -1985,6 +2059,19 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
 
   GtkWidget *window_menu = gtk_menu_new();
   gtk_widget_show(window_menu);
+  GtkWidget *panels_item = gtk_menu_item_new_with_label(C_("menu", "Panels"));
+  GtkWidget *panels_menu = gtk_menu_new();
+  _osx_add_action_menu_item(panels_menu, C_("menu", "Show/Hide Left Panel"),
+                            "global/panels/left");
+  _osx_add_action_menu_item(panels_menu, C_("menu", "Show/Hide Right Panel"),
+                            "global/panels/right");
+  _osx_add_action_menu_item(panels_menu, C_("menu", "Show/Hide Top Panel"),
+                            "global/panels/top");
+  _osx_add_action_menu_item(panels_menu, C_("menu", "Show/Hide Bottom Panel"),
+                            "global/panels/bottom");
+  gtk_menu_item_set_submenu(GTK_MENU_ITEM(panels_item), panels_menu);
+  gtk_menu_shell_append(GTK_MENU_SHELL(window_menu), panels_item);
+  gtk_widget_show(panels_item);
   gtk_menu_item_set_submenu(GTK_MENU_ITEM(window_root_menu), window_menu);
 
   // Help menu
@@ -2009,6 +2096,7 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
 
   // build the menu bar
   GtkWidget *menu_bar = gtk_menu_bar_new();
+  gtk_menu_shell_append(GTK_MENU_SHELL(menu_bar), file_root_menu);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_bar), view_root_menu);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_bar), window_root_menu);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_bar), help_root_menu);
@@ -3117,14 +3205,27 @@ static void _toggle_module_visibility(GSimpleAction *action,
   g_simple_action_set_state(action, g_variant_new_boolean(dt_lib_is_visible(module)));
 }
 
+static void _manage_processing_modules(GSimpleAction *action,
+                                       GVariant *parameter,
+                                       gpointer user_data)
+{
+  dt_lib_module_t *modulegroups = dt_lib_get_module("modulegroups");
+  if(modulegroups && modulegroups->manage_presets)
+    modulegroups->manage_presets(modulegroups);
+}
+
 static void _add_remove_modules_at_widget(dt_action_t *action,
                                           GtkWidget *parent,
                                           const gint x,
                                           const gint y)
 {
+  GtkWidget *side_panel = gtk_widget_get_ancestor(parent, DTGTK_TYPE_SIDE_PANEL);
+  if(!side_panel) return;
+
   GActionEntry action_entries[] =
   {
-    { "restore", _restore_default_modules, NULL, NULL }
+    { "restore", _restore_default_modules, NULL, NULL },
+    { "manage-processing", _manage_processing_modules, NULL, NULL }
   };
 
   GSimpleActionGroup *action_group = g_simple_action_group_new();
@@ -3138,16 +3239,25 @@ static void _add_remove_modules_at_widget(dt_action_t *action,
 
   const dt_view_type_flags_t cv = dt_view_get_current();
   GMenu *menu = g_menu_new();
-  GMenu *section = menu;
+  GMenu *panel_modules = g_menu_new();
 
-  for(const GList *iter = darktable.lib->plugins; iter; iter = iter->next)
+  for(const GList *iter = g_list_last(darktable.lib->plugins);
+      iter;
+      iter = g_list_previous(iter))
   {
     dt_lib_module_t *module = iter->data;
     if(!module->name) continue;
-    const dt_view_type_flags_t mv = module->views(module);
-    if((mv & cv || mv & (mv - 1) || mv & DT_VIEW_MULTI) // either current view or supports more than one view
-       && module->expandable(module))
+    const dt_view_type_flags_t views = module->views(module);
+    const gboolean available_in_view = (views & cv)
+      || (cv == DT_VIEW_LIGHTTABLE && (views & DT_VIEW_MULTI))
+      || dt_lib_is_visible_in_view(module, darktable.view_manager->current_view);
+    if(available_in_view && module->expandable(module))
     {
+      GtkWidget *container = GTK_WIDGET(dt_ui_get_container(darktable.gui->ui,
+                                                            dt_lib_get_container(module)));
+      if(gtk_widget_get_ancestor(container, DTGTK_TYPE_SIDE_PANEL) != side_panel)
+        continue;
+
       gchar *action_name = g_strdup_printf("toggle_%s", module->plugin_name);
       GSimpleAction *item_action = g_simple_action_new_stateful(action_name,
                                                                 NULL,
@@ -3158,17 +3268,36 @@ static void _add_remove_modules_at_widget(dt_action_t *action,
       GMenuItem *item = g_menu_item_new(module->name(module), NULL);
       gchar *detailed_action = g_strdup_printf("modules.%s", action_name);
       g_menu_item_set_detailed_action(item, detailed_action);
-      g_menu_append_item(section, item);
+      g_menu_append_item(panel_modules, item);
       g_object_unref(item);
       g_free(detailed_action);
       g_free(action_name);
     }
   }
 
-  section = g_menu_new();
-  g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
+  if(g_menu_model_get_n_items(G_MENU_MODEL(panel_modules)))
+    g_menu_append_section(menu, _("panels in this sidebar"), G_MENU_MODEL(panel_modules));
+  g_object_unref(panel_modules);
 
-  g_menu_append(section, _("restore defaults"), "modules.restore");
+  GtkWidget *processing_panel = gtk_widget_get_ancestor
+    (GTK_WIDGET(dt_ui_get_container(darktable.gui->ui, DT_UI_CONTAINER_PANEL_RIGHT_CENTER)),
+     DTGTK_TYPE_SIDE_PANEL);
+  dt_lib_module_t *modulegroups = dt_lib_get_module("modulegroups");
+  if(cv == DT_VIEW_DARKROOM && side_panel == processing_panel
+     && modulegroups && modulegroups->manage_presets)
+  {
+    GMenu *processing_section = g_menu_new();
+    g_menu_append(processing_section, _("manage processing modules..."),
+                  "modules.manage-processing");
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(processing_section));
+    g_object_unref(processing_section);
+  }
+
+  GMenu *restore_section = g_menu_new();
+  g_menu_append(restore_section, _("restore sidebar panel defaults"),
+                "modules.restore");
+  g_menu_append_section(menu, NULL, G_MENU_MODEL(restore_section));
+  g_object_unref(restore_section);
 
   // popup the menu
   GtkWidget *popover_menu = dt_gui_popover_menu_from_model(parent, menu);
@@ -3317,7 +3446,7 @@ static GtkWidget *_ui_init_panel_container_center(GtkWidget *container,
   g_signal_connect_swapped(box, "draw", G_CALLBACK(_side_panel_draw), NULL);
 
   GtkWidget *empty = gtk_event_box_new();
-  gtk_widget_set_tooltip_text(empty, _("right-click to show/hide modules"));
+  gtk_widget_set_tooltip_text(empty, _("right-click to show or hide panels in this sidebar"));
   gtk_box_pack_end(GTK_BOX(box), empty, TRUE, TRUE, 0);
   gtk_drag_dest_set(empty, 0, NULL, 0, GDK_ACTION_COPY);
   g_signal_connect(empty, "drag-motion", G_CALLBACK(_on_drag_motion_drop), GINT_TO_POINTER(FALSE));
@@ -3325,7 +3454,7 @@ static GtkWidget *_ui_init_panel_container_center(GtkWidget *container,
   g_signal_connect(empty, "drag-leave", G_CALLBACK(_on_drag_leave), NULL);
   dt_gui_connect_click_secondary(empty, _side_panel_press, NULL, NULL);
   dt_action_t *ac = dt_action_define(&darktable.control->actions_global, NULL,
-                                     N_("show/hide modules"), empty, NULL);
+                                     N_("show/hide sidebar panels"), empty, NULL);
   dt_action_register(ac, NULL, _add_remove_modules, 0, 0);
   return box;
 }

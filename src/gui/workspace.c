@@ -147,6 +147,7 @@ static gboolean _workspace_should_skip_copied_key(const char *key)
   static const char *prefixes[] = {"plugins/lighttable/collect/history",
                                    "plugins/lighttable/collect/string",
                                    "plugins/lighttable/filtering/history",
+                                   "ui_last/export_",
                                    "ui_last/import_",
                                    NULL};
 

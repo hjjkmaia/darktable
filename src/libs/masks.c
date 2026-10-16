@@ -2250,6 +2250,7 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
     // and we display the context-menu
     GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
     GtkWidget *item;
+    gboolean has_menu_items = FALSE;
 
     // we get all infos from selection
     const int nb = gtk_tree_selection_count_selected_rows(selection);
@@ -2347,7 +2348,8 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
         || (clicked_group_owner
             && (dt_iop_module_is(clicked_group_owner, "localmask")
                 || _can_add_to_standard_group(clicked_group_owner)));
-      item = gtk_menu_item_new_with_label(_("add brush"));
+      item = gtk_menu_item_new_with_label(clicked_group
+                                            ? _("add brush to mask") : _("new brush shape"));
       gtk_widget_set_sensitive(item, can_add);
       if(clicked_group)
       {
@@ -2359,7 +2361,9 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
                        GINT_TO_POINTER(DT_MASKS_BRUSH));
       gtk_menu_shell_append(menu, item);
 
-      item = gtk_menu_item_new_with_label(_("add radial gradient"));
+      item = gtk_menu_item_new_with_label(clicked_group
+                                            ? _("add radial gradient to mask")
+                                            : _("new radial gradient shape"));
       gtk_widget_set_sensitive(item, can_add);
       if(clicked_group)
       {
@@ -2371,7 +2375,8 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
                        GINT_TO_POINTER(DT_MASKS_ELLIPSE));
       gtk_menu_shell_append(menu, item);
 
-      item = gtk_menu_item_new_with_label(_("add path"));
+      item = gtk_menu_item_new_with_label(clicked_group
+                                            ? _("add path to mask") : _("new path shape"));
       gtk_widget_set_sensitive(item, can_add);
       if(clicked_group)
       {
@@ -2383,7 +2388,9 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
                        GINT_TO_POINTER(DT_MASKS_PATH));
       gtk_menu_shell_append(menu, item);
 
-      item = gtk_menu_item_new_with_label(_("add gradient"));
+      item = gtk_menu_item_new_with_label(clicked_group
+                                            ? _("add gradient to mask")
+                                            : _("new gradient shape"));
       gtk_widget_set_sensitive(item, can_add);
       if(clicked_group)
       {
@@ -2394,6 +2401,7 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
       g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape_menu),
                        GINT_TO_POINTER(DT_MASKS_GRADIENT));
       gtk_menu_shell_append(menu, item);
+      has_menu_items = TRUE;
     }
 
     if(grp && grp->type & DT_MASKS_GROUP)
@@ -2461,18 +2469,21 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
 
       if(has_unused_shapes)
       {
-        item = gtk_menu_item_new_with_label(_("add existing shape"));
+        item = gtk_menu_item_new_with_label(_("add existing shape to mask"));
         gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), menu0);
         gtk_menu_shell_append(menu, item);
+        has_menu_items = TRUE;
       }
     }
 
     if((group_owner || standard_owner) && grp->points)
     {
       dt_iop_module_t *mask_owner = group_owner ? group_owner : standard_owner;
-      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+      gboolean has_mask_edits = FALSE;
       if(!(mask_owner->blend_params->mask_combine & DEVELOP_COMBINE_MASKS_POS))
       {
+        if(has_menu_items)
+          gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
         GtkWidget *subtract_menu = gtk_menu_new();
         _tree_append_subtract_tool(subtract_menu, _("brush"), DT_MASKS_BRUSH, grpid, mask_owner);
         _tree_append_subtract_tool(subtract_menu, _("radial gradient"), DT_MASKS_ELLIPSE, grpid,
@@ -2483,20 +2494,28 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
         item = gtk_menu_item_new_with_label(_("subtract from mask"));
         gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), subtract_menu);
         gtk_menu_shell_append(menu, item);
+        has_menu_items = has_mask_edits = TRUE;
       }
 
       if(group_owner || !(standard_owner->blend_params->mask_mode & DEVELOP_MASK_CONDITIONAL))
       {
+        if(has_menu_items && !has_mask_edits)
+          gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
         item = gtk_check_menu_item_new_with_label(_("invert mask"));
+        gtk_widget_set_tooltip_text(item,
+                                    _("when checked, adjustments affect the area outside the mask"));
         gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
                                        mask_owner->blend_params->mask_combine
                                          & DEVELOP_COMBINE_MASKS_POS);
         g_signal_connect(item, "activate", G_CALLBACK(_tree_invert_mask), self);
         gtk_menu_shell_append(menu, item);
+        has_menu_items = has_mask_edits = TRUE;
       }
 
       if(group_owner)
       {
+        if(has_menu_items)
+          gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
         item = gtk_menu_item_new_with_label(_("duplicate mask"));
         g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_mask), self);
         gtk_menu_shell_append(menu, item);
@@ -2505,21 +2524,26 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
         g_object_set_data(G_OBJECT(item), "invert-copy", GINT_TO_POINTER(TRUE));
         g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_mask), self);
         gtk_menu_shell_append(menu, item);
+        has_menu_items = TRUE;
       }
     }
 
     if(!from_group && nb > 0)
     {
+      if(has_menu_items)
+        gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
       dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grpid);
       if(!(grp && (grp->type & DT_MASKS_GROUP)))
       {
         if(nb == 1)
         {
-          item = gtk_menu_item_new_with_label(_("duplicate this shape"));
+          item = gtk_menu_item_new_with_label(_("duplicate shape"));
           g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_shape), self);
           gtk_menu_shell_append(menu, item);
+          gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
         }
-        item = gtk_menu_item_new_with_label(_("delete this shape"));
+        item = gtk_menu_item_new_with_label(nb == 1
+                                              ? _("delete shape") : _("delete selected items"));
         g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
         gtk_menu_shell_append(menu, item);
       }
@@ -2529,32 +2553,40 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
         g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
         gtk_menu_shell_append(menu, item);
       }
+      has_menu_items = TRUE;
     }
     else if(nb > 0 && depth < 3)
     {
+      if(has_menu_items)
+        gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
       if(component_owner)
       {
-        item = gtk_menu_item_new_with_label(_("duplicate this component in the mask"));
+        item = gtk_menu_item_new_with_label(_("duplicate component in mask"));
         g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_component), self);
         gtk_menu_shell_append(menu, item);
+        gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
       }
       item = gtk_menu_item_new_with_label(_("remove from group"));
       g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
       gtk_menu_shell_append(menu, item);
+      has_menu_items = TRUE;
     }
 
     if(nb > 1 && !from_group)
     {
-      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      item = gtk_menu_item_new_with_label(_("group the forms"));
+      if(has_menu_items)
+        gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+      item = gtk_menu_item_new_with_label(_("group selected items"));
       g_signal_connect(item, "activate", G_CALLBACK(_tree_group), self);
       gtk_menu_shell_append(menu, item);
+      has_menu_items = TRUE;
     }
 
     if(from_group && depth < 3)
     {
-      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      _add_tree_operation(menu, _("use inverted shape"),
+      if(has_menu_items)
+        gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+      _add_tree_operation(menu, _("invert shape in group"),
                           DT_MASKS_STATE_INVERSE, selected_states, TRUE);
 
       gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
@@ -2570,18 +2602,20 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
                           DT_MASKS_STATE_EXCLUSION, selected_states, !is_last_row);
 
       gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      item = gtk_menu_item_new_with_label(_("move up"));
+      item = gtk_menu_item_new_with_label(_("move up in group"));
       gtk_widget_set_sensitive(item, !is_first_row);
       g_signal_connect(item, "activate", G_CALLBACK(_tree_moveup), self);
       gtk_menu_shell_append(menu, item);
 
-      item = gtk_menu_item_new_with_label(_("move down"));
+      item = gtk_menu_item_new_with_label(_("move down in group"));
       gtk_widget_set_sensitive(item, !is_last_row);
       g_signal_connect(item, "activate", G_CALLBACK(_tree_movedown), self);
       gtk_menu_shell_append(menu, item);
+      has_menu_items = TRUE;
     }
 
-    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+    if(has_menu_items)
+      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
     item = gtk_menu_item_new_with_label(_("delete unused shapes"));
     g_signal_connect(item, "activate", G_CALLBACK(_tree_cleanup), self);
     gtk_menu_shell_append(menu, item);
@@ -3378,7 +3412,8 @@ void gui_init(dt_lib_module_t *self)
 
   d->bt_ellipse = dtgtk_togglebutton_new_full(dtgtk_cairo_paint_masks_ellipse, 0, NULL,
     &(dtgtk_button_config_t){
-      .tooltip = _("radial gradient. shift while placing it makes a circle"),
+      .tooltip = _("radial gradient: adjust inside the ellipse by default\n"
+                   "invert the mask to adjust outside; shift-drag to make a circle"),
       .action = DT_ACTION(self),
       .action_section = N_("shapes"),
       .action_label = N_("radial gradient"),

@@ -1990,9 +1990,22 @@ static void _lib_import_select_folder(GtkWidget *widget,
       _("choose source folder"), GTK_WINDOW(win),
       GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, _("_open"), _("_cancel"));
 
-  // run the native dialog
-  dt_conf_get_folder_to_file_chooser("ui_last/import_last_place",
-                                     GTK_FILE_CHOOSER(filechooser));
+  // reopen at the selected source or active Places root before an older picker folder
+  const char *directory = dt_conf_get_string_const("ui_last/import_last_directory");
+  if(!directory[0]
+     || !g_file_test(directory, G_FILE_TEST_IS_DIR)
+     || !gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(filechooser), directory))
+  {
+    directory = dt_conf_get_string_const("ui_last/import_last_place");
+    if(!directory[0]
+       || !g_file_test(directory, G_FILE_TEST_IS_DIR)
+       || !gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(filechooser), directory))
+    {
+      directory = dt_conf_get_string_const("ui_last/import_picker_directory");
+      if(directory[0] && g_file_test(directory, G_FILE_TEST_IS_DIR))
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(filechooser), directory);
+    }
+  }
   if(gtk_native_dialog_run(GTK_NATIVE_DIALOG(filechooser)) == GTK_RESPONSE_ACCEPT)
   {
     char *dirname = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(filechooser));
@@ -2000,6 +2013,7 @@ static void _lib_import_select_folder(GtkWidget *widget,
     {
       _add_custom_place(dirname, self);
       dt_conf_set_string("ui_last/import_last_directory", dirname);
+      dt_conf_set_string("ui_last/import_picker_directory", dirname);
       _update_folders_list(self);
       _update_files_list(self);
       _show_all_thumbs(self);

@@ -2622,48 +2622,48 @@ static void _pop_menu_dictionary(GtkWidget *treeview,
                        DT_LIB_TAGGING_COL_COUNT, &count, -1);
 
     GMenu *menu = g_menu_new();
-    GMenu *section = menu;
+    GMenu *section;
 
     if(tagid)
     {
-      g_menu_append(section, _("attach tag"), "tags_dictionary.attach");
-      g_menu_append(section, _("detach tag"), "tags_dictionary.detach");
-
       section = g_menu_new();
+      g_menu_append(section, _("attach tag to selected images"), "tags_dictionary.attach");
+      g_menu_append(section, _("detach tag from selected images"), "tags_dictionary.detach");
       g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
+      g_object_unref(section);
     }
     if(d->tree_flag || !d->suggestion_flag)
     {
+      section = g_menu_new();
       g_menu_append(section, _("create tag..."), "tags_dictionary.create");
-
-      if(tagid)
-        g_menu_append(section, _("delete tag"), "tags_dictionary.delete");
-
-      if(gtk_tree_model_iter_children(model, &child, &iter))
-        g_menu_append(section, _("delete node"), "tags_dictionary.delete_node");
-
-      g_menu_append(section, _("edit"), "tags_dictionary.edit");
-    }
-
-    if(d->tree_flag)
-        g_menu_append(section, _("change path..."), "tags_dictionary.path");
-
-    if(d->tree_flag && !tagid)
-    {
-      section = g_menu_new();
+      g_menu_append(section, tagid ? _("edit tag...") : _("edit node..."),
+                    "tags_dictionary.edit");
+      if(d->tree_flag)
+        g_menu_append(section, tagid ? _("change tag path...") : _("change node path..."),
+                      "tags_dictionary.path");
+      if(d->tree_flag && !tagid)
+        g_menu_append(section, _("create tag from node"), "tags_dictionary.setastag");
       g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
+      g_object_unref(section);
 
-      g_menu_append(section, _("set as tag"), "tags_dictionary.setastag");
+      const gboolean has_children = gtk_tree_model_iter_children(model, &child, &iter);
+      if(tagid || has_children)
+      {
+        section = g_menu_new();
+        if(tagid)
+          g_menu_append(section, _("delete tag"), "tags_dictionary.delete");
+        if(has_children)
+          g_menu_append(section, _("delete node and its tags"), "tags_dictionary.delete_node");
+        g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
+        g_object_unref(section);
+      }
     }
 
-    if(!d->suggestion_flag)
-    {
-      section = g_menu_new();
-      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
-    }
-
-    g_menu_append(section, _("copy to entry"), "tags_dictionary.copytoentry");
-    g_menu_append(section, _("copy to clipboard"), "tags_dictionary.clipboard");
+    section = g_menu_new();
+    g_menu_append(section, _("copy tag path to entry"), "tags_dictionary.copytoentry");
+    g_menu_append(section, _("copy tag path to clipboard"), "tags_dictionary.clipboard");
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
+    g_object_unref(section);
 
     if(d->collection[0])
     {
@@ -2678,13 +2678,13 @@ static void _pop_menu_dictionary(GtkWidget *treeview,
     if(count || d->collection[0])
     {
       section = g_menu_new();
-      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
-
       if(count)
         g_menu_append(section, _("go to tag collection"), "tags_dictionary.goto");
 
       if(d->collection[0])
-        g_menu_append(section, _("go back to work"), "tags_dictionary.back");
+        g_menu_append(section, _("return to previous collection"), "tags_dictionary.back");
+      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
+      g_object_unref(section);
     }
 
     GdkRectangle rect;
