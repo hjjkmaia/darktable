@@ -147,8 +147,9 @@ int operation_tags()
 
 int operation_tags_filter()
 {
-  // switch off cropping and decoration, we want to see the full image.
-  return IOP_TAG_DECORATION | IOP_TAG_CROPPING;
+  // keep a downstream crop visible while adjusting rotation and perspective
+  // filtering cropping modules makes the saved crop appear to reset until focus changes
+  return IOP_TAG_DECORATION;
 }
 
 dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
