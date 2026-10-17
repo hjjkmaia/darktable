@@ -110,6 +110,22 @@ changes (where available).
   transform sections. Its module tabs follow the same editing flow while
   custom module layouts retain their chosen order.
 
+- New configurations open with the Lightroom processing layout. Lighttable's
+  left sidebar follows Import, Collections, Filters, and Image Information;
+  its right sidebar groups Styles and History, Selection and batch actions,
+  then tags, metadata, location, optional neural tools, and Export. Darkroom's
+  left sidebar puts Local Adjustments and the advanced Mask Manager together,
+  followed by Snapshots and History. Existing
+  saved panel positions still take precedence. The Lightroom tabs now include
+  tools previously omitted from the scene-referred layout, and Show All
+  Modules reveals every available nondeprecated tool. Editing module order
+  remains tied to image processing. Quick Access retains base white-balance
+  controls when a photo also has local Color Calibration instances.
+
+- Mask Manager now rebuilds its cached rows when the photo or processing-module
+  instances change, preventing a stale owner pointer crash while entering
+  Darkroom; slider-only edits still retain the panel's scroll position.
+
 - Left and right sidebar scrollbars are wider and easier to grab with a mouse.
 
 - Import and disk-export folder pickers now reopen at their last selected
@@ -137,11 +153,50 @@ changes (where available).
 - Option-dragging a vector shape in the mask manager copies it within or
   between supported local masks, preserving its shape and combine setting.
 
+- A local mask shape's context menu now offers **Create New Mask from Shape**
+  and **Delete Shape**. Creating a mask moves the shape into an editable local
+  adjustment with neutral sliders; an older detached shape can also be
+  recovered into a new mask. Both actions support Undo and Redo.
+
 - Local Adjustments now lists each mask with its component shapes underneath.
   One shared set of sliders edits the selected adjustment, while its technical
-  mask-source modules stay out of the right panel. The Mask Manager is labeled
-  advanced and normally omits duplicate top-level shape entries; **All shapes**
-  restores the full inventory for reuse.
+  mask-source modules stay out of the right panel. Parent and component menus
+  expose actions at their respective scopes; selecting a component keeps its
+  parent's slider values while targeting that shape for editing. Shape
+  properties and masks owned by other modules remain available in Mask Manager
+  (Advanced), which normally omits duplicate top-level shape entries. **All
+  shapes** restores the full inventory for reuse.
+
+- Selecting or arming a Brush shape now shows Size, Feather, Flow, and Density
+  in Local Adjustments. These control subsequent paint; the shared adjustment
+  sliders still apply to the whole mask, and existing strokes remain unchanged.
+
+- Local Adjustments places a shared Amount control above expandable Light,
+  Color, Effects, and Detail sections. The 0–100% Amount changes the strength
+  of the selected mask's edits without changing its shapes or Brush Density.
+  Contrast, Hue, Grain, and Sharpness now use local rendering modules alongside
+  the existing controls. Light can open an editable RGB point curve linked to
+  the selected mask; its control points are saved with the photo and support
+  Undo and Redo. Color can open a mask-linked **sampled color** editor: use the
+  plus eyedropper to create a color range from the photo, then shape
+  lightness, chroma, or hue by color zone. The result stays inside the selected
+  mask and is saved in its history. This uses
+  darktable's Color Zones curves; it does not yet provide Lightroom Point
+  Color's saved swatches, independent range controls, or Variance. A separate
+  mask-linked **Point Color** editor now adds up to eight persistent sampled
+  colors, Hue/Saturation/Luminance shifts, Variance, an overall Range and
+  independent Hue/Saturation/Luminance Range controls. Its Visualize Range
+  checkbox is a temporary black-and-white darkroom preview and is never
+  exported. This fork applies the effect in display-referred Lab and uses Lab
+  chroma as an approximation for saturation; the underlying sampled-color
+  editor and its Color Zones history remain available. Detail also includes
+  local luminance noise reduction through darktable's non-local means module.
+  This may be slower on large images and does not use Lightroom's noise
+  reduction algorithm. Detail also includes positive-only local Defringe:
+  it reduces colored fringes along edges inside the selected mask using a
+  fixed correction and a strength slider. It cannot protect areas from a
+  separate global defringe adjustment. Moiré is not available as a local
+  control.
 
 - An experimental magic eraser can replace a small painted area with nearby
   background pixels. It shows a before/after preview, saves only after explicit
@@ -385,6 +440,14 @@ changes (where available).
   ready to splice into another invocation.
 
 ## Bug Fixes
+
+- Selecting Darkroom from the macOS Views menu while already in Darkroom now
+  keeps the current image and edit history instead of switching to Lighttable.
+
+- Fixed Collections' Update Path and Remove actions so they affect only the
+  chosen folder and its descendants, even when siblings share a name prefix
+  or folder names contain `%` or `_`. Canceling Remove now preserves the
+  previous image selection.
 
 - Fixed non-finite fourth-channel white-balance coefficients on ordinary
   three-color raw images after changing temperature or tint.
