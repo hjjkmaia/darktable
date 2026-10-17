@@ -101,6 +101,17 @@ changes (where available).
 
 ## UI/UX Improvements
 
+- Local Adjustments now offers relative Temperature and Tint sliders for a
+  selected mask. In the Lightroom layout, global white balance remains in
+  Basic while the raw camera-reference module is under Calibration.
+
+- The Lightroom module layout now groups right-side Quick Access controls
+  into labeled white balance, tone, presence, tone curve, detail, and lens &
+  transform sections. Its module tabs follow the same editing flow while
+  custom module layouts retain their chosen order.
+
+- Left and right sidebar scrollbars are wider and easier to grab with a mouse.
+
 - Import and disk-export folder pickers now reopen at their last selected
   folders. New disk-export defaults add the export date and time to filenames.
 
@@ -374,6 +385,9 @@ changes (where available).
   ready to splice into another invocation.
 
 ## Bug Fixes
+
+- Fixed non-finite fourth-channel white-balance coefficients on ordinary
+  three-color raw images after changing temperature or tint.
 
 - Fixed the crop appearing to reset while adjusting the rotate and
   perspective slider. The saved crop now stays visible during rotation.
