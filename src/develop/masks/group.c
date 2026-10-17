@@ -326,7 +326,7 @@ static int _group_get_mask(const dt_iop_module_t *const module,
   int *h = malloc(sizeof(int) * nb);
   int *px = malloc(sizeof(int) * nb);
   int *py = malloc(sizeof(int) * nb);
-  int *ok = malloc(sizeof(int) * nb);
+  int *ok = calloc(nb, sizeof(int));
   int *states = malloc(sizeof(int) * nb);
   float *op = malloc(sizeof(float) * nb);
 
@@ -341,7 +341,7 @@ static int _group_get_mask(const dt_iop_module_t *const module,
     {
       ok[pos] = dt_masks_get_mask(module, piece, sel, &bufs[pos],
                                   &w[pos], &h[pos], &px[pos], &py[pos]);
-      if(fpt->state & DT_MASKS_STATE_INVERSE)
+      if(ok[pos] && (fpt->state & DT_MASKS_STATE_INVERSE))
       {
         double start = dt_get_wtime();
         _inverse_mask(module, piece, sel, &bufs[pos], &w[pos], &h[pos], &px[pos], &py[pos]);
@@ -361,6 +361,7 @@ static int _group_get_mask(const dt_iop_module_t *const module,
   int l = INT_MAX, r = INT_MIN, t = INT_MAX, b = INT_MIN;
   for(int i = 0; i < nb; i++)
   {
+    if(!ok[i]) continue;
     l = MIN(l, px[i]);
     t = MIN(t, py[i]);
     r = MAX(r, px[i] + w[i]);
@@ -372,13 +373,33 @@ static int _group_get_mask(const dt_iop_module_t *const module,
   *height = b - t;
 
   // we allocate the buffer
-  *buffer = dt_alloc_align_float((size_t)(r - l) * (b - t));
+  *buffer = dt_calloc_align_float((size_t)(r - l) * (b - t));
+  if(!*buffer) goto error;
 
   // and we copy each buffer inside, row by row
+  int combined = 0;
   for(int i = 0; i < nb; i++)
   {
+    if(!ok[i]) continue;
     double start = dt_get_debug_wtime();
-    if(states[i] & (DT_MASKS_STATE_UNION | DT_MASKS_STATE_SUM))
+    // a former second child can still carry an operation after the first was removed
+    if(!combined || !(states[i] & DT_MASKS_STATE_OP))
+    {
+      for(int y = 0; y < b - t; y++)
+      {
+        for(int x = 0; x < r - l; x++)
+        {
+          float b2 = 0.0f;
+          if(y + t - py[i] >= 0
+             && y + t - py[i] < h[i]
+             && x + l - px[i] >= 0
+             && x + l - px[i] < w[i])
+            b2 = bufs[i][(y + t - py[i]) * w[i] + x + l - px[i]];
+          (*buffer)[y * (r - l) + x] = b2 * op[i];
+        }
+      }
+    }
+    else if(states[i] & (DT_MASKS_STATE_UNION | DT_MASKS_STATE_SUM))
     {
       for(int y = 0; y < h[i]; y++)
       {
@@ -441,23 +462,7 @@ static int _group_get_mask(const dt_iop_module_t *const module,
         }
       }
     }
-    else // if we are here, this mean that we just have to copy the shape and null other parts
-    {
-      for(int y = 0; y < b - t; y++)
-      {
-        for(int x = 0; x < r - l; x++)
-        {
-          float b2 = 0.0f;
-          if(y + t - py[i] >= 0
-             && y + t - py[i] < h[i]
-             && x + l - px[i] >= 0
-             && x + l - px[i] < w[i])
-            b2 = bufs[i][(y + t - py[i]) * w[i] + x + l - px[i]];
-          (*buffer)[y * (r - l) + x] = b2 * op[i];
-        }
-      }
-    }
-
+    combined++;
     dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
              "[masks %d] combine took %0.04f sec",
              i, dt_get_lap_time(&start));
@@ -637,13 +642,14 @@ static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
                                const dt_iop_roi_t *const roi,
                                float *const restrict buffer)
 {
-  if(!form->points) return 0;
   double start = dt_get_debug_wtime();
   int nb_ok = 0;
 
   const int width = roi->width;
   const int height = roi->height;
   const size_t npixels = (size_t)width * height;
+  memset(buffer, 0, npixels * sizeof(float));
+  if(!form->points) return 0;
 
   // we need to allocate a zeroed temporary buffer for intermediate
   // creation of individual shapes
@@ -682,7 +688,16 @@ static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
         // first see if we need to invert this shape
         const int inverted = (state & DT_MASKS_STATE_INVERSE);
 
-        if(state & DT_MASKS_STATE_UNION)
+        // a former second child can still carry an operation after the first was removed
+        if(nb_ok == 0 || !(state & DT_MASKS_STATE_OP))
+        {
+          DT_OMP_FOR_SIMD(aligned(buffer, bufs : 64))
+          for(size_t index = 0; index < npixels; index++)
+          {
+            buffer[index] = op * (inverted ? (1.0f - bufs[index]) : bufs[index]);
+          }
+        }
+        else if(state & DT_MASKS_STATE_UNION)
         {
           _combine_masks_union(buffer, bufs, npixels, op, inverted);
         }
@@ -702,16 +717,6 @@ static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
         {
           _combine_masks_exclusion(buffer, bufs, npixels, op, inverted);
         }
-        else // if we are here, this mean that we just have to copy
-             // the shape and null other parts
-        {
-          DT_OMP_FOR_SIMD(aligned(buffer, bufs : 64))
-          for(size_t index = 0; index < npixels; index++)
-          {
-            buffer[index] = op * (inverted ? (1.0f - bufs[index]) : bufs[index]);
-          }
-        }
-
         dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
                  "[masks %d] combine took %0.04f sec",
                  nb_ok, dt_get_lap_time(&start));

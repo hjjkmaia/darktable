@@ -446,7 +446,10 @@ static void _xyz2mul(dt_iop_module_t *self,
     }
   }
 
-  for(int k = 0; k < 4; k++) mul[k] = 1.0 / CAM[k];
+  for(int k = 0; k < 3; k++) mul[k] = 1.0 / CAM[k];
+  // three-color cameras have no fourth matrix row; keep the unused coefficient neutral
+  mul[3] = (self->dev && (self->dev->image_storage.flags & DT_IMAGE_4BAYER))
+             ? 1.0 / CAM[3] : mul[1];
 }
 
 static void _temp2mul(dt_iop_module_t *self,
@@ -708,6 +711,12 @@ void commit_params(dt_iop_module_t *self,
   {
     d->coeffs[k] = tcoeffs[k];
     chr->wb_coeffs[k] = piece->enabled ? d->coeffs[k] : 1.0f;
+  }
+  if(!(self->dev->image_storage.flags & DT_IMAGE_4BAYER))
+  {
+    // also sanitize older history entries that stored a non-finite unused coefficient
+    d->coeffs[3] = 1.0f;
+    chr->wb_coeffs[3] = 1.0f;
   }
 
   // 4Bayer images not implemented in OpenCL yet
@@ -1566,9 +1575,15 @@ void reload_defaults(dt_iop_module_t *self)
     _find_coeffs(self, as_shot);
     as_shot[0] /= as_shot[1];
     as_shot[2] /= as_shot[1];
-    as_shot[3] /= as_shot[1];
+    if(self->dev->image_storage.flags & DT_IMAGE_4BAYER)
+      as_shot[3] /= as_shot[1];
+    else
+      as_shot[3] = 1.0;
     as_shot[1] = 1.0;
   }
+
+  if(!(self->dev->image_storage.flags & DT_IMAGE_4BAYER))
+    daylights[3] = 1.0;
 
   dt_dev_chroma_t *chr = &self->dev->chroma;
   for_four_channels(k)
@@ -1621,6 +1636,8 @@ void reload_defaults(dt_iop_module_t *self)
       }
     }
   }
+  if(!(self->dev->image_storage.flags & DT_IMAGE_4BAYER))
+    dcoeffs[3] = 1.0f;
 
   // remember daylight wb used for temperature/tint conversion,
   // assuming it corresponds to CIE daylight (D65)

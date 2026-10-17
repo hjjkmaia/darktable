@@ -1200,6 +1200,19 @@ scrollbar
   margin: 0.07em;
 }
 
+/* give the side-panel scrollbars a larger target for dragging */
+#left scrollbar.vertical,
+#right scrollbar.vertical
+{
+  min-width: 1em;
+}
+
+#left scrollbar.vertical slider,
+#right scrollbar.vertical slider
+{
+  min-width: 0.9em;
+}
+
 /* Scrollbars hover state */
 scrollbar slider:hover,
 scale contents trough slider:hover

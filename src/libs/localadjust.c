@@ -18,6 +18,8 @@
 
 #include "common/darktable.h"
 #include "common/debug.h"
+#include "common/chromatic_adaptation.h"
+#include "common/illuminants.h"
 #include "bauhaus/bauhaus.h"
 #include "control/signal.h"
 #include "develop/blend.h"
@@ -34,6 +36,7 @@
 #endif
 
 #include <gtk/gtk.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,7 +56,9 @@ DT_MODULE(1)
 
 typedef enum dt_lib_localadjust_sliders_t
 {
-  SLIDER_EXPOSURE = 0,
+  SLIDER_TEMPERATURE = 0,
+  SLIDER_TINT,
+  SLIDER_EXPOSURE,
   SLIDER_HIGHLIGHTS,
   SLIDER_SHADOWS,
   SLIDER_WHITES,
@@ -79,6 +84,13 @@ typedef struct dt_lib_localadjust_slider_info_t
 // already EV (identity in the map), the rest are Lightroom percent
 static const dt_lib_localadjust_slider_info_t _sliders[SLIDER_COUNT] =
 {
+  // These are relative local color shifts, not a second RAW white balance.
+  // The channel mixer runs with chromatic adaptation bypassed; its RGB
+  // diagonal is neutral at zero and the raster blend confines it to the mask.
+  [SLIDER_TEMPERATURE] = { N_("temperature"), "channelmixerrgb", "red",
+                           -100.0f, 100.0f, 1.0f, 0, FALSE },
+  [SLIDER_TINT]        = { N_("tint"),        "channelmixerrgb", "green",
+                           -100.0f, 100.0f, 1.0f, 0, FALSE },
   [SLIDER_EXPOSURE]   = { N_("exposure"),   "exposure",         "exposure",
                           -4.0f, 4.0f, 0.01f, 2, FALSE },
   [SLIDER_HIGHLIGHTS] = { N_("highlights"), "toneequal",        "highlights",
@@ -203,6 +215,78 @@ static float _field_to_slider(const int k, const float v)
   return _sliders[k].percent ? v * 100.0f : v;
 }
 
+static gboolean _is_local_wb_slider(const int k)
+{
+  return k == SLIDER_TEMPERATURE || k == SLIDER_TINT;
+}
+
+/* The RGB channel mixer has a neutral identity matrix and can be raster
+ * blended after the mask source. Logarithmic gains make Temp and Tint
+ * independent and reversible. Their geometric mean is one; image luminance
+ * can still change with color. Neither slider represents absolute Kelvin. */
+static float _local_wb_value(dt_iop_module_t *sink, const int k)
+{
+  const float *red = _field_ptr(sink, "red");
+  const float *green = _field_ptr(sink, "green");
+  const float *blue = _field_ptr(sink, "blue");
+  if(!red || !green || !blue
+     || !isfinite(red[0]) || !isfinite(green[1]) || !isfinite(blue[2])
+     || red[0] <= 0.0f || green[1] <= 0.0f || blue[2] <= 0.0f)
+    return 0.0f;
+
+  const float r = log2f(red[0]);
+  const float g = log2f(green[1]);
+  const float b = log2f(blue[2]);
+  const float value = k == SLIDER_TEMPERATURE
+    ? 100.0f * (r - b)
+    : (400.0f / 3.0f) * (0.5f * (r + b) - g);
+  return CLAMP(roundf(value), -100.0f, 100.0f);
+}
+
+static gboolean _set_local_wb_values(dt_iop_module_t *sink,
+                                     const float temperature,
+                                     const float tint)
+{
+  float *red = _field_ptr(sink, "red");
+  float *green = _field_ptr(sink, "green");
+  float *blue = _field_ptr(sink, "blue");
+  int *adaptation = (int *)_field_ptr(sink, "adaptation");
+  int *illuminant = (int *)_field_ptr(sink, "illuminant");
+  gboolean *normalize_r = (gboolean *)_field_ptr(sink, "normalize_R");
+  gboolean *normalize_g = (gboolean *)_field_ptr(sink, "normalize_G");
+  gboolean *normalize_b = (gboolean *)_field_ptr(sink, "normalize_B");
+  gboolean *clip = (gboolean *)_field_ptr(sink, "clip");
+  float *gamut = _field_ptr(sink, "gamut");
+  if(!red || !green || !blue || !adaptation || !illuminant
+     || !normalize_r || !normalize_g || !normalize_b || !clip || !gamut)
+    return FALSE;
+
+  // This instance must never register as another chromatic-adaptation owner.
+  *adaptation = DT_ADAPTATION_RGB;
+  *illuminant = DT_ILLUMINANT_PIPE;
+  *normalize_r = *normalize_g = *normalize_b = FALSE;
+  *clip = FALSE;
+  *gamut = 0.0f;
+
+  const float warm = temperature / 100.0f;
+  const float magenta = tint / 100.0f;
+  red[0] = exp2f(0.5f * warm + 0.25f * magenta);
+  green[1] = exp2f(-0.5f * magenta);
+  blue[2] = exp2f(-0.5f * warm + 0.25f * magenta);
+  red[1] = red[2] = 0.0f;
+  green[0] = green[2] = 0.0f;
+  blue[0] = blue[1] = 0.0f;
+  return TRUE;
+}
+
+static float _sink_slider_value(dt_iop_module_t *sink, const int k)
+{
+  if(!sink) return 0.0f;
+  if(_is_local_wb_slider(k)) return _local_wb_value(sink, k);
+  const float *value = _field_ptr(sink, _sliders[k].field);
+  return value ? _field_to_slider(k, *value) : 0.0f;
+}
+
 static void _end_undo_hold(dt_lib_localadjust_t *d);
 static void _abandon_shape(dt_lib_module_t *self, dt_iop_module_t *owner);
 
@@ -310,8 +394,7 @@ static void _set_sink_value(dt_lib_module_t *self, const int k, const float lr_v
   for(int j = 0; removing && j < SLIDER_COUNT; j++)
   {
     if(j == k || !g_str_equal(_sliders[j].op, _sliders[k].op)) continue;
-    float *value = _field_ptr(sink, _sliders[j].field);
-    if(value && *value != 0.0f) removing = FALSE;
+    if(_sink_slider_value(sink, j) != 0.0f) removing = FALSE;
   }
   /* Confirm may already be holding one group for the shape being drawn.
    * A nested group stops Undo at the inner marker. */
@@ -356,14 +439,31 @@ static void _set_sink_value(dt_lib_module_t *self, const int k, const float lr_v
     _commit_sink_blend(sink, mask->multi_priority);
   }
 
-  float *f = _field_ptr(sink, _sliders[k].field);
-  if(!f)
+  gboolean written = FALSE;
+  if(_is_local_wb_slider(k))
   {
+    const float temperature = k == SLIDER_TEMPERATURE
+      ? lr_value : _local_wb_value(sink, SLIDER_TEMPERATURE);
+    const float tint = k == SLIDER_TINT
+      ? lr_value : _local_wb_value(sink, SLIDER_TINT);
+    written = _set_local_wb_values(sink, temperature, tint);
+  }
+  else
+  {
+    float *f = _field_ptr(sink, _sliders[k].field);
+    if(f)
+    {
+      *f = _slider_to_field(k, lr_value);
+      written = TRUE;
+    }
+  }
+  if(!written)
+  {
+    if(creating) dt_iop_gui_delete(sink);
     dt_dev_modulegroups_update_visibility(dev);
     if(group) dt_undo_end_group(darktable.undo);
     return;
   }
-  *f = _slider_to_field(k, lr_value);
   // name and fold the masked copy before it is recorded, so the
   // instance on the right reads as local and the global one stays open
   _keep_global_module(sink);
@@ -867,8 +967,7 @@ static void _shape_cancelled(dt_lib_module_t *self)
   for(int k = 0; mask && k < SLIDER_COUNT; k++)
   {
     dt_iop_module_t *sink = _find_sink(darktable.develop, _sliders[k].op, mask->multi_priority);
-    float *value = sink ? _field_ptr(sink, _sliders[k].field) : NULL;
-    if(value && *value != 0.0f) has_adjustment = TRUE;
+    if(_sink_slider_value(sink, k) != 0.0f) has_adjustment = TRUE;
   }
   if(mask && !_mask_has_shape(mask) && !has_adjustment)
   {
@@ -933,11 +1032,7 @@ static void _refresh_sliders(dt_lib_module_t *self)
     if(d->selected >= 0)
     {
       dt_iop_module_t *sink = _find_sink(dev, _sliders[k].op, d->selected);
-      if(sink)
-      {
-        float *f = _field_ptr(sink, _sliders[k].field);
-        if(f) v = _field_to_slider(k, *f);
-      }
+      v = _sink_slider_value(sink, k);
     }
     dt_bauhaus_slider_set(d->slider[k], v);
   }
@@ -1431,6 +1526,12 @@ void gui_init(dt_lib_module_t *self)
                                                 _sliders[k].step, 0.0f,
                                                 _sliders[k].digits);
     dt_bauhaus_widget_set_label(s, NULL, _sliders[k].label);
+    if(k == SLIDER_TEMPERATURE)
+      gtk_widget_set_tooltip_text(s,
+        _("relative warmth or coolness inside this mask; not a Kelvin white balance"));
+    else if(k == SLIDER_TINT)
+      gtk_widget_set_tooltip_text(s,
+        _("relative green or magenta tint inside this mask"));
     g_object_set_data(G_OBJECT(s), "slider-index", GINT_TO_POINTER(k));
     g_signal_connect(G_OBJECT(s), "value-changed",
                      G_CALLBACK(_slider_changed), self);

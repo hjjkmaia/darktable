@@ -2054,18 +2054,16 @@ static void _set_trouble_messages(dt_iop_module_t *self)
   {
     dt_iop_set_module_trouble_message(chr->temperature,
         _("white balance applied twice (<u>details</u>)"),
-        _("the color calibration module is enabled and already provides\n"
-          "chromatic adaptation.\n"
-          "set the white balance here to camera reference (D65)\n"
-          "or disable chromatic adaptation in color calibration."),
+        _("color calibration already provides chromatic adaptation.\n"
+          "set this module to 'as shot to reference' or 'camera reference',\n"
+          "then adjust global temperature and tint in basic > white balance"),
         NULL);
 
     dt_iop_set_module_trouble_message(self,
         _("white balance module error (<u>details</u>)"),
-        _("the white balance module is not using the camera\n"
-          "reference illuminant, which will cause issues here\n"
-          "with chromatic adaptation. either set it to reference\n"
-          "or disable chromatic adaptation here."),
+        _("the white balance module is not at camera reference.\n"
+          "set it to 'as shot to reference' or 'camera reference',\n"
+          "then adjust global temperature and tint here or in basic"),
         NULL);
     return;
   }

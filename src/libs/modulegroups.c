@@ -916,6 +916,7 @@ static void _basics_show_listed(dt_lib_module_t *self)
   gboolean first = TRUE;
   gboolean after_heading = FALSE;
   dt_iop_module_t *last_module = NULL;
+  const gchar *pending_heading = NULL;
 
   for(const GList *l = d->basics; l; l = g_list_next(l))
   {
@@ -925,14 +926,9 @@ static void _basics_show_listed(dt_lib_module_t *self)
     // starts with '@', so pipeline mode simply never matches them
     if(item->id && item->id[0] == '@')
     {
-      // the label is not stored in the item: _basics_hide() destroys
-      // vbox_basic as a whole
-      gchar *context_id = g_strdup_printf("modulegroup|%s", item->id + 1);
-      GtkWidget *lb = dt_ui_section_label_new(Q_(context_id));
-      g_free(context_id);
-      gtk_widget_show(lb);
-      gtk_box_pack_start(GTK_BOX(d->vbox_basic), lb, FALSE, FALSE, 0);
-      after_heading = TRUE;
+      // Some listed controls are unavailable for this image or workflow.
+      // Only render a section when the first usable control is found.
+      pending_heading = item->id + 1;
       continue;
     }
 
@@ -968,6 +964,19 @@ static void _basics_show_listed(dt_lib_module_t *self)
       if(!w) continue;
     }
 
+    if(pending_heading)
+    {
+      // The label is not stored in the item: _basics_hide() destroys
+      // vbox_basic as a whole.
+      gchar *context_id = g_strdup_printf("modulegroup|%s", pending_heading);
+      GtkWidget *lb = dt_ui_section_label_new(Q_(context_id));
+      g_free(context_id);
+      gtk_widget_show(lb);
+      gtk_box_pack_start(GTK_BOX(d->vbox_basic), lb, FALSE, FALSE, 0);
+      pending_heading = NULL;
+      after_heading = TRUE;
+    }
+
     const dt_lib_modulegroups_basic_item_position_t item_pos =
       first ? FIRST_MODULE
             : (after_heading || module != last_module) ? NEW_MODULE : NORMAL;
@@ -981,41 +990,42 @@ static void _basics_show_listed(dt_lib_module_t *self)
   }
 }
 
-/* Lightroom Develop, top to bottom: white balance, tone, presence,
- * tone curve, color, detail, lens and transform. Widgets this preset
- * does not have are skipped. A heading is added only when something
- * under it is present. */
+/* Follow the Lightroom preset's Basic, Tone Curve, Detail and geometry
+ * sections. Widgets this preset does not have are skipped. A heading is
+ * added only when something under it is present. */
 static const gchar *const _lr_qap_order[] = {
   "@white balance",
   "channelmixerrgb/illuminant",
   "channelmixerrgb/temperature",
   "channelmixerrgb/hue",
   "channelmixerrgb/chroma",
-  "channelmixerrgb/F source",
-  "channelmixerrgb/LED source",
   "@tone",
   "exposure/exposure",
-  "sigmoid/contrast",
-  "sigmoid/skew",
   "filmicrgb/contrast",
+  "sigmoid/contrast",
   "agx/curve/contrast",
+  "colorbalancergb/contrast",
+  "toneequal/highlights",
+  "toneequal/shadows",
+  "sigmoid/target white",
+  "sigmoid/target black",
+  "filmicrgb/white relative exposure",
+  "filmicrgb/black relative exposure",
+  "agx/white relative exposure",
+  "agx/black relative exposure",
   "@presence",
-  "bilat/detail",
   "contrastntexture/medium details",
   "contrastntexture/coarse details",
   "hazeremoval/strength",
   "colorbalancergb/global vibrance",
   "colorbalancergb/global saturation",
-  "colorbalancergb/global brilliance",
-  "colorbalancergb/global chroma",
   "@tone curve",
-  "toneequal/graph",
-  "toneequal/mask exposure compensation",
-  "toneequal/mask contrast compensation",
-  "@color",
-  "colorequal/page",
-  "colorequal/graph",
-  "colorequal/node placement",
+  "paramcurve/highlights",
+  "paramcurve/lights",
+  "paramcurve/darks",
+  "paramcurve/shadows",
+  "rgbcurve/channel",
+  "rgbcurve/curve",
   "@detail",
   "denoiseprofile/strength",
   "@lens & transform",
@@ -1131,7 +1141,8 @@ static void _basics_show(dt_lib_module_t *self)
     gtk_widget_set_name(d->vbox_basic, "basics-box");
   dt_gui_add_class(d->vbox_basic,"dt_plugin_ui");
 
-  _basics_apply_lightroom_order(d);
+  if(dt_conf_is_equal("plugins/darkroom/modulegroups_preset", _("workflow: lightroom")))
+    _basics_apply_lightroom_order(d);
 
   if(d->basics_listed_order)
   {
@@ -1152,7 +1163,6 @@ static void _basics_show(dt_lib_module_t *self)
 
   gtk_widget_show(d->vbox_basic);
 
-  /* open the panel at white balance, the first Lightroom section. */
   g_idle_add(_basics_scroll_to_top, g_object_ref(d->vbox_basic));
 
   DT_LEAVE_GUI_UPDATE();
@@ -2432,6 +2442,8 @@ void init_presets(dt_lib_module_t *self)
   (void)NC_("modulegroup", "tone");
   (void)NC_("modulegroup", "presence");
   (void)NC_("modulegroup", "tone curve");
+  (void)NC_("modulegroup", "detail");
+  (void)NC_("modulegroup", "lens & transform");
   AM("@white balance");
   AM("channelmixerrgb/illuminant");
   AM("channelmixerrgb/temperature");
@@ -2481,11 +2493,14 @@ void init_presets(dt_lib_module_t *self)
   AM("paramcurve/shadows");
   AM("rgbcurve/channel");
   AM("rgbcurve/curve");
+  AM("@detail");
+  AM("denoiseprofile/strength");
+  AM("@lens & transform");
+  AM("lens");
   AM("ashift/rotation");
   AM("crop/aspect");
 
   SMG(C_("modulegroup", "basic"), "basic");
-  AM("temperature");
   AM("channelmixerrgb");
   AM("exposure");
   if(wf_filmic || wf_none)
@@ -2499,7 +2514,6 @@ void init_presets(dt_lib_module_t *self)
   AM("contrastntexture");
   AM("toneequal");
   AM("hazeremoval");
-  AM("colorbalancergb");
   AM("highlights");
 
   SMG(C_("modulegroup", "tone curve"), "tone");
@@ -2508,7 +2522,7 @@ void init_presets(dt_lib_module_t *self)
   AM("tonecurve");
   AM("rgblevels");
 
-  SMG(C_("modulegroup", "color"), "color");
+  SMG(C_("modulegroup", "color & grading"), "color");
   AM("colorequal");
   AM("colorzones");
   AM("colorbalancergb");
@@ -2535,6 +2549,7 @@ void init_presets(dt_lib_module_t *self)
   AM("grain");
 
   SMG(C_("modulegroup", "calibration"), "grading");
+  AM("temperature");
   AM("channelmixerrgb");
 
   dt_lib_presets_add(_("workflow: lightroom"),
@@ -5177,6 +5192,19 @@ void view_leave(dt_lib_module_t *self,
   }
 }
 
+static gboolean _restore_group_after_view_enter(gpointer user_data)
+{
+  dt_lib_module_t *self = user_data;
+  if(dt_view_get_current() != DT_VIEW_DARKROOM) return G_SOURCE_REMOVE;
+
+  // Startup may show the IOP panel after the saved group has been applied.
+  // Reapply the group when the view's initial widget setup is complete.
+  DT_ENTER_GUI_UPDATE();
+  _lib_modulegroups_switch_to(self, dt_conf_get_int("plugins/darkroom/groups"));
+  DT_LEAVE_GUI_UPDATE();
+  return G_SOURCE_REMOVE;
+}
+
 void view_enter(dt_lib_module_t *self,
                 dt_view_t *old_view,
                 dt_view_t *new_view)
@@ -5184,15 +5212,14 @@ void view_enter(dt_lib_module_t *self,
   if(!strcmp(new_view->module_name, "darkroom"))
   {
     dt_lib_modulegroups_t *d = self->data;
-
     // and we initialize the buttons too
     char *preset = dt_conf_get_string("plugins/darkroom/modulegroups_preset");
     if(!dt_lib_presets_apply(preset, self->plugin_name, self->version()))
       dt_lib_presets_apply(_(FALLBACK_PRESET_NAME), self->plugin_name, self->version());
     g_free(preset);
 
-    // and set the current group
     d->current = dt_conf_get_int("plugins/darkroom/groups");
+    g_idle_add_full(G_PRIORITY_LOW, _restore_group_after_view_enter, self, NULL);
   }
 }
 

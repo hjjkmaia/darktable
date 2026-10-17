@@ -2271,6 +2271,8 @@ void dt_masks_form_remove(dt_iop_module_t *module,
         break;
       }
     }
+    if(ok && grp->points)
+      ((dt_masks_point_group_t *)grp->points->data)->state &= ~DT_MASKS_STATE_OP;
     if(ok && grp->points == NULL)
     {
       // Remove the empty root before capturing history and its mask mode.
@@ -2343,6 +2345,8 @@ void dt_masks_form_remove(dt_iop_module_t *module,
           if(ok)
           {
             form_removed = TRUE;
+            if(iopgrp->points)
+              ((dt_masks_point_group_t *)iopgrp->points->data)->state &= ~DT_MASKS_STATE_OP;
             dt_masks_iop_update(m);
             if(iopgrp->points == NULL) dt_masks_form_remove(m, NULL, iopgrp);
           }
