@@ -4213,7 +4213,7 @@
   <dtconfig>
     <name>plugins/darkroom/modulegroups_preset</name>
     <type>string</type>
-    <default></default>
+    <default>workflow: lightroom</default>
     <shortdescription>preset use for defining iop layout</shortdescription>
     <longdescription>preset use for defining iop layout</longdescription>
   </dtconfig>

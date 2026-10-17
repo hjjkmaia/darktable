@@ -79,6 +79,20 @@ typedef enum dt_dev_rawoverexposed_colorscheme_t {
   DT_DEV_RAWOVEREXPOSED_BLACK = 3
 } dt_dev_rawoverexposed_colorscheme_t;
 
+// operations on a local-adjustment mask's owned group and component rows
+// dispatched by the mask manager so both panels share history and ownership paths
+typedef enum dt_dev_mask_ui_action_t
+{
+  DT_DEV_MASK_UI_ADD_COMPONENT,
+  DT_DEV_MASK_UI_SUBTRACT_COMPONENT,
+  DT_DEV_MASK_UI_INVERT_PARENT,
+  DT_DEV_MASK_UI_DUPLICATE_PARENT,
+  DT_DEV_MASK_UI_INVERT_COMPONENT,
+  DT_DEV_MASK_UI_DUPLICATE_COMPONENT,
+  DT_DEV_MASK_UI_MOVE_COMPONENT_TO_NEW_MASK,
+  DT_DEV_MASK_UI_DELETE_COMPONENT
+} dt_dev_mask_ui_action_t;
+
 typedef enum dt_dev_transform_direction_t
 {
   DT_DEV_TRANSFORM_DIR_ALL = 0,
@@ -323,6 +337,13 @@ typedef struct dt_develop_t
       void (*selection_change)(struct dt_lib_module_t *self,
                                struct dt_iop_module_t *module,
                                const dt_mask_id_t selectid);
+      /* dispatch against the exact owner/group/component; shape_type is a
+       * DT_MASKS_* kind for ADD/SUBTRACT and ignored otherwise */
+      gboolean (*local_action)(struct dt_lib_module_t *self,
+                               struct dt_iop_module_t *owner,
+                               const dt_mask_id_t childid,
+                               const dt_dev_mask_ui_action_t action,
+                               const int shape_type);
     } masks;
 
     /* local-adjustment mask that should own a newly created shape */
@@ -334,6 +355,11 @@ typedef struct dt_develop_t
       /* select the existing owner of a mask-manager row, or clear an ambiguous owner */
       void (*select_mask)(struct dt_lib_module_t *self,
                           struct dt_iop_module_t *owner);
+      /* mirror the manager's selected localmask root or child in the primary
+       * hierarchy; NO_MASKID selects the root */
+      void (*select_component)(struct dt_lib_module_t *self,
+                               struct dt_iop_module_t *owner,
+                               const dt_mask_id_t childid);
       /* duplicate a complete local adjustment with independent shapes and sinks */
       struct dt_iop_module_t *(*duplicate_mask)(struct dt_lib_module_t *self,
                                                 struct dt_iop_module_t *owner,

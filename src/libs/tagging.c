@@ -3185,7 +3185,7 @@ void gui_reset(dt_lib_module_t *self)
 
 int position(const dt_lib_module_t *self)
 {
-  return 500;
+  return 600;
 }
 
 static gboolean _match_selected_func(GtkEntryCompletion *completion,

@@ -281,7 +281,7 @@ void gui_reset(dt_lib_module_t *self)
 
 int position(const dt_lib_module_t *self)
 {
-  return 600;
+  return 900;
 }
 
 void gui_init(dt_lib_module_t *self)

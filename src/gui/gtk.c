@@ -1761,6 +1761,12 @@ void dt_open_url(const char* url)
 static void _osx_ctl_switch_mode_to(GtkWidget *mi,
                                     gpointer mode)
 {
+  const dt_view_t *current = dt_view_manager_get_current_view(darktable.view_manager);
+  // menu items select a view; the shared shortcut action toggles an active
+  // non-lighttable view back to lighttable
+  if(current && !g_ascii_strcasecmp(current->module_name, (const char *)mode))
+    return;
+
   dt_ctl_switch_mode_to((const char*) mode);
 }
 

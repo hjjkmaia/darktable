@@ -169,7 +169,7 @@ uint32_t container(dt_lib_module_t *self)
 
 int position(const dt_lib_module_t *self)
 {
-  return 450;
+  return 580;
 }
 
 // modify the datetime_taken field in the db/cache of selected images

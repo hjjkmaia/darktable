@@ -476,7 +476,7 @@ static gboolean _textview_focus(GtkWidget *widget,
 
 int position(const dt_lib_module_t *self)
 {
-  return 510;
+  return 590;
 }
 
 static void _update_layout(dt_lib_module_t *self)

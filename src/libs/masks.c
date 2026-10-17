@@ -131,7 +131,8 @@ uint32_t container(dt_lib_module_t *self)
 
 int position(const dt_lib_module_t *self)
 {
-  return 10;
+  /* Keep the advanced mask tools directly below Local Adjustments. */
+  return 1050;
 }
 
 static gboolean _selected_masks_are_used(GtkTreeModel *model,
@@ -616,12 +617,20 @@ static dt_masks_type_t _brush_conf_type(void)
   return DT_MASKS_BRUSH;
 }
 
+static void _brush_refresh_localadjust(void)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(dev && dev->proxy.localadjust.module)
+    dt_lib_gui_queue_update(dev->proxy.localadjust.module);
+}
+
 static void _brush_size_changed(GtkWidget *w, dt_lib_masks_t *d)
 {
   if(d->brush_updating) return;
   const float border = CLAMP(dt_bauhaus_slider_get(w) * 0.5f, 0.00005f, 0.5f);
   dt_conf_set_float(DT_MASKS_CONF(_brush_conf_type(), brush, border), border);
   dt_control_queue_redraw_center();
+  _brush_refresh_localadjust();
 }
 
 static void _brush_feather_changed(GtkWidget *w, dt_lib_masks_t *d)
@@ -630,6 +639,7 @@ static void _brush_feather_changed(GtkWidget *w, dt_lib_masks_t *d)
   const float hardness = CLAMP(1.0f - dt_bauhaus_slider_get(w), 0.0005f, 1.0f);
   dt_conf_set_float(DT_MASKS_CONF(_brush_conf_type(), brush, hardness), hardness);
   dt_control_queue_redraw_center();
+  _brush_refresh_localadjust();
 }
 
 static void _brush_density_changed(GtkWidget *w, dt_lib_masks_t *d)
@@ -637,6 +647,7 @@ static void _brush_density_changed(GtkWidget *w, dt_lib_masks_t *d)
   if(d->brush_updating) return;
   const float density = CLAMP(dt_bauhaus_slider_get(w), 0.05f, 1.0f);
   dt_conf_set_float(DT_MASKS_CONF(_brush_conf_type(), brush, density), density);
+  _brush_refresh_localadjust();
 }
 
 static void _brush_flow_changed(GtkWidget *w, dt_lib_masks_t *d)
@@ -644,6 +655,7 @@ static void _brush_flow_changed(GtkWidget *w, dt_lib_masks_t *d)
   if(d->brush_updating) return;
   const float flow = CLAMP(dt_bauhaus_slider_get(w), 0.01f, 1.0f);
   dt_conf_set_float("plugins/darkroom/masks/brush/flow", flow);
+  _brush_refresh_localadjust();
 }
 
 static void _brush_erase_changed(GtkWidget *w, dt_lib_masks_t *d)
@@ -839,6 +851,7 @@ static gboolean _tree_add_shape(GtkButton *button, gpointer shape)
   dev->form_gui->group_selected = 0;
   dev->form_gui->edit_mode = DT_MASKS_EDIT_FULL;
   dt_control_queue_redraw_center();
+  _brush_refresh_localadjust();
   _shape_add_ok = TRUE;
   return TRUE;
 }
@@ -923,14 +936,13 @@ static gboolean _tree_add_shape_to_standard_group(dt_iop_module_t *owner,
   return TRUE;
 }
 
-static void _tree_add_shape_menu(GtkButton *button, gpointer shape)
+static gboolean _tree_add_shape_to_target(const dt_mask_id_t target,
+                                          const gboolean group_context,
+                                          const gboolean subtract,
+                                          dt_iop_module_t *owner,
+                                          const dt_masks_type_t shape)
 {
-  if(_shape_add_busy) return;
-  const dt_mask_id_t target = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "target-group-id"));
-  const gboolean group_context = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "group-context"));
-  const gboolean subtract = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "subtract-from-mask"));
-  dt_iop_module_t *owner = g_object_get_data(G_OBJECT(button), "target-owner");
-  if(group_context && !dt_is_valid_maskid(target)) return;
+  if(_shape_add_busy || (group_context && !dt_is_valid_maskid(target))) return FALSE;
   if(dt_is_valid_maskid(target))
   {
     dt_develop_t *dev = darktable.develop;
@@ -942,28 +954,30 @@ static void _tree_add_shape_menu(GtkButton *button, gpointer shape)
                        || (owner->blend_params->mask_combine & DEVELOP_COMBINE_MASKS_POS)
                        || (!dt_iop_module_is(owner, "localmask")
                            && !_standard_group_is_exclusive(owner, target)))))
-      return;
+      return FALSE;
 
     if(!dt_iop_module_is(owner, "localmask"))
     {
-      if(!_tree_add_shape_to_standard_group(owner, shape) || !subtract) return;
+      if(!_tree_add_shape_to_standard_group(owner, GINT_TO_POINTER(shape))) return FALSE;
+      if(!subtract) return TRUE;
     }
     else
     {
       if(!dev->proxy.localadjust.module || !dev->proxy.localadjust.select_mask
          || !dev->proxy.localadjust.selected_mask)
-        return;
+        return FALSE;
       dev->proxy.localadjust.select_mask(dev->proxy.localadjust.module, owner);
       if(dev->proxy.localadjust.selected_mask(dev->proxy.localadjust.module) != owner)
-        return;
+        return FALSE;
     }
   }
   else if(subtract)
-    return;
+    return FALSE;
 
   if((!dt_is_valid_maskid(target) || dt_iop_module_is(owner, "localmask"))
-     && (!_tree_add_shape(button, shape) || !subtract))
-    return;
+     && !_tree_add_shape(NULL, GINT_TO_POINTER(shape)))
+    return FALSE;
+  if(!subtract) return TRUE;
 
   dt_develop_t *dev = darktable.develop;
   const dt_masks_form_t *group = dt_masks_get_from_id(dev, target);
@@ -977,13 +991,27 @@ static void _tree_add_shape_menu(GtkButton *button, gpointer shape)
          && !_standard_group_is_exclusive(owner, target)))
   {
     dt_masks_cancel_creation();
-    return;
+    return FALSE;
   }
   dev->form_gui->subtract_parentid = target;
   if(dt_iop_module_is(owner, "localmask")
      && (!dev->proxy.localadjust.hold_shape_undo
          || !dev->proxy.localadjust.hold_shape_undo(dev->proxy.localadjust.module, owner, target)))
+  {
     dt_masks_cancel_creation();
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static void _tree_add_shape_menu(GtkButton *button, gpointer shape)
+{
+  const dt_mask_id_t target = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "target-group-id"));
+  const gboolean group_context = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "group-context"));
+  const gboolean subtract = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "subtract-from-mask"));
+  dt_iop_module_t *owner = g_object_get_data(G_OBJECT(button), "target-owner");
+  _tree_add_shape_to_target(target, group_context, subtract, owner,
+                            (dt_masks_type_t)GPOINTER_TO_INT(shape));
 }
 
 static void _tree_append_subtract_tool(GtkWidget *menu, const gchar *label,
@@ -1446,7 +1474,7 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
 
       if(has_previous)
       {
-        _lib_masks_get_values(model, prev_iter, &module, &prev_grid, &prev_id);
+        _lib_masks_get_values(model, prev_iter, NULL, &prev_grid, &prev_id);
         if(_is_last_tree_item(model, &iter))
         {
           _swap_last_secondlast_item_visibility(lm, &iter, id, prev_id);
@@ -1462,6 +1490,226 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
 
   dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
   dt_undo_end_group(darktable.undo);
+  _lib_masks_recreate_list(self);
+}
+
+typedef struct dt_lib_masks_shape_context_t
+{
+  dt_mask_id_t formid;
+  dt_mask_id_t groupid;
+  dt_iop_module_t *owner;
+  dt_masks_state_t state;
+  float opacity;
+} dt_lib_masks_shape_context_t;
+
+static gboolean _shape_has_other_use(const dt_mask_id_t formid,
+                                     const dt_mask_id_t source_groupid)
+{
+  dt_develop_t *dev = darktable.develop;
+  for(const GList *it = dev->forms; it; it = g_list_next(it))
+  {
+    const dt_masks_form_t *group = it->data;
+    if(!(group->type & DT_MASKS_GROUP) || group->formid == source_groupid) continue;
+    for(const GList *points = group->points; points; points = g_list_next(points))
+    {
+      const dt_masks_point_group_t *point = points->data;
+      if(point->formid == formid) return TRUE;
+    }
+  }
+  for(const GList *it = dev->iop; it; it = g_list_next(it))
+  {
+    const dt_iop_module_t *module = it->data;
+    if(module->blend_params && module->blend_params->mask_id == formid) return TRUE;
+  }
+  return FALSE;
+}
+
+static gboolean _shape_context(GtkTreeModel *model, GtkTreePath *path,
+                               dt_lib_masks_shape_context_t *context)
+{
+  dt_develop_t *dev = darktable.develop;
+  const int depth = gtk_tree_path_get_depth(path);
+  if(!dev || !dev->gui_attached || (depth != 1 && depth != 2)) return FALSE;
+
+  GtkTreeIter iter;
+  if(!gtk_tree_model_get_iter(model, &iter, path)) return FALSE;
+  dt_mask_id_t groupid = NO_MASKID;
+  dt_mask_id_t formid = NO_MASKID;
+  _lib_masks_get_values(model, &iter, NULL, &groupid, &formid);
+  const dt_masks_form_t *form = dt_masks_get_from_id(dev, formid);
+  if(!form || !(form->type == DT_MASKS_BRUSH || form->type == DT_MASKS_ELLIPSE
+                || form->type == DT_MASKS_PATH || form->type == DT_MASKS_GRADIENT
+                || form->type == DT_MASKS_CIRCLE))
+    return FALSE;
+
+  *context = (dt_lib_masks_shape_context_t){
+    .formid = formid,
+    .groupid = NO_MASKID,
+    .owner = NULL,
+    .state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE,
+    .opacity = dt_conf_get_float("plugins/darkroom/masks/opacity")
+  };
+  if(depth == 1)
+    return !_form_is_group_member(formid)
+           && !_shape_has_other_use(formid, NO_MASKID);
+
+  const dt_masks_form_t *group = dt_masks_get_from_id(dev, groupid);
+  if(!group || group->type != DT_MASKS_GROUP) return FALSE;
+  // A shared root would change every owner when one child is removed.
+  for(const GList *it = dev->forms; it; it = g_list_next(it))
+  {
+    const dt_masks_form_t *parent = it->data;
+    if(parent == group || !(parent->type & DT_MASKS_GROUP)) continue;
+    for(const GList *points = parent->points; points; points = g_list_next(points))
+    {
+      const dt_masks_point_group_t *point = points->data;
+      if(point->formid == groupid) return FALSE;
+    }
+  }
+  for(const GList *it = dev->iop; it; it = g_list_next(it))
+  {
+    dt_iop_module_t *module = it->data;
+    if(!module->blend_params || module->blend_params->mask_id != groupid) continue;
+    if(context->owner) return FALSE;
+    context->owner = module;
+  }
+  // only local adjustments own the remove/delete semantics used below
+  if(!context->owner || !dt_iop_module_is(context->owner, "localmask")
+     || context->owner->multi_priority <= 0) return FALSE;
+  guint occurrences = 0;
+  for(const GList *points = group->points; points; points = g_list_next(points))
+  {
+    const dt_masks_point_group_t *point = points->data;
+    if(point->formid != formid) continue;
+    if(++occurrences > 1) return FALSE;
+    context->groupid = groupid;
+    context->state = point->state;
+    context->opacity = point->opacity;
+  }
+  return occurrences == 1;
+}
+
+static void _tree_create_mask_from_shape(GtkMenuItem *item, dt_lib_module_t *self)
+{
+  (void)item;
+  dt_develop_t *dev = darktable.develop;
+  dt_lib_masks_t *lm = self->data;
+  if(!dev || !dev->gui_attached || !darktable.undo
+     || darktable.undo->group != DT_UNDO_NONE
+     || (dev->form_gui && dev->form_gui->creation)) return;
+
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
+  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
+  dt_lib_masks_shape_context_t source;
+  const gboolean valid = items && !items->next
+                         && _shape_context(model, items->data, &source);
+  g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+  if(!valid) return;
+
+  dt_iop_module_t *base = dt_iop_get_module_by_op_priority(dev->iop, "localmask", 0);
+  const dt_masks_form_t *form = dt_masks_get_from_id(dev, source.formid);
+  if(!base || !form) return;
+
+  dt_masks_form_t *group = dt_masks_create(DT_MASKS_GROUP);
+  if(!group) return;
+  while(dt_masks_get_from_id(dev, group->formid)) group->formid++;
+  dt_masks_point_group_t *point = dt_masks_group_add_form(group, form);
+  if(!point)
+  {
+    dt_masks_free_form(group);
+    return;
+  }
+  point->state = source.state & ~DT_MASKS_STATE_OP;
+  point->opacity = source.opacity;
+
+  dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+  dt_iop_module_t *mask = dt_iop_gui_duplicate(base, FALSE);
+  if(!mask || !mask->blend_params)
+  {
+    if(mask) dt_iop_gui_delete(mask);
+    dt_masks_free_form(group);
+    dt_undo_end_group(darktable.undo);
+    return;
+  }
+
+  gchar *label = dt_history_item_get_name(mask);
+  snprintf(group->name, sizeof(group->name), _("group `%s'"), label);
+  g_free(label);
+  dt_pthread_mutex_lock(&dev->history_mutex);
+  dev->forms = g_list_append(dev->forms, group);
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+  dt_develop_blend_params_t bp = *mask->blend_params;
+  bp.mask_id = group->formid;
+  bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  bp.mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
+  dt_iop_commit_blend_params(mask, &bp, NULL);
+  dt_dev_add_masks_history_item(dev, mask, TRUE);
+
+  if(dt_is_valid_maskid(source.groupid))
+  {
+    dt_masks_form_t *old_group = dt_masks_get_from_id(dev, source.groupid);
+    dt_masks_form_t *old_form = dt_masks_get_from_id(dev, source.formid);
+    if(old_group && old_form)
+      dt_masks_form_remove(source.owner, old_group, old_form);
+  }
+  dt_undo_end_group(darktable.undo);
+
+  dt_iop_gui_update_blending(mask);
+  if(dev->proxy.localadjust.module && dev->proxy.localadjust.select_mask)
+    dev->proxy.localadjust.select_mask(dev->proxy.localadjust.module, mask);
+  dt_masks_set_edit_mode_single_form(mask, source.formid, DT_MASKS_EDIT_FULL);
+  dt_dev_masks_selection_change(dev, mask, source.formid);
+  _lib_masks_recreate_list(self);
+}
+
+static void _tree_delete_component(GtkMenuItem *item, dt_lib_module_t *self)
+{
+  (void)item;
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached || !darktable.undo
+     || darktable.undo->group != DT_UNDO_NONE
+     || (dev->form_gui && dev->form_gui->creation)) return;
+  dt_lib_masks_t *lm = self->data;
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
+  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
+  GArray *targets = g_array_new(FALSE, FALSE, sizeof(dt_lib_masks_shape_context_t));
+  gboolean valid = items != NULL;
+  for(const GList *it = items; it; it = g_list_next(it))
+  {
+    dt_lib_masks_shape_context_t context;
+    if(!_shape_context(model, it->data, &context)
+       || !dt_is_valid_maskid(context.groupid))
+    {
+      valid = FALSE;
+      break;
+    }
+    g_array_append_val(targets, context);
+  }
+  g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+  if(!valid)
+  {
+    g_array_free(targets, TRUE);
+    return;
+  }
+
+  dt_masks_clear_form_gui(darktable.develop);
+  dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+  for(guint i = 0; i < targets->len; i++)
+  {
+    const dt_lib_masks_shape_context_t target =
+      g_array_index(targets, dt_lib_masks_shape_context_t, i);
+    dt_masks_form_t *group = dt_masks_get_from_id(darktable.develop, target.groupid);
+    dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, target.formid);
+    if(!group || !form) continue;
+    if(_shape_has_other_use(target.formid, target.groupid))
+      dt_masks_form_remove(target.owner, group, form);
+    else
+      dt_masks_form_remove(target.owner, NULL, form);
+  }
+  dt_undo_end_group(darktable.undo);
+  g_array_free(targets, TRUE);
   _lib_masks_recreate_list(self);
 }
 
@@ -1950,6 +2198,232 @@ static void _tree_duplicate_component(GtkMenuItem *item, dt_lib_module_t *self)
   }
 }
 
+static gboolean _select_local_action_row(dt_lib_module_t *self,
+                                         dt_iop_module_t *owner,
+                                         const dt_mask_id_t childid)
+{
+  dt_develop_t *dev = darktable.develop;
+  dt_lib_masks_t *lm = self ? self->data : NULL;
+  if(!dev || !dev->gui_attached || !lm || !lm->treeview || !owner
+     || !g_list_find(dev->iop, owner) || !dt_iop_module_is(owner, "localmask")
+     || !owner->blend_params) return FALSE;
+
+  // The Advanced panel can stay collapsed while Local Adjustments changes
+  // masks. Its queued redraw has not necessarily rebuilt the tree yet, but
+  // actions below need to select a row from the current model immediately.
+  dt_lib_gui_queue_update(self);
+  dt_lib_gui_update(self);
+
+  const dt_mask_id_t rootid = owner->blend_params->mask_id;
+  const dt_masks_form_t *group = dt_masks_get_from_id(dev, rootid);
+  if(!group || group->type != DT_MASKS_GROUP) return FALSE;
+  if(dt_is_valid_maskid(childid))
+  {
+    guint matches = 0;
+    for(const GList *it = group->points; it; it = g_list_next(it))
+    {
+      const dt_masks_point_group_t *point = it->data;
+      if(point && point->formid == childid) matches++;
+    }
+    if(matches != 1) return FALSE;
+  }
+
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
+  GtkTreeIter root;
+  if(!model || !gtk_tree_model_get_iter_first(model, &root)) return FALSE;
+  gboolean found = FALSE;
+  do
+  {
+    dt_iop_module_t *row_owner = NULL;
+    dt_mask_id_t row_groupid = NO_MASKID;
+    dt_mask_id_t row_id = NO_MASKID;
+    _lib_masks_get_values(model, &root, &row_owner, &row_groupid, &row_id);
+    if(row_owner == owner && row_groupid == NO_MASKID && row_id == rootid)
+    {
+      found = TRUE;
+      break;
+    }
+  } while(gtk_tree_model_iter_next(model, &root));
+  if(!found) return FALSE;
+
+  GtkTreeIter target = root;
+  if(dt_is_valid_maskid(childid))
+  {
+    if(!gtk_tree_model_iter_children(model, &target, &root)) return FALSE;
+    found = FALSE;
+    do
+    {
+      dt_iop_module_t *row_owner = NULL;
+      dt_mask_id_t row_groupid = NO_MASKID;
+      dt_mask_id_t row_id = NO_MASKID;
+      _lib_masks_get_values(model, &target, &row_owner, &row_groupid, &row_id);
+      if(row_owner == owner && row_groupid == rootid && row_id == childid)
+      {
+        found = TRUE;
+        break;
+      }
+    } while(gtk_tree_model_iter_next(model, &target));
+    if(!found) return FALSE;
+  }
+
+  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  DT_ENTER_GUI_UPDATE();
+  gtk_tree_selection_unselect_all(selection);
+  GtkTreePath *path = gtk_tree_model_get_path(model, &target);
+  gtk_tree_view_expand_to_path(GTK_TREE_VIEW(lm->treeview), path);
+  gtk_tree_selection_select_iter(selection, &target);
+  gtk_tree_path_free(path);
+  dev->mask_form_selected_id = dt_is_valid_maskid(childid) ? childid : NO_MASKID;
+  DT_LEAVE_GUI_UPDATE();
+  _update_all_properties(lm);
+  _overlay_set_selected(selection);
+  return TRUE;
+}
+
+static dt_masks_point_group_t *_local_group_point(const dt_mask_id_t groupid,
+                                                   const dt_mask_id_t childid)
+{
+  const dt_masks_form_t *group = dt_masks_get_from_id(darktable.develop, groupid);
+  if(!group || group->type != DT_MASKS_GROUP) return NULL;
+  for(const GList *it = group->points; it; it = g_list_next(it))
+  {
+    dt_masks_point_group_t *point = it->data;
+    if(point && point->formid == childid) return point;
+  }
+  return NULL;
+}
+
+static gboolean _local_action(dt_lib_module_t *self,
+                              dt_iop_module_t *owner,
+                              const dt_mask_id_t childid,
+                              const dt_dev_mask_ui_action_t action,
+                              const int shape_type)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached || !darktable.undo
+     || darktable.undo->group != DT_UNDO_NONE
+     || (dev->form_gui && dev->form_gui->creation)) return FALSE;
+
+  const gboolean child_action = action == DT_DEV_MASK_UI_INVERT_COMPONENT
+                                || action == DT_DEV_MASK_UI_DUPLICATE_COMPONENT
+                                || action == DT_DEV_MASK_UI_MOVE_COMPONENT_TO_NEW_MASK
+                                || action == DT_DEV_MASK_UI_DELETE_COMPONENT;
+  const gboolean shape_action = action == DT_DEV_MASK_UI_ADD_COMPONENT
+                                || action == DT_DEV_MASK_UI_SUBTRACT_COMPONENT;
+  if(child_action != dt_is_valid_maskid(childid) || (shape_action &&
+     !(shape_type == DT_MASKS_BRUSH || shape_type == DT_MASKS_ELLIPSE
+       || shape_type == DT_MASKS_PATH || shape_type == DT_MASKS_GRADIENT)))
+    return FALSE;
+
+  // A newly committed shape can precede the Mask Manager tree refresh. Shape
+  // creation needs the live owner and group, not a selection in that tree.
+  if(shape_action)
+  {
+    if(self != dev->proxy.masks.module || !owner || !g_list_find(dev->iop, owner)
+       || !dt_iop_module_is(owner, "localmask") || owner->multi_priority <= 0
+       || !owner->blend_params || !dev->proxy.localadjust.module
+       || !dev->proxy.localadjust.select_mask
+       || !dev->proxy.localadjust.selected_mask) return FALSE;
+    const dt_mask_id_t rootid = owner->blend_params->mask_id;
+    if(rootid == NO_MASKID)
+    {
+      if(action != DT_DEV_MASK_UI_ADD_COMPONENT) return FALSE;
+    }
+    else
+    {
+      const dt_masks_form_t *group = dt_masks_get_from_id(dev, rootid);
+      if(!group || group->type != DT_MASKS_GROUP) return FALSE;
+      for(const GList *it = dev->iop; it; it = g_list_next(it))
+      {
+        const dt_iop_module_t *other = it->data;
+        if(other != owner && other->blend_params
+           && other->blend_params->mask_id == rootid) return FALSE;
+      }
+    }
+    dev->proxy.localadjust.select_mask(dev->proxy.localadjust.module, owner);
+    if(dev->proxy.localadjust.selected_mask(dev->proxy.localadjust.module) != owner
+       || owner->blend_params->mask_id != rootid) return FALSE;
+    const gboolean armed = rootid == NO_MASKID
+      ? _tree_add_shape(NULL, GINT_TO_POINTER(shape_type))
+      : _tree_add_shape_to_target(rootid, TRUE,
+                                  action == DT_DEV_MASK_UI_SUBTRACT_COMPONENT,
+                                  owner, (dt_masks_type_t)shape_type);
+    if(!armed) return FALSE;
+    if(!dev->form_gui || !dev->form_gui->creation
+       || dev->form_gui->creation_module != owner)
+    {
+      if(dev->form_gui && dev->form_gui->creation) dt_masks_cancel_creation();
+      return FALSE;
+    }
+    return TRUE;
+  }
+  if(!_select_local_action_row(self, owner, childid)) return FALSE;
+
+  dt_lib_masks_t *lm = self->data;
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
+  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
+  const gboolean valid = child_action
+    ? _selected_localmask_component(model, items, NULL, NULL, NULL) == owner
+    : _selected_localmask_group_owner(model, items, NULL) == owner;
+  gboolean safe_move_or_delete = TRUE;
+  if(valid && (action == DT_DEV_MASK_UI_MOVE_COMPONENT_TO_NEW_MASK
+               || action == DT_DEV_MASK_UI_DELETE_COMPONENT))
+  {
+    dt_lib_masks_shape_context_t context;
+    safe_move_or_delete = _shape_context(model, items->data, &context)
+                          && context.owner == owner
+                          && context.formid == childid
+                          && context.groupid == owner->blend_params->mask_id;
+  }
+  g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+  if(!valid || !safe_move_or_delete) return FALSE;
+
+  switch(action)
+  {
+    case DT_DEV_MASK_UI_INVERT_PARENT:
+    {
+      const dt_masks_form_t *group = dt_masks_get_from_id(dev, owner->blend_params->mask_id);
+      if(!group || !group->points) return FALSE;
+      const int before = owner->blend_params->mask_combine;
+      _tree_invert_mask(NULL, self);
+      return owner->blend_params->mask_combine != before;
+    }
+    case DT_DEV_MASK_UI_DUPLICATE_PARENT:
+    {
+      if(!dev->proxy.localadjust.module || !dev->proxy.localadjust.duplicate_mask)
+        return FALSE;
+      dt_iop_module_t *copy = dev->proxy.localadjust.duplicate_mask(
+        dev->proxy.localadjust.module, owner, FALSE);
+      if(copy && copy->blend_params)
+        dt_dev_masks_selection_change(dev, copy, copy->blend_params->mask_id);
+      return copy != NULL;
+    }
+    case DT_DEV_MASK_UI_INVERT_COMPONENT:
+    {
+      dt_masks_point_group_t *point = _local_group_point(owner->blend_params->mask_id, childid);
+      if(!point) return FALSE;
+      const dt_masks_state_t before = point->state;
+      _tree_operation(NULL, GINT_TO_POINTER(DT_MASKS_STATE_INVERSE));
+      return point->state != before;
+    }
+    case DT_DEV_MASK_UI_DUPLICATE_COMPONENT:
+    {
+      const guint before = g_list_length(dev->forms);
+      _tree_duplicate_component(NULL, self);
+      return g_list_length(dev->forms) > before;
+    }
+    case DT_DEV_MASK_UI_MOVE_COMPONENT_TO_NEW_MASK:
+      _tree_create_mask_from_shape(NULL, self);
+      return _local_group_point(owner->blend_params->mask_id, childid) == NULL;
+    case DT_DEV_MASK_UI_DELETE_COMPONENT:
+      _tree_delete_component(NULL, self);
+      return _local_group_point(owner->blend_params->mask_id, childid) == NULL;
+    default:
+      return FALSE;
+  }
+}
+
 static void _overlay_row_context(GtkTreeModel *model, GtkTreeIter *iter,
                                  dt_mask_id_t *id, dt_mask_id_t *groupid,
                                  uint32_t *state, dt_iop_module_t **owner)
@@ -2064,8 +2538,11 @@ static gboolean _tree_overlay_leave(GtkWidget *treeview, GdkEventCrossing *event
 static void _show_overlay_toggled(GtkToggleButton *button, gpointer user_data)
 {
   (void)user_data;
+  DT_GUARD_GUI_UPDATE();
   darktable.develop->mask_overlay_show = gtk_toggle_button_get_active(button);
   dt_control_queue_redraw_center();
+  if(darktable.develop->proxy.localadjust.module)
+    dt_lib_gui_queue_update(darktable.develop->proxy.localadjust.module);
 }
 
 static void _all_shapes_toggled(GtkToggleButton *button, dt_lib_module_t *self)
@@ -2095,8 +2572,34 @@ static void _tree_selection_change(GtkTreeSelection *selection, dt_lib_masks_t *
       rows = g_list_append(rows, gtk_tree_row_reference_new(model, it->data));
 
     dt_develop_t *dev = darktable.develop;
-    if(dev->proxy.localadjust.module && dev->proxy.localadjust.select_mask)
-      dev->proxy.localadjust.select_mask(dev->proxy.localadjust.module, owner);
+    if(dev->proxy.localadjust.module)
+    {
+      dt_mask_id_t childid = NO_MASKID;
+      gboolean local_row = FALSE;
+      if(nb == 1 && owner && dt_iop_module_is(owner, "localmask")
+         && owner->blend_params)
+      {
+        GtkTreeIter iter;
+        if(gtk_tree_model_get_iter(model, &iter, items->data))
+        {
+          dt_mask_id_t groupid = NO_MASKID;
+          dt_mask_id_t formid = NO_MASKID;
+          _lib_masks_get_values(model, &iter, NULL, &groupid, &formid);
+          if(groupid == NO_MASKID && formid == owner->blend_params->mask_id)
+            local_row = TRUE;
+          else if(groupid == owner->blend_params->mask_id
+                  && _selected_localmask_component(model, items, NULL, NULL, NULL) == owner)
+          {
+            childid = formid;
+            local_row = TRUE;
+          }
+        }
+      }
+      if(local_row && dev->proxy.localadjust.select_component)
+        dev->proxy.localadjust.select_component(dev->proxy.localadjust.module, owner, childid);
+      else if(dev->proxy.localadjust.select_mask)
+        dev->proxy.localadjust.select_mask(dev->proxy.localadjust.module, owner);
+    }
 
     // focus clears the mask overlay and selection; restore the rows afterwards
     // disabled owners stay disabled and are edited through the mask manager
@@ -2540,6 +3043,18 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
           item = gtk_menu_item_new_with_label(_("duplicate shape"));
           g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_shape), self);
           gtk_menu_shell_append(menu, item);
+          GList *selected = gtk_tree_selection_get_selected_rows(selection, NULL);
+          dt_lib_masks_shape_context_t source;
+          const gboolean orphan = selected && !selected->next
+                                  && _shape_context(model, selected->data, &source)
+                                  && !dt_is_valid_maskid(source.groupid);
+          g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
+          if(orphan)
+          {
+            item = gtk_menu_item_new_with_label(_("create new mask from shape"));
+            g_signal_connect(item, "activate", G_CALLBACK(_tree_create_mask_from_shape), self);
+            gtk_menu_shell_append(menu, item);
+          }
           gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
         }
         item = gtk_menu_item_new_with_label(nb == 1
@@ -2566,8 +3081,53 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
         gtk_menu_shell_append(menu, item);
         gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
       }
-      item = gtk_menu_item_new_with_label(_("remove from group"));
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
+      GList *selected = gtk_tree_selection_get_selected_rows(selection, NULL);
+      gboolean can_delete = selected != NULL;
+      gboolean can_rehome = nb == 1;
+      gboolean has_localmask_child = FALSE;
+      for(const GList *it = selected; it; it = g_list_next(it))
+      {
+        GtkTreeIter row;
+        if(gtk_tree_path_get_depth(it->data) == 2
+           && gtk_tree_model_get_iter(model, &row, it->data))
+        {
+          dt_mask_id_t row_groupid = NO_MASKID;
+          _lib_masks_get_values(model, &row, NULL, &row_groupid, NULL);
+          for(const GList *modules = darktable.develop->iop;
+              modules; modules = g_list_next(modules))
+          {
+            const dt_iop_module_t *owner = modules->data;
+            if(owner->blend_params && owner->blend_params->mask_id == row_groupid
+               && dt_iop_module_is(owner, "localmask"))
+            {
+              has_localmask_child = TRUE;
+              break;
+            }
+          }
+        }
+        dt_lib_masks_shape_context_t source;
+        if(!_shape_context(model, it->data, &source)
+           || !dt_is_valid_maskid(source.groupid))
+          can_delete = can_rehome = FALSE;
+      }
+      g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
+      if(can_delete && nb == 1)
+      {
+        item = gtk_menu_item_new_with_label(_("create new mask from shape"));
+        gtk_widget_set_sensitive(item, can_rehome);
+        g_signal_connect(item, "activate", G_CALLBACK(_tree_create_mask_from_shape), self);
+        gtk_menu_shell_append(menu, item);
+      }
+      item = gtk_menu_item_new_with_label(can_delete
+                                            ? (nb == 1 ? _("delete shape")
+                                                       : _("delete selected shapes"))
+                                            : _("remove from group"));
+      if(can_delete)
+        g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_component), self);
+      else if(!has_localmask_child)
+        g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
+      else
+        gtk_widget_set_sensitive(item, FALSE);
       gtk_menu_shell_append(menu, item);
       has_menu_items = TRUE;
     }
@@ -2948,8 +3508,11 @@ GList *_lib_masks_get_selected(dt_lib_module_t *self)
 }
 
 // A hash of everything that determines the tree's *structure* (which rows exist
-// and how they nest): the all-shapes view, the active module, and every form's
-// id/type plus each group member's id and parent. Deliberately excludes
+// and how they nest): the image, module instances, all-shapes view, active
+// module, and every form's id/type plus each group member's id and parent.
+// Module instances must be included because the rows keep owner pointers;
+// reusing a tree after a photo switch would leave those pointers dangling.
+// Deliberately excludes
 // per-shape parameters - opacity, state, size, feather, rotation - so editing
 // them (e.g. dragging a slider) leaves the hash unchanged and gui_update can
 // refresh the rows in place instead of recreating the store, which would reset
@@ -2963,10 +3526,17 @@ static guint _forms_structure_hash(const gboolean all_shapes)
   {                                                                                                \
     h = (h ^ (guint)(v)) * 16777619u;                                                              \
   } while(0)
+  _MIX(dev->image_storage.id);
   _MIX(all_shapes);
   const size_t mod = (size_t)dev->gui_module;
   _MIX(mod);
   _MIX(mod >> 32);
+  for(const GList *l = dev->iop; l; l = g_list_next(l))
+  {
+    const size_t owner = (size_t)l->data;
+    _MIX(owner);
+    _MIX(owner >> 32);
+  }
   for(const GList *l = dev->forms; l; l = g_list_next(l))
   {
     const dt_masks_form_t *f = l->data;
@@ -2991,6 +3561,9 @@ void gui_update(dt_lib_module_t *self)
   if(!lm) return;
 
   DT_TRY_GUI_UPDATE();
+
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(lm->show_overlay),
+                               darktable.develop->mask_overlay_show);
 
   // if the tree structure is unchanged (e.g. this update was triggered by a slider
   // edit, which only alters shape parameters), do not recreate the store - that
@@ -3316,6 +3889,16 @@ static void _lib_masks_selection_change(dt_lib_module_t *self,
     gtk_tree_view_expand_all(GTK_TREE_VIEW(lm->treeview));
     found = _lib_masks_selection_change_r(model, selection, &iter, module, selectid, 1);
     if(!found) gtk_tree_view_collapse_all(GTK_TREE_VIEW(lm->treeview));
+    else
+    {
+      GList *rows = gtk_tree_selection_get_selected_rows(selection, NULL);
+      if(rows)
+      {
+        gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(lm->treeview), rows->data,
+                                     NULL, TRUE, 0.5, 0.5);
+        g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+      }
+    }
   }
 
   // a shape just created is not yet in the (still to be rebuilt) tree, so the
@@ -3680,6 +4263,7 @@ void gui_init(dt_lib_module_t *self)
   darktable.develop->proxy.masks.list_update = _lib_masks_update_list;
   darktable.develop->proxy.masks.list_remove = _lib_masks_remove_item;
   darktable.develop->proxy.masks.selection_change = _lib_masks_selection_change;
+  darktable.develop->proxy.masks.local_action = _local_action;
 }
 
 void gui_cleanup(dt_lib_module_t *self)
@@ -3687,6 +4271,15 @@ void gui_cleanup(dt_lib_module_t *self)
   dt_lib_masks_t *d = self->data;
   if(d && d->resize_timer)
     g_source_remove(d->resize_timer);
+  if(darktable.develop->proxy.masks.module == self)
+  {
+    darktable.develop->proxy.masks.module = NULL;
+    darktable.develop->proxy.masks.list_change = NULL;
+    darktable.develop->proxy.masks.list_update = NULL;
+    darktable.develop->proxy.masks.list_remove = NULL;
+    darktable.develop->proxy.masks.selection_change = NULL;
+    darktable.develop->proxy.masks.local_action = NULL;
+  }
   darktable.develop->mask_overlay_hover_id = NO_MASKID;
   darktable.develop->mask_overlay_hover_group_id = NO_MASKID;
   darktable.develop->mask_overlay_hover_state = DT_MASKS_STATE_NONE;

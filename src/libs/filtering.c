@@ -1486,7 +1486,7 @@ void gui_reset(dt_lib_module_t *self)
 
 int position(const dt_lib_module_t *self)
 {
-  return 350;
+  return 800;
 }
 
 static void _dt_collection_updated(gpointer instance, dt_collection_change_t query_change,

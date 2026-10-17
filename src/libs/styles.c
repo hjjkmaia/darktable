@@ -73,7 +73,7 @@ uint32_t container(dt_lib_module_t *self)
 
 int position(const dt_lib_module_t *self)
 {
-  return 599;
+  return 1000;
 }
 
 typedef enum _styles_columns_t

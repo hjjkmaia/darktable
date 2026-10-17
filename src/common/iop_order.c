@@ -142,6 +142,7 @@ const dt_iop_order_entry_t legacy_order[] = {
   { {41.0f }, "atrous", 0},
   { {42.0f }, "bilat", 0},
   { {43.0f }, "colorzones", 0},
+  { {43.5f }, "pointcolor", 0},
   { {44.0f }, "lowlight", 0},
   { {45.0f }, "monochrome", 0},
   { {45.3f }, "sigmoid", 0},
@@ -287,6 +288,7 @@ const dt_iop_order_entry_t v30_order[] = {
   { {57.0f }, "velvia", 0},          // same
   { {58.0f }, "vibrance", 0},        // same, but more subtle
   { {60.0f }, "colorzones", 0},      // same, but locally
+  { {60.5f }, "pointcolor", 0},
   { {61.0f }, "bloom", 0},           // creative module
   { {62.0f }, "colorize", 0},        // creative module
   { {63.0f }, "lowlight", 0},        // creative module
@@ -413,6 +415,7 @@ const dt_iop_order_entry_t v50_order[] = {
   { {57.0f }, "velvia", 0},          // same
   { {58.0f }, "vibrance", 0},        // same, but more subtle
   { {60.0f }, "colorzones", 0},      // same, but locally
+  { {60.5f }, "pointcolor", 0},
   { {61.0f }, "bloom", 0},           // creative module
   { {62.0f }, "colorize", 0},        // creative module
   { {63.0f }, "lowlight", 0},        // creative module
@@ -541,6 +544,7 @@ const dt_iop_order_entry_t v30_jpg_order[] = {
   { { 57.0f }, "velvia", 0 },           // same
   { { 58.0f }, "vibrance", 0 },         // same, but more subtle
   { { 60.0f }, "colorzones", 0 },       // same, but locally
+  { { 60.5f }, "pointcolor", 0 },
   { { 61.0f }, "bloom", 0 },            // creative module
   { { 62.0f }, "colorize", 0 },         // creative module
   { { 63.0f }, "lowlight", 0 },         // creative module
@@ -670,6 +674,7 @@ const dt_iop_order_entry_t v50_jpg_order[] = {
   { { 57.0f }, "velvia", 0 },           // same
   { { 58.0f }, "vibrance", 0 },         // same, but more subtle
   { { 60.0f }, "colorzones", 0 },       // same, but locally
+  { { 60.5f }, "pointcolor", 0 },
   { { 61.0f }, "bloom", 0 },            // creative module
   { { 62.0f }, "colorize", 0 },         // creative module
   { { 63.0f }, "lowlight", 0 },         // creative module
@@ -784,6 +789,8 @@ void dt_ioppr_migrate_legacy_iop_order_list(GList *iop_order_list)
   _insert_before_after(iop_order_list, "demosaic", "demosaicscale", FALSE);
   _insert_before_after(iop_order_list, "colorbalance", "colorharmonizer", TRUE);
   _insert_before_after(iop_order_list, "hazeremoval", "localmask", TRUE);
+  _insert_before_after(iop_order_list, "colorzones", "pointcolor", FALSE);
+  _insert_before_after(iop_order_list, "colorout", "pointcolor", TRUE);
   _insert_before_after(iop_order_list, "borders", "magiceraser", TRUE);
 }
 

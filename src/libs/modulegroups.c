@@ -47,8 +47,8 @@
 DT_MODULE(1)
 
 // the T_ macros are for the translation engine to take them into account
-#define FALLBACK_PRESET_NAME     "workflow: scene-referred"
-#define T_FALLBACK_PRESET_NAME _("workflow: scene-referred")
+#define FALLBACK_PRESET_NAME     "workflow: lightroom"
+#define T_FALLBACK_PRESET_NAME _("workflow: lightroom")
 
 #define DEPRECATED_PRESET_NAME     "modules: deprecated"
 #define T_DEPRECATED_PRESET_NAME _("modules: deprecated")
@@ -759,6 +759,21 @@ static dt_action_t *_basics_next_action(dt_action_t *ac)
 // defines a new one each time it is called), so all of them are compared
 static gboolean _basics_widget_has_id(dt_iop_module_t *module, GtkWidget *w, const gchar *id)
 {
+  // Actions are shared by all instances, and their target is rebound to the
+  // preferred instance. Use this instance's referrals when matching widgets
+  // so a local adjustment cannot hide the base white-balance controls.
+  for(const GSList *l = module->widget_list; l; l = l->next)
+  {
+    const dt_action_target_t *referral = l->data;
+    if(referral->target == w && referral->action->type >= DT_ACTION_TYPE_WIDGET)
+    {
+      gchar *action_id = _action_id(referral->action);
+      const gboolean found = !g_strcmp0(id, action_id);
+      g_free(action_id);
+      if(found) return TRUE;
+    }
+  }
+
   for(dt_action_t *ac = module->so->actions.target; ac; ac = _basics_next_action(ac))
   {
     if(ac->type >= DT_ACTION_TYPE_WIDGET && ac->target == w)
@@ -1364,9 +1379,20 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
         continue;
       }
 
-      /* a local-mask sink stays in the pipe and in history, not in this list */
+      /* local sinks normally stay out of the global module list; the mask
+       * panel can explicitly open a graph editor for the selected mask */
       if(dt_iop_is_local_sink(module))
       {
+        if(w && ((dt_iop_module_is(module, "rgbcurve")
+                  && g_object_get_data(G_OBJECT(w), "local-adjust-curve-open"))
+                 || (dt_iop_module_is(module, "colorzones")
+                     && g_object_get_data(G_OBJECT(w), "local-adjust-sampled-color-open"))
+                 || (dt_iop_module_is(module, "pointcolor")
+                     && g_object_get_data(G_OBJECT(w), "local-adjust-point-color-open"))))
+        {
+          gtk_widget_show(w);
+          continue;
+        }
         if(dt_dev_gui_module() == module) dt_iop_request_focus(NULL);
         if(w) gtk_widget_hide(w);
         continue;
@@ -1441,10 +1467,11 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
 
         case DT_MODULEGROUP_NONE:
         {
-          /* show all except hidden ones */
-          show_module = (((!(module->flags() & IOP_FLAGS_DEPRECATED) || show_deprecated)
-                          && _lib_modulegroups_test_visible(self, module->op))
-                         || module->enabled);
+          /* "show all modules" must include modules omitted by the selected
+           * workflow preset; hidden and inactive pipeline modules were
+           * already filtered above. */
+          show_module = !(module->flags() & IOP_FLAGS_DEPRECATED)
+                        || show_deprecated || module->enabled;
         }
         break;
 
@@ -2526,12 +2553,19 @@ void init_presets(dt_lib_module_t *self)
   AM("colorequal");
   AM("colorzones");
   AM("colorbalancergb");
+  AM("colorharmonizer");
+  AM("primaries");
+  AM("satcurvergb");
 
   SMG(C_("modulegroup", "detail"), "correct");
   AM("sharpen");
   AM("diffuse");
   AM("denoiseprofile");
   AM("nlmeans");
+  AM("atrous");
+  AM("retouch");
+  AM("liquify");
+  AM("rasterfile");
 
   // Lightroom's lens corrections and transform panels share one tab: there
   // are only seven distinct group icons
@@ -2543,10 +2577,17 @@ void init_presets(dt_lib_module_t *self)
   AM("ashift");
   AM("crop");
   AM("flip");
+  AM("enlargecanvas");
 
   SMG(C_("modulegroup", "effects"), "effect");
   AM("vignette");
   AM("grain");
+  AM("blurs");
+  AM("borders");
+  AM("censorize");
+  AM("graduatednd");
+  AM("overlay");
+  AM("watermark");
 
   SMG(C_("modulegroup", "calibration"), "grading");
   AM("temperature");

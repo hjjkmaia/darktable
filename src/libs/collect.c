@@ -491,12 +491,13 @@ static void _view_popup_menu_onSearchFilmroll(GSimpleAction *action,
     {
       gchar *old = NULL;
 
-      gchar *q_tree_path = g_strdup_printf("%s%%", tree_path);
-      query = "SELECT id, folder FROM main.film_rolls WHERE folder LIKE ?1";
+      gchar *child_path = g_str_has_suffix(tree_path, G_DIR_SEPARATOR_S)
+                            ? g_strdup(tree_path) : g_strconcat(tree_path, G_DIR_SEPARATOR_S, NULL);
+      query = "SELECT id, folder FROM main.film_rolls"
+              " WHERE folder = ?1 OR substr(folder, 1, length(?2)) = ?2";
       DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query, -1, &stmt, NULL);
-      DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, q_tree_path, -1, SQLITE_TRANSIENT);
-      g_free(q_tree_path);
-      q_tree_path = NULL;
+      DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, tree_path, -1, SQLITE_TRANSIENT);
+      DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, child_path, -1, SQLITE_TRANSIENT);
       query = NULL;
 
       while(sqlite3_step(stmt) == SQLITE_ROW)
@@ -511,7 +512,7 @@ static void _view_popup_menu_onSearchFilmroll(GSimpleAction *action,
 
         if(g_strcmp0(old, tree_path))
         {
-          g_strlcpy(trailing, old + strlen(tree_path) + 1, sizeof(trailing));
+          g_strlcpy(trailing, old + strlen(child_path), sizeof(trailing));
           g_snprintf(final, sizeof(final), "%s/%s", new_path, trailing);
         }
         else
@@ -527,6 +528,7 @@ static void _view_popup_menu_onSearchFilmroll(GSimpleAction *action,
         sqlite3_finalize(stmt2);
       }
       sqlite3_finalize(stmt);
+      g_free(child_path);
       g_free(query);
 
       /* reset filter so that view isn't empty */
@@ -573,27 +575,50 @@ static void _view_popup_menu_onRemove(GSimpleAction *action,
   if(gtk_tree_selection_get_selected(selection, &model, &iter))
   {
     gchar *filmroll_path = NULL;
-    gchar *fullq = NULL;
-
     gtk_tree_model_get(model, &iter, DT_LIB_COLLECT_COL_PATH, &filmroll_path, -1);
-    char *escaped_filmroll_path = sqlite3_mprintf("%q", filmroll_path);
+    if(!filmroll_path) return;
+    gchar *child_path = g_str_has_suffix(filmroll_path, G_DIR_SEPARATOR_S)
+                          ? g_strdup(filmroll_path) : g_strconcat(filmroll_path, G_DIR_SEPARATOR_S, NULL);
+
+    /* The removal job reads selected_images before asking for confirmation.
+     * Keep the user's selection intact when they decline the operation. */
+    typedef struct selected_image_t
+    {
+      sqlite3_int64 num;
+      sqlite3_int64 imgid;
+    } selected_image_t;
+    GArray *previous_selection = g_array_new(FALSE, FALSE, sizeof(selected_image_t));
+    sqlite3_stmt *stmt = NULL;
+    DT_DEBUG_SQLITE3_PREPARE_V2
+      (dt_database_get(darktable.db),
+       "SELECT num, imgid FROM main.selected_images ORDER BY num",
+       -1, &stmt, NULL);
+    while(sqlite3_step(stmt) == SQLITE_ROW)
+    {
+      const selected_image_t selected = { sqlite3_column_int64(stmt, 0),
+                                          sqlite3_column_int64(stmt, 1) };
+      g_array_append_val(previous_selection, selected);
+    }
+    sqlite3_finalize(stmt);
 
     /* Clean selected images, and add to the table those which are going to be deleted */
     DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db),
                           "DELETE FROM main.selected_images", NULL, NULL, NULL);
 
-    // clang-format off
-    fullq = g_strdup_printf
-      ("INSERT INTO main.selected_images (imgid)"
-       " SELECT id"
-       " FROM main.images"
-       " WHERE film_id IN (SELECT id FROM main.film_rolls WHERE folder LIKE '%s%%')",
-       escaped_filmroll_path);
-    // clang-format on
-
-    DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db), fullq, NULL, NULL, NULL);
+    stmt = NULL;
+    DT_DEBUG_SQLITE3_PREPARE_V2
+      (dt_database_get(darktable.db),
+       "INSERT INTO main.selected_images (imgid)"
+       " SELECT id FROM main.images"
+       " WHERE film_id IN (SELECT id FROM main.film_rolls"
+       " WHERE folder = ?1 OR substr(folder, 1, length(?2)) = ?2)",
+       -1, &stmt, NULL);
+    DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, filmroll_path, -1, SQLITE_TRANSIENT);
+    DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, child_path, -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
     g_free(filmroll_path);
-    sqlite3_free(escaped_filmroll_path);
+    g_free(child_path);
 
     if(dt_control_remove_images())
     {
@@ -613,8 +638,28 @@ static void _view_popup_menu_onRemove(GSimpleAction *action,
            &model_iter);
       }
     }
+    else
+    {
+      DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db),
+                            "DELETE FROM main.selected_images", NULL, NULL, NULL);
+      stmt = NULL;
+      DT_DEBUG_SQLITE3_PREPARE_V2
+        (dt_database_get(darktable.db),
+         "INSERT INTO main.selected_images (num, imgid) VALUES (?1, ?2)",
+         -1, &stmt, NULL);
+      for(guint i = 0; i < previous_selection->len; i++)
+      {
+        const selected_image_t *selected = &g_array_index(previous_selection, selected_image_t, i);
+        DT_DEBUG_SQLITE3_BIND_INT64(stmt, 1, selected->num);
+        DT_DEBUG_SQLITE3_BIND_INT64(stmt, 2, selected->imgid);
+        sqlite3_step(stmt);
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+      }
+      sqlite3_finalize(stmt);
+    }
+    g_array_unref(previous_selection);
 
-    g_free(fullq);
   }
 }
 
@@ -3384,7 +3429,7 @@ static void entry_changed(GtkEntry *entry,
 
 int position(const dt_lib_module_t *self)
 {
-  return 400;
+  return 900;
 }
 
 static gboolean entry_focus_in_callback(GtkWidget *w,
