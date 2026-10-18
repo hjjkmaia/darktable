@@ -101,6 +101,10 @@ changes (where available).
 
 ## UI/UX Improvements
 
+- With the watermark module open, drag the mark to move it, a corner to
+  resize it, and the handle above it to rotate it. The position, size,
+  and angle stay when the mouse button is released.
+
 - Local Adjustments now offers relative Temperature and Tint sliders for a
   selected mask. In the Lightroom layout, global white balance remains in
   Basic while the raw camera-reference module is under Calibration.
