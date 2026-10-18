@@ -105,6 +105,10 @@ changes (where available).
   resize it, and the handle above it to rotate it. The position, size,
   and angle stay when the mouse button is released.
 
+- Right-click a selected mask and choose duplicate and invert mask. The
+  new mask covers the opposite of that selection, the original mask stays
+  as it is, and the new mask's adjustments start cleared.
+
 - Local Adjustments now offers relative Temperature and Tint sliders for a
   selected mask. In the Lightroom layout, global white balance remains in
   Basic while the raw camera-reference module is under Calibration.
