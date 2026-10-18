@@ -32,9 +32,11 @@
 #include "dtgtk/togglebutton.h"
 #include "gui/accelerators.h"
 #include "gui/color_picker_proxy.h"
+#include "gui/draw.h"
 #include "gui/gtk.h"
 #include "gui/gtkentry.h"
 #include "iop/iop_api.h"
+#include "views/view.h"
 
 #include <gtk/gtk.h>
 #include <inttypes.h>
@@ -143,6 +145,31 @@ typedef struct dt_iop_watermark_gui_data_t
   GtkWidget *colorpick;
   GtkWidget *fontsel;
   GtkWidget *color_picker_button;
+  // on-canvas gesture: 0 none, 1 move, 2 corner scale, 3 rotate
+  int dragging;
+  int hover;
+  int corner;
+  int undo_open;
+  int moved;
+  float press_x;
+  float press_y;
+  float start_xoff;
+  float start_yoff;
+  float start_scale;
+  float start_rotate;
+  float anchor_x;
+  float anchor_y;
+  float grab_x;
+  float grab_y;
+  float pivot_x;
+  float pivot_y;
+  float press_angle;
+  float nat_w;
+  float nat_h;
+  int nat_ok;
+  char nat_file[DT_MAX_FILENAME_LEN];
+  char nat_text[512];
+  char nat_font[64];
 } dt_iop_watermark_gui_data_t;
 
 // option selection from module version 2 through 5
@@ -1330,7 +1357,8 @@ void cleanup_pipe(dt_iop_module_t *self,
 
 void gui_update(dt_iop_module_t *self)
 {
-  const dt_iop_watermark_gui_data_t *g = self->gui_data;
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  g->nat_ok = FALSE;
   dt_iop_watermark_params_t *p = self->params;
   // the GUI handlers read the stored strings as C strings
   p->filename[sizeof(p->filename) - 1] = '\0';
@@ -1581,6 +1609,848 @@ void gui_cleanup(dt_iop_module_t *self)
   dt_iop_watermark_gui_data_t *g = self->gui_data;
   g_list_free_full(g->watermarks_filenames, g_free);
   g->watermarks_filenames = NULL;
+}
+
+enum
+{
+  DT_WM_NONE = 0,
+  DT_WM_MOVE = 1,
+  DT_WM_SCALE = 2,
+  DT_WM_ROTATE = 3
+};
+
+// center and half-size of the unrotated mark, in preview pixels.
+// angle is the cairo rotation used by process(), clockwise in y-down space
+typedef struct dt_wm_geom_t
+{
+  float cx, cy;
+  float hw, hh;
+  float angle;
+} dt_wm_geom_t;
+
+// same placement as process(): alignment plus x/y offset, in preview pixels.
+// the pipe keeps its own copy of this math; a drift here only mis-aims the grab.
+static gboolean _watermark_box(const dt_iop_watermark_params_t *p,
+                               const float iw,
+                               const float ih,
+                               const float nat_w,
+                               const float nat_h,
+                               float *left,
+                               float *top,
+                               float *right,
+                               float *bottom,
+                               float *wbase_out,
+                               float *hbase_out,
+                               dt_wm_geom_t *geom)
+{
+  if(!(iw >= 1.0f && ih >= 1.0f && nat_w >= 1.0f && nat_h >= 1.0f))
+    return FALSE;
+
+  const float uscale = p->scale / 100.0f;
+  float wbase = iw;
+  float hbase = ih;
+  gboolean height_from_width = TRUE;
+  float svg_base = iw * uscale;
+
+  switch(p->scale_base)
+  {
+    case DT_SCALE_MAINMENU_LARGER_BORDER:
+      wbase = hbase = (iw > ih) ? iw : ih;
+      svg_base = wbase * uscale;
+      height_from_width = nat_w > nat_h;
+      break;
+    case DT_SCALE_MAINMENU_SMALLER_BORDER:
+      wbase = hbase = (iw < ih) ? iw : ih;
+      svg_base = wbase * uscale;
+      height_from_width = nat_w > nat_h;
+      break;
+    case DT_SCALE_MAINMENU_MARKERHEIGHT:
+      wbase = iw;
+      hbase = ih;
+      svg_base = ih * uscale;
+      height_from_width = FALSE;
+      break;
+    case DT_SCALE_MAINMENU_ADVANCED:
+      wbase = iw;
+      hbase = ih;
+      if(p->scale_img == DT_SCALE_IMG_WIDTH)
+        svg_base = iw * uscale;
+      else if(p->scale_img == DT_SCALE_IMG_HEIGHT)
+        svg_base = ih * uscale;
+      else if(p->scale_img == DT_SCALE_IMG_LARGER)
+        svg_base = ((iw > ih) ? iw : ih) * uscale;
+      else
+        svg_base = ((iw < ih) ? iw : ih) * uscale;
+      height_from_width = p->scale_svg == DT_SCALE_SVG_WIDTH;
+      break;
+    case DT_SCALE_MAINMENU_IMAGE:
+    default:
+      wbase = iw;
+      hbase = ih;
+      if(nat_w > nat_h)
+      {
+        svg_base = iw * uscale;
+        height_from_width = TRUE;
+      }
+      else
+      {
+        svg_base = ih * uscale;
+        height_from_width = FALSE;
+      }
+      break;
+  }
+
+  float svg_width, svg_height;
+  if(height_from_width)
+  {
+    svg_width = svg_base;
+    svg_height = nat_h * (svg_width / nat_w);
+  }
+  else
+  {
+    svg_height = svg_base;
+    svg_width = nat_w * (svg_height / nat_h);
+  }
+
+  const float angle = deg2radf(-p->rotate);
+  const float bb_width = fabsf(svg_width * cosf(angle)) + fabsf(svg_height * sinf(angle));
+  const float bb_height = fabsf(svg_width * sinf(angle)) + fabsf(svg_height * cosf(angle));
+  const float bX = bb_width / 2.0f - svg_width / 2.0f;
+  const float bY = bb_height / 2.0f - svg_height / 2.0f;
+
+  float tx = 0.0f, ty = 0.0f;
+  if(p->alignment >= 0 && p->alignment < 3)
+    ty = bY;
+  else if(p->alignment >= 3 && p->alignment < 6)
+    ty = (ih / 2.0f) - (svg_height / 2.0f);
+  else if(p->alignment >= 6 && p->alignment < 9)
+    ty = ih - svg_height - bY;
+
+  if(p->alignment == 0 || p->alignment == 3 || p->alignment == 6)
+    tx = bX;
+  else if(p->alignment == 1 || p->alignment == 4 || p->alignment == 7)
+    tx = (iw / 2.0f) - (svg_width / 2.0f);
+  else if(p->alignment == 2 || p->alignment == 5 || p->alignment == 8)
+    tx = iw - svg_width - bX;
+
+  tx += p->xoffset * wbase;
+  ty += p->yoffset * hbase;
+
+  const float cx = tx + svg_width / 2.0f;
+  const float cy = ty + svg_height / 2.0f;
+  *left = cx - bb_width / 2.0f;
+  *top = cy - bb_height / 2.0f;
+  *right = cx + bb_width / 2.0f;
+  *bottom = cy + bb_height / 2.0f;
+  *wbase_out = wbase;
+  *hbase_out = hbase;
+  if(geom)
+  {
+    geom->cx = cx;
+    geom->cy = cy;
+    geom->hw = svg_width * 0.5f;
+    geom->hh = svg_height * 0.5f;
+    geom->angle = angle;
+  }
+  return TRUE;
+}
+
+static gboolean _watermark_resolve(const char *file, char *out, const size_t out_len)
+{
+  gchar configdir[PATH_MAX] = { 0 };
+  gchar datadir[PATH_MAX] = { 0 };
+  dt_loc_get_user_config_dir(configdir, sizeof(configdir));
+  dt_loc_get_datadir(datadir, sizeof(datadir));
+  gchar *user = g_build_filename(configdir, "watermarks", file, NULL);
+  gchar *share = g_build_filename(datadir, "watermarks", file, NULL);
+  gboolean ok = FALSE;
+  if(g_file_test(user, G_FILE_TEST_EXISTS))
+  {
+    g_strlcpy(out, user, out_len);
+    ok = TRUE;
+  }
+  else if(g_file_test(share, G_FILE_TEST_EXISTS))
+  {
+    g_strlcpy(out, share, out_len);
+    ok = TRUE;
+  }
+  g_free(user);
+  g_free(share);
+  return ok;
+}
+
+static gboolean _watermark_natural(dt_iop_module_t *self, float *nat_w, float *nat_h)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  dt_iop_watermark_params_t *p = self->params;
+  char file[sizeof(p->filename)];
+  char text[sizeof(p->text)];
+  char font[sizeof(p->font)];
+  memcpy(file, p->filename, sizeof(file));
+  memcpy(text, p->text, sizeof(text));
+  memcpy(font, p->font, sizeof(font));
+  file[sizeof(file) - 1] = '\0';
+  text[sizeof(text) - 1] = '\0';
+  font[sizeof(font) - 1] = '\0';
+
+  if(g->nat_ok
+     && !g_strcmp0(g->nat_file, file)
+     && !g_strcmp0(g->nat_text, text)
+     && !g_strcmp0(g->nat_font, font))
+  {
+    *nat_w = g->nat_w;
+    *nat_h = g->nat_h;
+    return TRUE;
+  }
+
+  char path[PATH_MAX] = { 0 };
+  if(!_watermark_resolve(file, path, sizeof(path)))
+    return FALSE;
+
+  const gchar *extension = strrchr(file, '.');
+  float width = 0.0f, height = 0.0f;
+  dt_pthread_mutex_lock(&darktable.plugin_threadsafe);
+  if(extension && !g_ascii_strcasecmp(extension, ".png"))
+  {
+    cairo_surface_t *surface = cairo_image_surface_create_from_png(path);
+    if(cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS)
+    {
+      width = cairo_image_surface_get_width(surface);
+      height = cairo_image_surface_get_height(surface);
+    }
+    cairo_surface_destroy(surface);
+  }
+  else if(extension && !g_ascii_strcasecmp(extension, ".svg"))
+  {
+    dt_iop_watermark_data_t data = { 0 };
+    dt_strlcpy_to_fixed(data.filename, file, sizeof(data.filename));
+    dt_strlcpy_to_fixed(data.text, text, sizeof(data.text));
+    dt_strlcpy_to_fixed(data.font, font, sizeof(data.font));
+    for(int k = 0; k < 3; k++) data.color[k] = p->color[k];
+    gchar *svgdoc = _watermark_get_svgdoc(self, &data, &self->dev->image_storage, path);
+    if(svgdoc)
+    {
+      GError *error = NULL;
+      RsvgHandle *svg = rsvg_handle_new_from_data((const guint8 *)svgdoc, strlen(svgdoc), &error);
+      g_free(svgdoc);
+      if(svg && !error)
+      {
+        const RsvgDimensionData dimension = dt_get_svg_dimension(svg);
+        width = dimension.width;
+        height = dimension.height;
+        g_object_unref(svg);
+      }
+      else
+      {
+        if(svg) g_object_unref(svg);
+        if(error) g_error_free(error);
+      }
+    }
+  }
+  dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
+
+  if(width < 1.0f || height < 1.0f)
+    return FALSE;
+
+  g->nat_ok = TRUE;
+  g->nat_w = width;
+  g->nat_h = height;
+  dt_strlcpy_to_fixed(g->nat_file, file, sizeof(g->nat_file));
+  dt_strlcpy_to_fixed(g->nat_text, text, sizeof(g->nat_text));
+  dt_strlcpy_to_fixed(g->nat_font, font, sizeof(g->nat_font));
+  *nat_w = width;
+  *nat_h = height;
+  return TRUE;
+}
+
+static gboolean _watermark_metrics(dt_iop_module_t *self,
+                                   float *left,
+                                   float *top,
+                                   float *right,
+                                   float *bottom,
+                                   float *wbase,
+                                   float *hbase,
+                                   float *iw,
+                                   float *ih,
+                                   dt_wm_geom_t *geom)
+{
+  float wd = 0.0f, ht = 0.0f;
+  if(!self->dev || !dt_dev_get_preview_size(self->dev, &wd, &ht))
+    return FALSE;
+  float nat_w = 0.0f, nat_h = 0.0f;
+  if(!_watermark_natural(self, &nat_w, &nat_h))
+    return FALSE;
+  if(!_watermark_box(self->params, wd, ht, nat_w, nat_h,
+                     left, top, right, bottom, wbase, hbase, geom))
+    return FALSE;
+  *iw = wd;
+  *ih = ht;
+  return TRUE;
+}
+
+static float _watermark_screen(const float zoom_scale, const float px)
+{
+  const float z = zoom_scale > 0.0f ? zoom_scale : 1.0f;
+  return DT_PIXEL_APPLY_DPI(px) / z;
+}
+
+static float _watermark_wrap_pi(float a)
+{
+  while(a > (float)M_PI) a -= 2.0f * (float)M_PI;
+  while(a < -(float)M_PI) a += 2.0f * (float)M_PI;
+  return a;
+}
+
+static float _watermark_wrap_deg(float a)
+{
+  while(a > 180.0f) a -= 360.0f;
+  while(a < -180.0f) a += 360.0f;
+  return a;
+}
+
+// clockwise in y-down space, matching cairo_rotate
+static void _watermark_rot(const float angle,
+                           const float x,
+                           const float y,
+                           float *ox,
+                           float *oy)
+{
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  *ox = x * c - y * s;
+  *oy = x * s + y * c;
+}
+
+static void _watermark_corner(const dt_wm_geom_t *geom,
+                              const int corner,
+                              float *x,
+                              float *y)
+{
+  const float sx = (corner == 1 || corner == 2) ? geom->hw : -geom->hw;
+  const float sy = (corner >= 2) ? geom->hh : -geom->hh;
+  float rx = 0.0f, ry = 0.0f;
+  _watermark_rot(geom->angle, sx, sy, &rx, &ry);
+  *x = geom->cx + rx;
+  *y = geom->cy + ry;
+}
+
+// the alignment point of the axis-aligned box. scale grows around it.
+static void _watermark_anchor(const dt_iop_watermark_params_t *p,
+                              const float iw,
+                              const float ih,
+                              const float wbase,
+                              const float hbase,
+                              float *ax,
+                              float *ay)
+{
+  const float ox = p->xoffset * wbase;
+  const float oy = p->yoffset * hbase;
+  if(p->alignment == 0 || p->alignment == 3 || p->alignment == 6)
+    *ax = ox;
+  else if(p->alignment == 1 || p->alignment == 4 || p->alignment == 7)
+    *ax = iw * 0.5f + ox;
+  else
+    *ax = iw + ox;
+
+  if(p->alignment >= 0 && p->alignment < 3)
+    *ay = oy;
+  else if(p->alignment >= 3 && p->alignment < 6)
+    *ay = ih * 0.5f + oy;
+  else
+    *ay = ih + oy;
+}
+
+static void _watermark_rotate_handle(const dt_wm_geom_t *geom,
+                                     const float gap,
+                                     float *hx,
+                                     float *hy,
+                                     float *sx,
+                                     float *sy)
+{
+  float ex = 0.0f, ey = 0.0f, rx = 0.0f, ry = 0.0f;
+  _watermark_rot(geom->angle, 0.0f, -geom->hh, &ex, &ey);
+  _watermark_rot(geom->angle, 0.0f, -(geom->hh + gap), &rx, &ry);
+  *sx = geom->cx + ex;
+  *sy = geom->cy + ey;
+  *hx = geom->cx + rx;
+  *hy = geom->cy + ry;
+}
+
+static const char *_watermark_cursor(const int kind,
+                                     const dt_wm_geom_t *geom,
+                                     const int corner)
+{
+  if(kind == DT_WM_MOVE)
+    return "move";
+  if(kind == DT_WM_ROTATE)
+    return "crosshair";
+  if(kind == DT_WM_SCALE && geom && corner >= 0 && corner < 4)
+  {
+    const float sx = (corner == 1 || corner == 2) ? 1.0f : -1.0f;
+    const float sy = (corner >= 2) ? 1.0f : -1.0f;
+    float rx = 0.0f, ry = 0.0f;
+    _watermark_rot(geom->angle, sx, sy, &rx, &ry);
+    // pick the axis-aligned resize cursor closest to this corner's diagonal
+    return fabsf(rx + ry) >= fabsf(rx - ry) ? "nwse-resize" : "nesw-resize";
+  }
+  return "default";
+}
+
+static void _watermark_hinter(const int kind, const int dragging)
+{
+  if(kind == DT_WM_MOVE)
+    dt_control_hinter_message(dragging ? _("release to place the watermark")
+                                       : _("click and hold to move the watermark"));
+  else if(kind == DT_WM_SCALE)
+    dt_control_hinter_message(dragging ? _("release to resize the watermark")
+                                       : _("drag a corner to resize the watermark"));
+  else if(kind == DT_WM_ROTATE)
+    dt_control_hinter_message(dragging ? _("release to rotate the watermark")
+                                       : _("drag to rotate the watermark"));
+}
+
+static void _watermark_feedback(dt_iop_module_t *self,
+                                const int kind,
+                                const int corner,
+                                const int dragging)
+{
+  dt_wm_geom_t geom;
+  const dt_wm_geom_t *gp = NULL;
+  if(kind == DT_WM_SCALE)
+  {
+    float left, top, right, bottom, wbase, hbase, iw, ih;
+    if(_watermark_metrics(self, &left, &top, &right, &bottom,
+                          &wbase, &hbase, &iw, &ih, &geom))
+      gp = &geom;
+  }
+  dt_control_change_cursor(_watermark_cursor(kind, gp, corner));
+  if(kind != DT_WM_NONE)
+    _watermark_hinter(kind, dragging);
+  else if(!dragging)
+    dt_control_hinter_message("");
+}
+
+// rotate handle, then a corner, then the body of the rotated mark
+static int _watermark_pick(dt_iop_module_t *self,
+                           const float x,
+                           const float y,
+                           const float zoom_scale,
+                           int *corner_out,
+                           dt_wm_geom_t *geom_out)
+{
+  if(corner_out)
+    *corner_out = -1;
+  float left, top, right, bottom, wbase, hbase, iw, ih;
+  dt_wm_geom_t geom;
+  if(!_watermark_metrics(self, &left, &top, &right, &bottom,
+                         &wbase, &hbase, &iw, &ih, &geom))
+    return DT_WM_NONE;
+  if(geom_out)
+    *geom_out = geom;
+
+  const float px = x * iw;
+  const float py = y * ih;
+  const float reach = _watermark_screen(zoom_scale, 16.0f);
+  const float reach2 = reach * reach;
+  const float gap = _watermark_screen(zoom_scale, 22.0f);
+
+  float hx = 0.0f, hy = 0.0f, sx = 0.0f, sy = 0.0f;
+  _watermark_rotate_handle(&geom, gap, &hx, &hy, &sx, &sy);
+  const float rdx = px - hx;
+  const float rdy = py - hy;
+  if(rdx * rdx + rdy * rdy <= reach2)
+    return DT_WM_ROTATE;
+
+  int best = -1;
+  float best_d = reach2;
+  for(int i = 0; i < 4; i++)
+  {
+    float cx = 0.0f, cy = 0.0f;
+    _watermark_corner(&geom, i, &cx, &cy);
+    const float dx = px - cx;
+    const float dy = py - cy;
+    const float d = dx * dx + dy * dy;
+    if(d <= best_d)
+    {
+      best_d = d;
+      best = i;
+    }
+  }
+  if(best >= 0)
+  {
+    if(corner_out)
+      *corner_out = best;
+    return DT_WM_SCALE;
+  }
+
+  const float pad = _watermark_screen(zoom_scale, 4.0f);
+  const float dx = px - geom.cx;
+  const float dy = py - geom.cy;
+  float lx = 0.0f, ly = 0.0f;
+  _watermark_rot(-geom.angle, dx, dy, &lx, &ly);
+  if(fabsf(lx) <= geom.hw + pad && fabsf(ly) <= geom.hh + pad)
+    return DT_WM_MOVE;
+  return DT_WM_NONE;
+}
+
+// the pipe reads the history copy, not self->params. keep that copy
+// current while the button is down so the mark moves before release.
+static void _watermark_preview(dt_iop_module_t *self)
+{
+  dt_develop_t *dev = self->dev;
+  if(!dev) return;
+
+  dt_pthread_mutex_lock(&dev->history_mutex);
+  int index = 0;
+  dt_dev_history_item_t *hist = NULL;
+  for(GList *link = dev->history; link && index < dev->history_end;
+      link = g_list_next(link), index++)
+  {
+    dt_dev_history_item_t *item = link->data;
+    if(item && item->module == self && item->params)
+      hist = item;
+  }
+  if(hist)
+    memcpy(hist->params, self->params, self->params_size);
+  // the mark is rarely the last history item. synch_top reloads only
+  // that last item, so the sliders move and the picture stays put.
+  // replay the whole stack, which is what a later module's own edit does.
+  if(dev->full.pipe)
+    dev->full.pipe->changed |= DT_DEV_PIPE_SYNCH;
+  if(dev->preview_pipe)
+    dev->preview_pipe->changed |= DT_DEV_PIPE_SYNCH;
+  if(dev->preview2.pipe)
+    dev->preview2.pipe->changed |= DT_DEV_PIPE_SYNCH;
+  dt_dev_invalidate_all(dev);
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+  dt_control_queue_redraw_center();
+}
+
+static void _watermark_begin_undo(dt_iop_module_t *self)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  // one record for the whole gesture, opened on the first real change
+  if(!g->undo_open && self->dev)
+  {
+    dt_dev_undo_start_record(self->dev);
+    g->undo_open = TRUE;
+  }
+  g->moved = TRUE;
+}
+
+static void _watermark_apply_drag(dt_iop_module_t *self, const float x, const float y)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  dt_iop_watermark_params_t *p = self->params;
+  float left, top, right, bottom, wbase, hbase, iw, ih;
+  if(!_watermark_metrics(self, &left, &top, &right, &bottom,
+                         &wbase, &hbase, &iw, &ih, NULL))
+    return;
+  if(!(wbase > 0.0f && hbase > 0.0f && iw > 0.0f && ih > 0.0f))
+    return;
+
+  if(g->dragging == DT_WM_SCALE)
+  {
+    const float vx = g->grab_x - g->anchor_x;
+    const float vy = g->grab_y - g->anchor_y;
+    const float den = vx * vx + vy * vy;
+    if(den < 1.0f)
+      return;
+    // the alignment point stays put. Scale follows how far the pointer
+    // travels along the ray from that point, starting from the grab so
+    // the mark does not jump
+    const float px = x * iw;
+    const float py = y * ih;
+    const float press_along =
+      (g->press_x * iw - g->anchor_x) * vx + (g->press_y * ih - g->anchor_y) * vy;
+    if(fabsf(press_along) < 1.0f)
+      return;
+    const float along = (px - g->anchor_x) * vx + (py - g->anchor_y) * vy;
+    const float scale = CLAMP(g->start_scale * along / press_along, 1.0f, 500.0f);
+    if(fabsf(scale - p->scale) < 0.02f)
+      return;
+    _watermark_begin_undo(self);
+    p->scale = scale;
+    DT_ENTER_GUI_UPDATE();
+    dt_bauhaus_slider_set(g->scale, p->scale);
+    DT_LEAVE_GUI_UPDATE();
+    _watermark_preview(self);
+    return;
+  }
+
+  if(g->dragging == DT_WM_ROTATE)
+  {
+    const float dx = x * iw - g->pivot_x;
+    const float dy = y * ih - g->pivot_y;
+    if(dx * dx + dy * dy < 4.0f)
+      return;
+    // process() feeds cairo_rotate(-rotate), so a clockwise swing
+    // lowers the stored angle and the slider, which displays -rotate, rises
+    const float delta = _watermark_wrap_pi(atan2f(dy, dx) - g->press_angle);
+    const float rot = _watermark_wrap_deg(g->start_rotate - rad2degf(delta));
+    if(fabsf(rot - p->rotate) < 0.02f)
+      return;
+    _watermark_begin_undo(self);
+    p->rotate = rot;
+    DT_ENTER_GUI_UPDATE();
+    dt_bauhaus_slider_set(g->rotate, p->rotate);
+    DT_LEAVE_GUI_UPDATE();
+    _watermark_preview(self);
+    return;
+  }
+
+  const float xoff = CLAMP(g->start_xoff + (x - g->press_x) * iw / wbase, -1.0f, 1.0f);
+  const float yoff = CLAMP(g->start_yoff + (y - g->press_y) * ih / hbase, -1.0f, 1.0f);
+  if(fabsf(xoff - p->xoffset) < 1.0e-5f && fabsf(yoff - p->yoffset) < 1.0e-5f)
+    return;
+
+  _watermark_begin_undo(self);
+  p->xoffset = xoff;
+  p->yoffset = yoff;
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_slider_set(g->x_offset, p->xoffset);
+  dt_bauhaus_slider_set(g->y_offset, p->yoffset);
+  DT_LEAVE_GUI_UPDATE();
+  _watermark_preview(self);
+}
+
+static void _watermark_finish_drag(dt_iop_module_t *self)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  if(!g->dragging && !g->undo_open)
+    return;
+  g->dragging = DT_WM_NONE;
+  if(g->undo_open && self->dev)
+  {
+    dt_dev_undo_end_record(self->dev);
+    if(g->moved)
+      dt_dev_write_history(self->dev);
+  }
+  g->undo_open = FALSE;
+  g->moved = FALSE;
+  _watermark_feedback(self, g->hover, g->corner, FALSE);
+  dt_control_queue_redraw_center();
+}
+
+void gui_post_expose(dt_iop_module_t *self,
+                     cairo_t *cr,
+                     const float wd,
+                     const float ht,
+                     const float pzx,
+                     const float pzy,
+                     const float zoom_scale)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  if(!self->enabled)
+    return;
+
+  float left, top, right, bottom, wbase, hbase, iw, ih;
+  dt_wm_geom_t geom;
+  if(!_watermark_metrics(self, &left, &top, &right, &bottom,
+                         &wbase, &hbase, &iw, &ih, &geom))
+    return;
+
+  const float z = zoom_scale > 0.0f ? zoom_scale : 1.0f;
+  const double lwidth =
+    (dt_iop_canvas_not_sensitive(darktable.develop) ? 0.5 : 1.0) / z;
+  const float gap = _watermark_screen(zoom_scale, 22.0f);
+  const float rad = _watermark_screen(zoom_scale, 5.5f);
+  const int hot = g->dragging ? g->dragging : g->hover;
+
+  float corner[4][2];
+  for(int i = 0; i < 4; i++)
+    _watermark_corner(&geom, i, &corner[i][0], &corner[i][1]);
+
+  float hx = 0.0f, hy = 0.0f, sx = 0.0f, sy = 0.0f;
+  _watermark_rotate_handle(&geom, gap, &hx, &hy, &sx, &sy);
+
+  cairo_save(cr);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0) * lwidth);
+  cairo_move_to(cr, corner[0][0], corner[0][1]);
+  for(int i = 1; i < 4; i++)
+    cairo_line_to(cr, corner[i][0], corner[i][1]);
+  cairo_close_path(cr);
+  dt_draw_set_color_overlay(cr, TRUE, hot ? 0.85 : 0.5);
+  cairo_stroke(cr);
+
+  cairo_move_to(cr, sx, sy);
+  cairo_line_to(cr, hx, hy);
+  dt_draw_set_color_overlay(cr, TRUE, 0.7);
+  cairo_stroke(cr);
+
+  for(int i = 0; i < 4; i++)
+  {
+    const int on = hot == DT_WM_SCALE && g->corner == i;
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, corner[i][0], corner[i][1], on ? rad * 1.35 : rad, 0.0, 2.0 * M_PI);
+    dt_draw_set_color_overlay(cr, TRUE, on ? 0.95 : 0.75);
+    cairo_fill(cr);
+  }
+
+  cairo_new_sub_path(cr);
+  cairo_arc(cr, hx, hy, (hot == DT_WM_ROTATE) ? rad * 1.45 : rad * 1.15, 0.0, 2.0 * M_PI);
+  dt_draw_set_color_overlay(cr, TRUE, hot == DT_WM_ROTATE ? 0.95 : 0.75);
+  cairo_fill(cr);
+  cairo_restore(cr);
+}
+
+void gui_focus(dt_iop_module_t *self, const gboolean in)
+{
+  if(!in)
+    _watermark_finish_drag(self);
+}
+
+int mouse_moved(dt_iop_module_t *self,
+                const float pzx,
+                const float pzy,
+                const double pressure,
+                const int which,
+                const float zoom_scale)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+
+  if(g->dragging)
+  {
+    if(!(darktable.control->button_down
+         && darktable.control->button_down_which == GDK_BUTTON_PRIMARY))
+    {
+      _watermark_finish_drag(self);
+      return 0;
+    }
+    _watermark_apply_drag(self, pzx, pzy);
+    _watermark_feedback(self, g->dragging, g->corner, TRUE);
+    return 1;
+  }
+
+  if(!self->enabled)
+    return 0;
+
+  int corner = -1;
+  const int hit = _watermark_pick(self, pzx, pzy, zoom_scale, &corner, NULL);
+  if(hit != g->hover || corner != g->corner)
+  {
+    g->hover = hit;
+    g->corner = corner;
+    dt_control_queue_redraw_center();
+  }
+  _watermark_feedback(self, hit, corner, FALSE);
+  return 0;
+}
+
+int button_pressed(dt_iop_module_t *self,
+                   const float pzx,
+                   const float pzy,
+                   const double pressure,
+                   const int which,
+                   const int type,
+                   const uint32_t state,
+                   const float zoom_scale)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  const dt_iop_watermark_params_t *p = self->params;
+
+  if(!self->enabled || which != GDK_BUTTON_PRIMARY)
+    return 0;
+
+  int corner = -1;
+  dt_wm_geom_t geom;
+  const int hit = _watermark_pick(self, pzx, pzy, zoom_scale, &corner, &geom);
+  // a double-click on the mark must not leave darkroom
+  if(type == GDK_2BUTTON_PRESS)
+    return hit ? 1 : 0;
+  if(type != GDK_BUTTON_PRESS || !hit)
+    return 0;
+
+  g->dragging = hit;
+  g->hover = hit;
+  g->corner = corner;
+  g->moved = FALSE;
+  g->undo_open = FALSE;
+  g->press_x = pzx;
+  g->press_y = pzy;
+  g->start_xoff = p->xoffset;
+  g->start_yoff = p->yoffset;
+  g->start_scale = p->scale;
+  g->start_rotate = p->rotate;
+
+  if(hit == DT_WM_SCALE)
+  {
+    float left, top, right, bottom, wbase, hbase, iw, ih;
+    if(!_watermark_metrics(self, &left, &top, &right, &bottom,
+                           &wbase, &hbase, &iw, &ih, NULL))
+    {
+      g->dragging = DT_WM_NONE;
+      return 0;
+    }
+    _watermark_anchor(p, iw, ih, wbase, hbase, &g->anchor_x, &g->anchor_y);
+    _watermark_corner(&geom, corner, &g->grab_x, &g->grab_y);
+  }
+  else if(hit == DT_WM_ROTATE)
+  {
+    float left, top, right, bottom, wbase, hbase, iw, ih;
+    if(!_watermark_metrics(self, &left, &top, &right, &bottom,
+                           &wbase, &hbase, &iw, &ih, NULL))
+    {
+      g->dragging = DT_WM_NONE;
+      return 0;
+    }
+    g->pivot_x = geom.cx;
+    g->pivot_y = geom.cy;
+    g->press_angle = atan2f(pzy * ih - geom.cy, pzx * iw - geom.cx);
+  }
+
+  _watermark_feedback(self, hit, corner, TRUE);
+  return 1;
+}
+
+int button_released(dt_iop_module_t *self,
+                    const float pzx,
+                    const float pzy,
+                    const int which,
+                    const uint32_t state,
+                    const float zoom_scale)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  if(!g->dragging || which != GDK_BUTTON_PRIMARY)
+    return 0;
+
+  _watermark_apply_drag(self, pzx, pzy);
+  int corner = -1;
+  g->hover = _watermark_pick(self, pzx, pzy, zoom_scale, &corner, NULL);
+  g->corner = corner;
+  _watermark_finish_drag(self);
+  return 1;
+}
+
+int mouse_leave(dt_iop_module_t *self)
+{
+  dt_iop_watermark_gui_data_t *g = self->gui_data;
+  if(g->dragging)
+    return 1;
+  if(g->hover)
+  {
+    g->hover = DT_WM_NONE;
+    g->corner = -1;
+    dt_control_queue_redraw_center();
+  }
+  dt_control_change_cursor("default");
+  dt_control_hinter_message("");
+  return 0;
+}
+
+GSList *mouse_actions(dt_iop_module_t *self)
+{
+  GSList *lm = NULL;
+  lm = dt_mouse_action_create_format(lm, DT_MOUSE_ACTION_LEFT_DRAG, 0,
+                                     _("[%s] click and hold to move, release to place"),
+                                     self->name());
+  lm = dt_mouse_action_create_format(lm, DT_MOUSE_ACTION_LEFT_DRAG, 0,
+                                     _("[%s] drag a corner to resize"),
+                                     self->name());
+  lm = dt_mouse_action_create_format(lm, DT_MOUSE_ACTION_LEFT_DRAG, 0,
+                                     _("[%s] drag the handle to rotate"),
+                                     self->name());
+  return lm;
 }
 
 // clang-format off
