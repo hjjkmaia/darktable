@@ -360,7 +360,8 @@ typedef struct dt_develop_t
       void (*select_component)(struct dt_lib_module_t *self,
                                struct dt_iop_module_t *owner,
                                const dt_mask_id_t childid);
-      /* duplicate a complete local adjustment with independent shapes and sinks */
+      /* duplicate a local adjustment and its shapes. invert keeps the opposite
+       * selection and starts with no adjustment sinks */
       struct dt_iop_module_t *(*duplicate_mask)(struct dt_lib_module_t *self,
                                                 struct dt_iop_module_t *owner,
                                                 gboolean invert);

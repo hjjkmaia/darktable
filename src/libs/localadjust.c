@@ -908,6 +908,23 @@ static void _select_component(dt_lib_module_t *self, dt_iop_module_t *owner,
 static void _select_mask(dt_lib_module_t *self, dt_iop_module_t *owner)
 {
   _select_component(self, owner, NO_MASKID);
+  dt_develop_t *dev = darktable.develop;
+  if(!owner || !owner->blend_params || _selected_mask(self) != owner) return;
+  if(!_mask_has_shape(owner))
+  {
+    _clear_overlay(dev);
+    return;
+  }
+
+  // show the new mask's combined coverage, including an inverted copy
+  dt_masks_set_edit_mode(owner, DT_MASKS_EDIT_FULL);
+  dev->mask_overlay_selected_id = owner->blend_params->mask_id;
+  dev->mask_overlay_selected_group_id = NO_MASKID;
+  dev->mask_overlay_selected_state = DT_MASKS_STATE_NONE;
+  dev->mask_overlay_selected_owner = owner;
+  dev->mask_overlay_imgid = dev->image_storage.id;
+  dt_control_queue_redraw_center();
+  dt_dev_masks_selection_change(dev, owner, owner->blend_params->mask_id);
 }
 
 static gboolean _duplicable_form(dt_develop_t *dev, const dt_masks_form_t *form,
@@ -959,8 +976,10 @@ static dt_iop_module_t *_duplicate_mask(dt_lib_module_t *self,
 
   // A local adjustment owns every raster sink pointed at its source instance.
   // Validate them all before changing history so none can be silently omitted.
+  // An inverted copy is the opposite selection with the adjustments cleared,
+  // so it does not carry those sinks.
   GPtrArray *sinks = g_ptr_array_new();
-  for(const GList *it = dev->iop; it; it = g_list_next(it))
+  for(const GList *it = dev->iop; !invert && it; it = g_list_next(it))
   {
     dt_iop_module_t *old = it->data;
     const dt_develop_blend_params_t *bp = old->blend_params;
@@ -997,7 +1016,11 @@ static dt_iop_module_t *_duplicate_mask(dt_lib_module_t *self,
   memcpy(copy->params, owner->params, copy->params_size);
   dt_develop_blend_params_t source_bp = *owner->blend_params;
   source_bp.mask_id = copyid;
-  if(invert) source_bp.mask_combine ^= DEVELOP_COMBINE_MASKS_POS;
+  if(invert)
+  {
+    source_bp.mask_combine ^= DEVELOP_COMBINE_MASKS_POS;
+    source_bp.opacity = 100.0f;
+  }
   dt_iop_commit_blend_params(copy, &source_bp, NULL);
   copy->enabled = owner->enabled;
   dt_dev_add_masks_history_item(dev, copy, copy->enabled);
@@ -1598,6 +1621,7 @@ typedef enum dt_lib_localadjust_menu_action_t
 {
   LOCAL_MENU_RENAME = 1,
   LOCAL_MENU_DUPLICATE,
+  LOCAL_MENU_DUPLICATE_INVERT,
   LOCAL_MENU_INVERT_MASK,
   LOCAL_MENU_DELETE_ADJUSTMENT,
   LOCAL_MENU_ADD,
@@ -1689,6 +1713,8 @@ static void _menu_action(GtkMenuItem *item, dt_lib_module_t *self)
     _rename_adjustment(self, mask);
   else if(action == LOCAL_MENU_DUPLICATE)
     _duplicate_mask(self, mask, FALSE);
+  else if(action == LOCAL_MENU_DUPLICATE_INVERT)
+    _duplicate_mask(self, mask, TRUE);
   else if(action == LOCAL_MENU_DELETE_ADJUSTMENT)
     _delete_adjustment(self, priority);
   else if(action == LOCAL_MENU_ADVANCED)
@@ -1800,6 +1826,13 @@ static void _row_context_pressed(GtkGestureSingle *gesture, int n_press,
       (menu, _("duplicate adjustment"), self, priority, NO_MASKID,
        LOCAL_MENU_DUPLICATE, DT_MASKS_NONE);
     gtk_widget_set_sensitive(duplicate, _mask_has_shape(mask));
+    GtkWidget *duplicate_invert = _append_menu_action
+      (menu, _("duplicate and invert mask"), self, priority, NO_MASKID,
+       LOCAL_MENU_DUPLICATE_INVERT, DT_MASKS_NONE);
+    gtk_widget_set_sensitive(duplicate_invert, _mask_has_shape(mask));
+    gtk_widget_set_tooltip_text
+      (duplicate_invert,
+       _("create a new mask of the opposite selection and leave this mask unchanged"));
     GtkWidget *invert = _append_menu_action
       (menu, _("invert mask"), self, priority, NO_MASKID,
        LOCAL_MENU_INVERT_MASK, DT_MASKS_NONE);

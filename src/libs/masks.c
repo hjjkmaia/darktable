@@ -3024,6 +3024,8 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
         gtk_menu_shell_append(menu, item);
 
         item = gtk_menu_item_new_with_label(_("duplicate and invert mask"));
+        gtk_widget_set_tooltip_text
+          (item, _("create a new mask of the opposite selection and leave this mask unchanged"));
         g_object_set_data(G_OBJECT(item), "invert-copy", GINT_TO_POINTER(TRUE));
         g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_mask), self);
         gtk_menu_shell_append(menu, item);
